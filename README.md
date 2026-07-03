@@ -1,0 +1,126 @@
+<div align="center">
+
+# ◇ zicro
+
+**[Micro](https://github.com/postadelmaga/Micro), ported to Zig — the minimal, generic core of the Frame architecture.**
+
+A tiny modules + bus micro-kernel: a string-named pub/sub bus, a generic undoable
+document, and an in-process module runtime. On top of it — in separate, optional
+namespaces that never touch the kernel — the opinionated **`sources → world → sinks`**
+framework: time, input, video, audio, a zero-copy media plane, and a bus-over-byte-stream
+bridge.
+
+</div>
+
+---
+
+## What is zicro?
+
+A faithful port of the Rust **Micro** workspace to Zig 0.16. The three ideas are the same:
+
+1. **`Envelope` + channels (`protocol`)** — the only types modules share. Routing is by
+   channel name; a module never inspects another's internals. `Topic(T)` binds a channel
+   name to a payload type at compile time.
+2. **`LocalBus` (`bus`)** — an in-process pub/sub broker with bounded inboxes, per-channel
+   overflow policy (`.drop` counted / `.block` backpressure), retained channels that
+   replay their last value to late subscribers, and per-channel metrics.
+3. **`Doc(S, A)` + reducer (`document`)** — the single source of truth. Every edit is a
+   serializable action applied by one reducer, transactionally (on a clone first) and
+   undoably. Mutations are *data*: loggable, replayable, bus-sendable.
+
+`core` ties them together: a **`Module`** declares its channel subscriptions and a `run`
+loop; the **`Runtime`** subscribes it to the bus and spawns it on its own thread, with a
+shared worker pool (`ctx.offload`) and fail-fast supervision.
+
+## Layout
+
+One Zig file per Rust crate, one importable module:
+
+```
+src/
+  # micro-kernel — generic, zero domain
+  protocol.zig   Envelope, Topic(T), ChannelKind          (zero logic)
+  bus.zig        LocalBus broker + Receiver               (+ retained, metrics)
+  pool.zig       size-classed slab recycler               (zero-alloc publish, internal)
+  document.zig   History(S), Doc(S, A) + reducer          (undo/redo, transactional)
+  core.zig       Module, ModuleCtx, Runtime + worker pool (the in-process kernel)
+
+  # framework — opinionated sources → world → sinks, built only on the kernel
+  app.zig        App builder + WorldModule(S, A)          (declarative wiring)
+  media.zig      zero-copy data plane: latest() + bounded()  (Rc, Frame, AudioBlock)
+  time.zig       Clock source (Tick) + Pacer frame-limiter
+  input.zig      device-neutral InputEvent + InputMapper(A) → bus actions
+  video.zig      FrameSink contract + VideoSink module (+ headless BufferSink)
+  audio.zig      AudioOut contract + AudioSink module (+ headless Recorder)
+  bridge.zig     the bus over a byte stream               (length-prefixed frames,
+                                                           wire-compatible with micro-bridge)
+
+  # out-of-process transports — the Rust `ipc` feature of micro-bus
+  ipc.zig        channel pair + stdio codec (JSON lines / postcard, wire-compatible)
+  shmem.zig      seqlock'd latest-value shared-memory slot   (/dev/shm, Linux)
+```
+
+## Try it
+
+```sh
+zig build test                  # the whole suite (kernel + framework)
+zig build run-counter           # the bare kernel
+zig build run-world_counter     # the App + world spine
+zig build bench                 # the performance contract (ReleaseFast; add `-- --quick` for a fast pass)
+```
+
+## Port notes (Rust → Zig)
+
+The boundaries and semantics are the same; the idioms are translated:
+
+| Rust | Zig |
+|---|---|
+| `serde_json::Value` payloads | JSON **text** (`[]const u8`), typed via `std.json` encode/decode |
+| `Arc<T>` sharing (envelopes, pixels) | explicit reference counts (`bus.Msg`, `media.Rc`) with `deinit`/`release` |
+| RAII drops (receivers, senders, docs) | explicit `deinit` calls |
+| trait objects (`Module`, `FrameSink`, `AudioOut`) | vtable structs with a duck-typed `of(T, instance)` adapter |
+| closures (reducer, input map, offload jobs) | function pointers (+ optional context pointer); `offload` captures args like `Thread.spawn` |
+| module **panic** supervision (`catch_unwind`) | module `run` returns `anyerror!void`; an error is recorded by `join` and trips shutdown (a Zig panic aborts and cannot be caught) |
+| `std::sync::mpsc` bounded channels | hand-rolled rings on `Io.Mutex` + a futex epoch `Signal` (Zig 0.16's `Io.Condition` has no timed wait) |
+| implicit global OS clock/sleep | everything takes `std.Io` (`Io.Threaded`), the 0.16 way |
+| `std::env::var` config (`MICRO_IPC_FORMAT`, …) | explicit parameters + `*FromEnv` parsing helpers (0.16 has no ambient `getenv`; the env flows through `std.process.Environ`) |
+| `fence(Release/Acquire)` in the shmem seqlock | per-word release stores / acquire loads on the payload (`@fence` was removed from Zig) |
+
+## Real-time by construction
+
+The port deliberately hardens the hot paths beyond the Rust original (same observable
+semantics, better behaviour under load) — and `zig build bench` keeps the numbers honest:
+
+* **Zero-allocation publish in steady state.** An envelope is one contiguous slab
+  (header + strings) drawn from a size-classed recycler (`pool.zig`, lock-free Vyukov MPMC
+  free rings, ~3 MiB fixed ceiling). `LocalBus.prewarmEnvelopes` covers even the first
+  burst. The bench *counts allocator calls* to prove the zero.
+* **Lock-free data plane.** `media.latest` is a wait-free triple buffer (send = one store
+  + one swap); `media.bounded` is a Lamport SPSC ring with cached indices à la Rigtorp.
+  No mutex anywhere media flows.
+* **No head-of-line blocking.** The `.block` fan-out sweeps all subscribers with
+  non-blocking pushes and waits on a bus-wide "space freed" eventcount — a slow consumer
+  never delays the fast ones (Rust pushes sequentially).
+* **Syscall-free when busy.** Every wait/notify signal is waiter-gated (notify with
+  nobody parked = one atomic add) and waiters spin-then-park (~1 µs spin window before the
+  futex), so a streaming pipeline crosses the kernel only when genuinely idle. Blocked
+  publishers are woken at a half-drained low-water mark and refill in bursts.
+
+Indicative numbers (4-core Linux box, ReleaseFast): publish→recv RTT p50 ≈ 0.5 µs,
+`latest` freshness p99 ≈ 0.3 µs, bounded SPSC ≈ 20 M items/s, **0 allocator calls per
+million publishes** after prewarm. Run `zig build bench` on your hardware for real ones.
+
+**Interop:** the wire formats are byte-compatible with Micro across every seam — the
+bridge framing, the ipc JSON-lines and postcard codecs (postcard's LEB128 string encoding
+is reimplemented and locked by a test), and the shmem slot layout/naming (`/dev/shm`, the
+same object a Rust `shm_open` peer maps). A zicro process can talk to a Micro process
+today.
+
+Out of scope for the port (deliberately): the optional `cpal` audio device backend (the
+`AudioOut` contract is the extension point) and the `micro-stems` showcase app (it
+orchestrates external Demucs/basic-pitch subprocesses). The shmem slot is Linux-only for
+now; the Rust original also covers macOS and Windows.
+
+---
+
+<sub>Ported from Rust 🦀 to Zig ⚡ — same skeleton, explicit memory.</sub>
