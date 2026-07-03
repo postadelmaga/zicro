@@ -434,6 +434,7 @@ pub const Runtime = struct {
     /// when the bus closes or when they observe [`Runtime.shutdown`]. Consumes the
     /// runtime; call `report.deinit()` when done with the result.
     pub fn join(rt: *Runtime) JoinReport {
+        rt.bus_ptr.notifyAllInboxes(); // wake modules blocked in recvTimeout(); modules check shouldStop()
         for (rt.entries.items) |entry| {
             entry.thread.join();
             if (entry.module.vtable.deinit) |deinitFn| deinitFn(entry.module.ptr, rt.gpa);

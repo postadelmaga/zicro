@@ -70,13 +70,21 @@ pub const OwnedEnvelope = struct {
 };
 
 /// Write an envelope as one JSON object — the wire shape shared by every zicro/Micro
-/// codec: `{"from":…,"channel":…,"payload":<raw JSON>}`, from/channel JSON-escaped, the
-/// payload spliced in verbatim (it already is JSON text).
-pub fn writeEnvelopeJson(w: *std.Io.Writer, env: *const Envelope) std.Io.Writer.Error!void {
+/// codec: `{"from":…,"channel":…,"payload":<compact JSON>}`, from/channel JSON-escaped.
+/// Payload is re-stringified in compact form to prevent injection of newlines/whitespace.
+pub const WriteEnvelopeJsonError = error{ MalformedPayload } || std.Io.Writer.Error;
+
+pub fn writeEnvelopeJson(gpa: Allocator, w: *std.Io.Writer, env: *const Envelope) WriteEnvelopeJsonError!void {
+    // Re-parse and re-stringify payload to ensure it's valid compact JSON (no newlines/whitespace).
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, env.payload, .{}) catch return error.MalformedPayload;
+    defer parsed.deinit();
+    const compact = std.json.Stringify.valueAlloc(gpa, parsed.value, .{}) catch return error.MalformedPayload;
+    defer gpa.free(compact);
+
     try w.print("{{\"from\":{f},\"channel\":{f},\"payload\":{s}}}", .{
         std.json.fmt(env.from, .{}),
         std.json.fmt(env.channel, .{}),
-        env.payload,
+        compact,
     });
 }
 

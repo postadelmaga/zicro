@@ -27,9 +27,12 @@ const protocol = @import("protocol.zig");
 pub const Envelope = protocol.Envelope;
 pub const OwnedEnvelope = protocol.OwnedEnvelope;
 
-// --- IPC format selection ------------------------------------------------------
+// --- IPC format selection & sanity limits -----------------------------------------------
 
 pub const IpcFormat = enum { json, postcard };
+
+/// Maximum message size (bytes) for untrusted wire input; prevents allocation DoS.
+pub const max_message_size: usize = 16 * 1024 * 1024; // 16 MiB default
 
 /// The env var both ends read (`MICRO_IPC_FORMAT=postcard`); JSON lines by default. A
 /// child inherits the supervisor's environment, so setting it once on the parent
@@ -268,7 +271,7 @@ pub const ProcessSender = struct {
         defer sync.unlock(&self.mutex, self.io);
         switch (self.format) {
             .json => {
-                try protocol.writeEnvelopeJson(self.writer, env);
+                try protocol.writeEnvelopeJson(self.gpa, self.writer, env);
                 try self.writer.writeByte('\n');
             },
             .postcard => {
@@ -313,6 +316,7 @@ pub const ProcessReceiver = struct {
             },
             .postcard => {
                 const len = try self.reader.takeInt(u32, .big);
+                if (len > max_message_size) return error.MessageTooLarge;
                 const buf = try self.gpa.alloc(u8, len);
                 defer self.gpa.free(buf);
                 try self.reader.readSliceAll(buf);

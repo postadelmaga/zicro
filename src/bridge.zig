@@ -36,6 +36,9 @@ pub const Envelope = protocol.Envelope;
 /// How often an egress loop wakes to check for shutdown while idle.
 const poll_ns: u64 = 100 * std.time.ns_per_ms;
 
+/// Maximum frame size (bytes) for untrusted wire input; prevents allocation DoS.
+pub const max_frame_size: usize = 16 * 1024 * 1024; // 16 MiB default
+
 pub const FrameKind = enum(u8) {
     raw = 0,
     json = 1,
@@ -84,6 +87,7 @@ pub fn readRawFrame(gpa: Allocator, r: *Io.Reader) !?RawFrame {
         else => return e,
     };
     if (total_len < 3) return error.FrameTooSmall;
+    if (total_len > max_frame_size) return error.FrameTooLarge;
 
     const kind = try FrameKind.fromByte(try r.takeByte());
     const channel_len = try r.takeInt(u16, .little);
@@ -106,7 +110,7 @@ pub fn readRawFrame(gpa: Allocator, r: *Io.Reader) !?RawFrame {
 pub fn writeFrame(gpa: Allocator, w: *Io.Writer, env: *const Envelope) !void {
     var data: std.Io.Writer.Allocating = .init(gpa);
     defer data.deinit();
-    try protocol.writeEnvelopeJson(&data.writer, env);
+    try protocol.writeEnvelopeJson(gpa, &data.writer, env);
     try writeRawFrame(w, .{ .channel = env.channel, .kind = .json, .data = data.writer.buffered() });
 }
 

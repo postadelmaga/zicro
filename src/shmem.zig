@@ -226,7 +226,7 @@ pub const StateWriter = struct {
 
         const start = seq.load(.monotonic);
         seq.store(start +% 1, .monotonic); // odd: write in progress
-        len.store(bytes.len, .monotonic);
+        len.store(bytes.len, .release);
 
         // Release stores: a reader that acquires any of these words also sees the odd
         // sequence above, so its seq re-check rejects the torn read (the fence stand-in).
@@ -286,7 +286,7 @@ pub const StateReader = struct {
             if (s1 == 0) return null; // nothing ever written
             if (s1 == last_seq.*) return null; // unchanged: the caller won't rebuild
 
-            const n = len.load(.monotonic);
+            const n = len.load(.acquire);
             if (n > r.cap) {
                 std.atomic.spinLoopHint();
                 continue; // torn header: len from a write in flight

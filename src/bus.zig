@@ -345,6 +345,19 @@ pub const LocalBus = struct {
         return .{ .gpa = gpa, .io = io };
     }
 
+    /// Notify all inboxes (wake blocked receivers) without closing them, e.g. during shutdown.
+    /// Modules that check [`ModuleCtx.shouldStop`] will wake and can exit gracefully.
+    pub fn notifyAllInboxes(bus: *LocalBus) void {
+        sync.lock(&bus.mutex, bus.io);
+        defer sync.unlock(&bus.mutex, bus.io);
+        var subs_it = bus.subs.iterator();
+        while (subs_it.next()) |entry| {
+            for (entry.value_ptr.items) |inbox| {
+                inbox.changed.notifyAll(bus.io);
+            }
+        }
+    }
+
     pub fn deinit(bus: *LocalBus) void {
         sync.lock(&bus.mutex, bus.io);
         var subs_it = bus.subs.iterator();
@@ -551,6 +564,22 @@ pub const LocalBus = struct {
             }
             if (!progressed and blocking_targets.items.len > 0) {
                 space.?.signal.waitSpin(bus.io, snapshot);
+            }
+        }
+
+        // Prune any .gone inboxes from the original subs lists that accumulated during the
+        // lock-free sweep; they were removed from the snapshot but linger in bus.subs.
+        sync.lock(&bus.mutex, bus.io);
+        defer sync.unlock(&bus.mutex, bus.io);
+        var subs_it = bus.subs.iterator();
+        while (subs_it.next()) |entry| {
+            var i: usize = 0;
+            while (i < entry.value_ptr.items.len) {
+                if (entry.value_ptr.items[i].receiver_gone) {
+                    entry.value_ptr.swapRemove(i).release(bus.io);
+                } else {
+                    i += 1;
+                }
             }
         }
     }
