@@ -40,6 +40,9 @@ pub const bridge = @import("bridge.zig");
 pub const ipc = @import("ipc.zig");
 pub const shmem = @import("shmem.zig");
 
+// -- GPU memory: autonomous, format-agnostic, Vulkan-bindable
+pub const gpu_memory = @import("gpu_memory.zig");
+
 // -- the short names an app usually wants
 pub const Envelope = protocol.Envelope;
 pub const Topic = protocol.Topic;
@@ -71,4 +74,5 @@ test {
     _ = bridge;
     _ = ipc;
     _ = shmem;
+    _ = gpu_memory;
 }
