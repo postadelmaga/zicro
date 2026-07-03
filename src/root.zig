@@ -45,6 +45,7 @@ pub const gpu_memory = @import("gpu_memory.zig");
 pub const gpu_vulkan = @import("gpu_vulkan.zig");
 pub const gpu_wgpu = @import("gpu_wgpu.zig");
 pub const gpu_wgpu_native = @import("gpu_wgpu_native.zig");
+pub const gpu_wgpu_bridge_ffi = @import("gpu_wgpu_bridge_ffi.zig");
 
 // -- the short names an app usually wants
 pub const Envelope = protocol.Envelope;
@@ -81,4 +82,5 @@ test {
     _ = gpu_vulkan;
     _ = gpu_wgpu;
     _ = gpu_wgpu_native;
+    _ = gpu_wgpu_bridge_ffi;
 }
