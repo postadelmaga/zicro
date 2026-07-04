@@ -22,11 +22,19 @@
 //! stays free of any domain dependency.
 //!
 //! ## Backing store & portability
-//! POSIX shared memory. Zig's std has no `shm_open` wrapper, so on Linux the slot is a
-//! file under `/dev/shm` — byte- and name-compatible with what glibc's `shm_open` does,
-//! so a zicro writer and a Micro (Rust) reader can share one slot. Linux-only for now
-//! (`create`/`open` return `error.Unsupported` elsewhere); the Rust original also covers
-//! macOS and Windows.
+//! The seqlock is pure atomics over a mapped byte buffer, so it is platform-neutral; only
+//! *how* a named shared region is created, opened, unlinked and swept is OS-specific, and
+//! that lives behind a [`backend`] selected at compile time:
+//!
+//!   * **Linux** ([`shmem_linux`](shmem_linux.zig)) — files under `/dev/shm`, byte- and
+//!     name-compatible with glibc's `shm_open`, so a zicro writer and a Rust Micro reader
+//!     can share one slot; includes the orphan sweeper.
+//!   * **macOS** ([`shmem_darwin`](shmem_darwin.zig)) — POSIX `shm_open` (short names, no
+//!     enumeration → no sweep).
+//!   * **Windows** ([`shmem_windows`](shmem_windows.zig)) — a `Local\` section object (no
+//!     filesystem object to leak → no sweep).
+//!   * everything else ([`shmem_unsupported`](shmem_unsupported.zig)) — `create`/`open`
+//!     return `error.Unsupported`, so the caller falls back to its byte-stream transport.
 //!
 //! Port note: Zig removed the `@fence` builtin, so the Rust version's
 //! `fence(Release)/fence(Acquire)` pairs become per-word release **stores** / acquire
@@ -37,6 +45,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+
+/// The platform mapping backend — see the module doc. Only the selected file is compiled.
+const backend = switch (builtin.os.tag) {
+    .linux => @import("shmem_linux.zig"),
+    .macos => @import("shmem_darwin.zig"),
+    .windows => @import("shmem_windows.zig"),
+    else => @import("shmem_unsupported.zig"),
+};
+
+/// Whether this build has a working shared-memory backend (false ⇒ `create`/`open` yield
+/// `error.Unsupported`; use the caller's fallback transport).
+pub const supported = backend.supported;
+
+/// Garbage-collect slots leaked by dead writer processes. Linux-only in practice (the other
+/// backends have nothing to enumerate/leak and return 0); `error.Unsupported` off a backend.
+pub const sweepOrphans = backend.sweepOrphans;
 
 /// Env var carrying the slot's identifier from writer to reader. The writer sets it
 /// before spawning the reader; the child inherits and opens it.
@@ -72,7 +96,7 @@ const off_seq: usize = 0;
 const off_len: usize = 8;
 const header: usize = 16;
 
-/// Default payload ceiling (bytes) when none is configured: 128 MiB. The backing file is
+/// Default payload ceiling (bytes) when none is configured: 128 MiB. The backing store is
 /// sparse — only touched pages are ever resident — so a large ceiling is free (a tiny
 /// payload uses a few hundred bytes).
 pub const default_cap: usize = 128 * 1024 * 1024;
@@ -104,114 +128,25 @@ fn atomicAt(base: [*]align(std.heap.page_size_min) u8, off: usize) *std.atomic.V
     return @ptrCast(@alignCast(base + off));
 }
 
-fn shmPath(buf: *[96:0]u8, id: []const u8) ![:0]const u8 {
-    // A POSIX shm name "/foo" lives at /dev/shm/foo on Linux — same layout glibc uses,
-    // which is what keeps a zicro slot openable by a Rust `shm_open` peer.
-    if (id.len == 0 or id[0] != '/') return error.InvalidSlotId;
-    return std.fmt.bufPrintZ(buf, "/dev/shm{s}", .{id});
-}
-
-// --- orphan sweeping -------------------------------------------------------------
-//
-// A slot is unlinked by [`StateWriter.deinit`] — which never runs if the writer process
-// is SIGKILLed, panics (Zig panics abort), or exits without teardown. The backing shm
-// object then outlives the process. [`sweepOrphans`] is the garbage collector for that
-// case: it scans for slots whose creator pid (baked into the slot name) is no longer
-// alive and unlinks them. [`StateWriter.create`] calls it best-effort, so any
-// long-running host cleans up after its predecessors automatically.
-
-/// Whether `pid` names a live process, via `/proc/<pid>`.
-fn pidAlive(pid: i32) bool {
-    var buf: [32:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buf, "/proc/{d}", .{pid}) catch return true;
-    return std.os.linux.errno(std.os.linux.access(path, 0)) == .SUCCESS;
-}
-
-/// Unlink every `micro-state-<pid>-*` slot whose creator process is dead, returning how
-/// many were removed. Never touches a slot whose pid is still alive, so a concurrent
-/// writer is safe. Linux-only (POSIX gives no portable way to enumerate shm objects, but
-/// on Linux they are the files of `/dev/shm`). Sweeps the slots of Rust Micro peers too —
-/// same name scheme, same backing store. Raw syscalls so it needs no `Io` and
-/// [`StateWriter.create`] can run it unconditionally.
-pub fn sweepOrphans() error{Unsupported}!usize {
-    if (builtin.os.tag != .linux) return error.Unsupported;
-    const linux = std.os.linux;
-
-    const dir_rc = linux.open("/dev/shm", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
-    if (linux.errno(dir_rc) != .SUCCESS) return 0; // no /dev/shm: nothing to sweep
-    const dir_fd: i32 = @intCast(dir_rc);
-    defer _ = linux.close(dir_fd);
-
-    var removed: usize = 0;
-    var buf: [4096]u8 align(@alignOf(linux.dirent64)) = undefined;
-    while (true) {
-        const n = linux.getdents64(dir_fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS or n == 0) break;
-        var off: usize = 0;
-        while (off < n) {
-            const entry: *align(1) linux.dirent64 = @ptrCast(&buf[off]);
-            defer off += entry.reclen;
-            const name_ptr: [*:0]const u8 = @ptrCast(@as([*]const u8, @ptrCast(entry)) + @offsetOf(linux.dirent64, "name"));
-            const name = std.mem.sliceTo(name_ptr, 0);
-            if (!std.mem.startsWith(u8, name, "micro-state-")) continue;
-            const rest = name["micro-state-".len..];
-            const dash = std.mem.indexOfScalar(u8, rest, '-') orelse continue;
-            const pid = std.fmt.parseInt(i32, rest[0..dash], 10) catch continue;
-            if (pidAlive(pid)) continue;
-            // Dead creator: remove the leaked slot.
-            if (linux.errno(linux.unlinkat(dir_fd, name_ptr, 0)) == .SUCCESS) removed += 1;
-        }
-    }
-    return removed;
-}
-
 /// The single writer of a slot. Create it, export [`StateWriter.id`] to the child via
 /// [`shmem_id_env`], then [`write`](StateWriter.write) at will — it never blocks.
 pub const StateWriter = struct {
     id_buf: [64]u8,
     id_len: usize,
-    map: []align(std.heap.page_size_min) u8,
-    fd: std.posix.fd_t,
+    mapping: backend.Mapping,
     cap: usize,
 
-    /// Create a fresh slot: allocate the backing shared memory object and map it. Also
-    /// sweeps slots leaked by dead predecessors (see [`sweepOrphans`]), best-effort.
+    /// Create a fresh slot: allocate the backing shared region and map it. Also sweeps
+    /// slots leaked by dead predecessors (best-effort; a no-op where unsupported).
     pub fn create(options: Options) !StateWriter {
-        if (builtin.os.tag != .linux) return error.Unsupported;
-        const linux = std.os.linux;
-
-        _ = sweepOrphans() catch 0;
+        if (!backend.supported) return error.Unsupported;
+        _ = backend.sweepOrphans() catch 0;
 
         var w: StateWriter = undefined;
-        // Unique name: pid + nanotime, like the Rust original. `O_EXCL` below turns any
-        // residual collision into a hard error instead of silent sharing.
-        var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
-        _ = linux.clock_gettime(.MONOTONIC, &ts);
-        const nanos: u64 = @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
-        const written = std.fmt.bufPrint(&w.id_buf, "/micro-state-{d}-{d}", .{
-            linux.getpid(),
-            nanos,
-        }) catch unreachable;
-        w.id_len = written.len;
-
-        var path_buf: [96:0]u8 = undefined;
-        const path = try shmPath(&path_buf, written);
-        const open_rc = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o600);
-        if (linux.errno(open_rc) != .SUCCESS) return error.ShmOpenFailed;
-        const fd: std.posix.fd_t = @intCast(open_rc);
-        errdefer _ = linux.close(fd);
-        // We just created (O_CREAT|O_EXCL) this /dev/shm object; unlink it on any failure
-        // below, or the live creating process orphans it (sweepOrphans only reaps names
-        // whose creator has exited).
-        errdefer _ = linux.unlink(path);
-
         w.cap = options.cap;
-        const total = header + w.cap;
-        if (linux.errno(linux.ftruncate(fd, @intCast(total))) != .SUCCESS) {
-            return error.ShmResizeFailed;
-        }
-        w.map = try std.posix.mmap(null, total, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
-        w.fd = fd;
+        const result = try backend.createSlot(&w.id_buf, header + options.cap);
+        w.mapping = result.mapping;
+        w.id_len = result.id_len;
         return w;
     }
 
@@ -224,8 +159,8 @@ pub const StateWriter = struct {
     /// rejected whole (the previous value stays readable).
     pub fn write(w: *StateWriter, bytes: []const u8) error{BlobExceedsCap}!void {
         if (bytes.len > w.cap) return error.BlobExceedsCap;
-        const seq = atomicAt(w.map.ptr, off_seq);
-        const len = atomicAt(w.map.ptr, off_len);
+        const seq = atomicAt(w.mapping.bytes.ptr, off_seq);
+        const len = atomicAt(w.mapping.bytes.ptr, off_len);
 
         const start = seq.load(.monotonic);
         seq.store(start +% 1, .monotonic); // odd: write in progress
@@ -233,51 +168,36 @@ pub const StateWriter = struct {
 
         // Release stores: a reader that acquires any of these words also sees the odd
         // sequence above, so its seq re-check rejects the torn read (the fence stand-in).
-        const data = w.map.ptr + header;
+        const data = w.mapping.bytes.ptr + header;
         copyRelease(data, bytes);
 
         seq.store(start +% 2, .release); // even: stable
     }
 
     pub fn deinit(w: *StateWriter) void {
-        std.posix.munmap(w.map);
-        _ = std.os.linux.close(w.fd);
-        var path_buf: [96:0]u8 = undefined;
-        if (shmPath(&path_buf, w.id())) |path| {
-            _ = std.os.linux.unlink(path);
-        } else |_| {}
+        backend.closeWriter(w.mapping, w.id());
     }
 };
 
 /// A reader of a slot created by a (possibly foreign) [`StateWriter`].
 pub const StateReader = struct {
-    map: []align(std.heap.page_size_min) u8,
-    fd: std.posix.fd_t,
+    mapping: backend.Mapping,
     cap: usize,
 
     /// Open the slot the host created, by its shm name (from [`shmem_id_env`]).
     pub fn open(slot_id: []const u8, options: Options) !StateReader {
-        if (builtin.os.tag != .linux) return error.Unsupported;
-        const linux = std.os.linux;
-
-        var path_buf: [96:0]u8 = undefined;
-        const path = try shmPath(&path_buf, slot_id);
-        const open_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-        if (linux.errno(open_rc) != .SUCCESS) return error.ShmOpenFailed;
-        const fd: std.posix.fd_t = @intCast(open_rc);
-        errdefer _ = linux.close(fd);
-
-        const map = try std.posix.mmap(null, header + options.cap, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
-        return .{ .map = map, .fd = fd, .cap = options.cap };
+        if (!backend.supported) return error.Unsupported;
+        const mapping = try backend.openSlot(slot_id, header + options.cap);
+        return .{ .mapping = mapping, .cap = options.cap };
     }
 
     /// Copy out the latest payload **iff it changed** since `last_seq` (caller frees).
     /// `null` means: nothing written yet, nothing new, or a writer collision that
     /// outlasted the retry budget — in every case, just poll again next tick.
     pub fn readLatest(r: *const StateReader, gpa: Allocator, last_seq: *u64) Allocator.Error!?[]u8 {
-        const seq = atomicAt(r.map.ptr, off_seq);
-        const len = atomicAt(r.map.ptr, off_len);
-        const data = r.map.ptr + header;
+        const seq = atomicAt(r.mapping.bytes.ptr, off_seq);
+        const len = atomicAt(r.mapping.bytes.ptr, off_len);
+        const data = r.mapping.bytes.ptr + header;
 
         var retry: u32 = 0;
         while (retry < read_retries) : (retry += 1) {
@@ -307,8 +227,7 @@ pub const StateReader = struct {
     }
 
     pub fn deinit(r: *StateReader) void {
-        std.posix.munmap(r.map);
-        _ = std.os.linux.close(r.fd);
+        backend.closeReader(r.mapping);
     }
 };
 
@@ -342,8 +261,13 @@ fn copyAcquire(out: []u8, src: [*]u8) void {
 
 const testing = std.testing;
 
+test {
+    // Pull in the selected backend's own tests (e.g. the Linux orphan sweeper).
+    _ = backend;
+}
+
 test "write then read latest is change-tracked" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!supported) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var w = try StateWriter.create(.{ .cap = 4096 });
@@ -372,7 +296,7 @@ test "write then read latest is change-tracked" {
 }
 
 test "oversized blob is rejected, value preserved" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!supported) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var w = try StateWriter.create(.{ .cap = 4096 });
@@ -392,35 +316,8 @@ test "oversized blob is rejected, value preserved" {
     try testing.expectEqualStrings("keep", got);
 }
 
-test "sweepOrphans removes dead-pid slots and keeps live ones" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const linux = std.os.linux;
-
-    // A pid that is certainly dead right now: scan downward from past pid_max.
-    var dead_pid: i32 = 4_194_304;
-    while (pidAlive(dead_pid)) dead_pid -= 1;
-
-    // Fabricate two "leaked" slots: one from the dead pid, one from us (alive).
-    var dead_buf: [96:0]u8 = undefined;
-    const dead_path = try std.fmt.bufPrintZ(&dead_buf, "/dev/shm/micro-state-{d}-42", .{dead_pid});
-    var live_buf: [96:0]u8 = undefined;
-    const live_path = try std.fmt.bufPrintZ(&live_buf, "/dev/shm/micro-state-{d}-42", .{linux.getpid()});
-    for ([_][*:0]const u8{ dead_path, live_path }) |path| {
-        const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
-        try testing.expect(linux.errno(rc) == .SUCCESS);
-        _ = linux.close(@intCast(rc));
-    }
-    defer _ = linux.unlink(live_path);
-
-    const removed = try sweepOrphans();
-    try testing.expect(removed >= 1);
-    // The dead creator's slot is gone; the live one survived.
-    try testing.expect(linux.errno(linux.access(dead_path, 0)) != .SUCCESS);
-    try testing.expect(linux.errno(linux.access(live_path, 0)) == .SUCCESS);
-}
-
 test "reader never sees a torn frame under concurrent writes" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!supported) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var w = try StateWriter.create(.{ .cap = 4096 });

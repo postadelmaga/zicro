@@ -63,7 +63,10 @@ src/
 
   # out-of-process transports — the Rust `ipc` feature of micro-bus
   ipc.zig        channel pair + stdio codec (JSON lines / postcard, wire-compatible)
-  shmem.zig      seqlock'd latest-value shared-memory slot   (/dev/shm, Linux)
+  shmem.zig      seqlock'd latest-value shared-memory slot   (per-OS backend, below)
+  shmem_linux.zig   /dev/shm files (+ orphan sweep)          (Rust-Micro interop)
+  shmem_darwin.zig  POSIX shm_open                           (macOS)
+  shmem_windows.zig Local\ section object                    (Windows)
 
   # graphics & windowing — a software-rendered shell (Wayland / Win32)
   window.zig         cross-platform Window facade         (selects the backend by OS)
@@ -142,10 +145,14 @@ is reimplemented and locked by a test), and the shmem slot layout/naming (`/dev/
 same object a Rust `shm_open` peer maps). A zicro process can talk to a Micro process
 today.
 
+The shmem slot now has a backend per OS — `/dev/shm` on Linux (the interop-compatible
+path, with the orphan sweeper), POSIX `shm_open` on macOS, and a `Local\` section object on
+Windows — behind one portable seqlock. Linux is runtime-tested here; the macOS/Windows
+backends are compile-checked via cross-compilation (a native run needs the respective host).
+
 Out of scope for the port (deliberately): the optional `cpal` audio device backend (the
 `AudioOut` contract is the extension point) and the `micro-stems` showcase app (it
-orchestrates external Demucs/basic-pitch subprocesses). The shmem slot is Linux-only for
-now; the Rust original also covers macOS and Windows.
+orchestrates external Demucs/basic-pitch subprocesses).
 
 ---
 
