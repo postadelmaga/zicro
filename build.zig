@@ -9,7 +9,27 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+
+    // stb_truetype FONT RASTERIZER (Hack regular+bold fonts embedded)
+    zicro.addIncludePath(b.path("vendor/stb"));
+    zicro.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_truetype_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
+
+    // Linux-specific Wayland support
+    if (target.query.os_tag == .linux) {
+        zicro.linkSystemLibrary("wayland-client", .{});
+
+        // We only need the xdg-shell stable protocol for basic windowing
+        const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
+        const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        scan.addFileArg(.{ .cwd_relative = xml });
+        const c_file = scan.addOutputFileArg("protocol.c");
+        zicro.addCSourceFile(.{ .file = c_file });
+    }
 
     // `zig build test` — every `test` block in the library.
     const mod_tests = b.addTest(.{ .root_module = zicro });
@@ -22,7 +42,22 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .link_libc = true,
     });
+    zicro_fast.addIncludePath(b.path("vendor/stb"));
+    zicro_fast.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_truetype_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
+    if (target.query.os_tag == .linux) {
+        zicro_fast.linkSystemLibrary("wayland-client", .{});
+        const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
+        const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        scan.addFileArg(.{ .cwd_relative = xml });
+        const c_file = scan.addOutputFileArg("protocol.c");
+        zicro_fast.addCSourceFile(.{ .file = c_file });
+    }
+
     const bench_exe = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{
@@ -39,8 +74,8 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the latency/throughput benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
-    // Examples: `zig build run-counter`, `zig build run-world_counter`.
-    inline for (.{ "counter", "world_counter" }) |name| {
+    // Examples: `zig build run-counter`, `zig build run-world_counter`, `zig build run-shell`.
+    inline for (.{ "counter", "world_counter", "shell" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

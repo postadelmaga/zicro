@@ -36,6 +36,12 @@ pub const video = @import("video.zig");
 pub const audio = @import("audio.zig");
 pub const bridge = @import("bridge.zig");
 
+// -- graphics and windowing layer (Wayland/Win32)
+pub const wl = @import("wl.zig");
+pub const text = @import("text.zig");
+pub const paint = @import("paint.zig");
+pub const window = @import("window.zig");
+
 // -- out-of-process transports (the Rust `ipc` feature of micro-bus)
 pub const ipc = @import("ipc.zig");
 pub const shmem = @import("shmem.zig");
@@ -83,4 +89,7 @@ test {
     _ = gpu_wgpu;
     _ = gpu_wgpu_native;
     _ = gpu_wgpu_bridge_ffi;
+    _ = text;
+    _ = paint;
+    _ = window;
 }
