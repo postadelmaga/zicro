@@ -129,6 +129,181 @@ pub fn remapClamp(v: f32, in0: f32, in1: f32, out0: f32, out1: f32) f32 {
     return out0 + (out1 - out0) * t;
 }
 
+// ── easing catalogue (egui `emath::easing` parity) ────────────────────────────────
+//
+// A full set of tweening curves, one-to-one with egui 0.29's `emath/easing.rs`, so any
+// motion the reference describes can be reproduced here. Each maps a normalised time
+// `t ∈ [0,1]` to an eased `[0,1]` (a few — `back*`, `bounce*` — deliberately overshoot
+// outside that range, which is the point). Inputs are clamped, so callers can pass a raw
+// progress without guarding the ends. `linear`, `cubicOut`, `easeInOut` (smoothstep) and
+// `smoothstep` above cover the common cases; reach here for character (overshoot, bounce,
+// snap). Pair with [`approach`]: store the linear factor, apply a curve when you read it.
+
+/// Identity: `y = t`.
+pub fn linear(t: f32) f32 {
+    return std.math.clamp(t, 0.0, 1.0);
+}
+
+/// Accelerating parabola `y = t²`.
+pub fn quadraticIn(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return x * x;
+}
+
+/// Decelerating parabola, the mirror of [`quadraticIn`].
+pub fn quadraticOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return 1.0 - (1.0 - x) * (1.0 - x);
+}
+
+/// Parabola in then out around the midpoint.
+pub fn quadraticInOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x < 0.5) return 2.0 * x * x;
+    const u = -2.0 * x + 2.0;
+    return 1.0 - u * u / 2.0;
+}
+
+/// Accelerating cubic `y = t³`.
+pub fn cubicIn(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return x * x * x;
+}
+
+// `cubicOut` is defined above (the common fade curve).
+
+/// Cubic in then out around the midpoint.
+pub fn cubicInOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x < 0.5) return 4.0 * x * x * x;
+    const u = -2.0 * x + 2.0;
+    return 1.0 - u * u * u / 2.0;
+}
+
+/// Quarter sine, accelerating.
+pub fn sineIn(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return 1.0 - @cos(x * std.math.pi / 2.0);
+}
+
+/// Quarter sine, decelerating.
+pub fn sineOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return @sin(x * std.math.pi / 2.0);
+}
+
+/// Half sine, in then out.
+pub fn sineInOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return -(@cos(std.math.pi * x) - 1.0) / 2.0;
+}
+
+/// Quarter circle, accelerating (a steep late rise).
+pub fn circularIn(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return 1.0 - @sqrt(1.0 - x * x);
+}
+
+/// Quarter circle, decelerating (a steep early rise).
+pub fn circularOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    const u = x - 1.0;
+    return @sqrt(1.0 - u * u);
+}
+
+/// Circular in then out.
+pub fn circularInOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x < 0.5) {
+        const u = 2.0 * x;
+        return (1.0 - @sqrt(1.0 - u * u)) / 2.0;
+    }
+    const u = -2.0 * x + 2.0;
+    return (@sqrt(1.0 - u * u) + 1.0) / 2.0;
+}
+
+/// Exponential ramp, near-flat then a sharp climb (`2^(10t-10)`, pinned to 0 at t=0).
+pub fn exponentialIn(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x <= 0.0) return 0.0;
+    return std.math.pow(f32, 2.0, 10.0 * x - 10.0);
+}
+
+/// Exponential ease-out, a sharp climb then a long settle (pinned to 1 at t=1).
+pub fn exponentialOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x >= 1.0) return 1.0;
+    return 1.0 - std.math.pow(f32, 2.0, -10.0 * x);
+}
+
+/// Exponential in then out.
+pub fn exponentialInOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    if (x < 0.5) return std.math.pow(f32, 2.0, 20.0 * x - 10.0) / 2.0;
+    return (2.0 - std.math.pow(f32, 2.0, -20.0 * x + 10.0)) / 2.0;
+}
+
+// Overshoot constants shared by the `back*` family (egui/Penner values).
+const back_c1: f32 = 1.70158;
+const back_c2: f32 = back_c1 * 1.525;
+const back_c3: f32 = back_c1 + 1.0;
+
+/// Anticipation: dips below 0 before shooting to 1.
+pub fn backIn(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return back_c3 * x * x * x - back_c1 * x * x;
+}
+
+/// Follow-through: overshoots past 1 before settling.
+pub fn backOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    const u = x - 1.0;
+    return 1.0 + back_c3 * u * u * u + back_c1 * u * u;
+}
+
+/// Anticipation in, overshoot out.
+pub fn backInOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x < 0.5) {
+        const u = 2.0 * x;
+        return (u * u * ((back_c2 + 1.0) * u - back_c2)) / 2.0;
+    }
+    const u = 2.0 * x - 2.0;
+    return (u * u * ((back_c2 + 1.0) * u + back_c2) + 2.0) / 2.0;
+}
+
+/// Bouncing deceleration (settles onto 1 through a few diminishing hops).
+pub fn bounceOut(t: f32) f32 {
+    var x = std.math.clamp(t, 0.0, 1.0);
+    const n1: f32 = 7.5625;
+    const d1: f32 = 2.75;
+    if (x < 1.0 / d1) return n1 * x * x;
+    if (x < 2.0 / d1) {
+        x -= 1.5 / d1;
+        return n1 * x * x + 0.75;
+    }
+    if (x < 2.5 / d1) {
+        x -= 2.25 / d1;
+        return n1 * x * x + 0.9375;
+    }
+    x -= 2.625 / d1;
+    return n1 * x * x + 0.984375;
+}
+
+/// Bouncing acceleration, the mirror of [`bounceOut`].
+pub fn bounceIn(t: f32) f32 {
+    return 1.0 - bounceOut(1.0 - std.math.clamp(t, 0.0, 1.0));
+}
+
+/// Bounce in then out.
+pub fn bounceInOut(t: f32) f32 {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    if (x < 0.5) return (1.0 - bounceOut(1.0 - 2.0 * x)) / 2.0;
+    return (1.0 + bounceOut(2.0 * x - 1.0)) / 2.0;
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "spring settles onto its target and goes inactive" {
@@ -193,6 +368,41 @@ test "easing endpoints and remapClamp bounds" {
     try std.testing.expectEqual(@as(f32, 5), remapClamp(-3, 0, 10, 5, 25));
     try std.testing.expectEqual(@as(f32, 25), remapClamp(999, 0, 10, 5, 25));
     try std.testing.expectApproxEqAbs(@as(f32, 15), remapClamp(5, 0, 10, 5, 25), 1e-5);
+}
+
+test "easing catalogue: endpoints, overshoot and bounce settle" {
+    // Every curve is pinned at both ends (0→0, 1→1). Grouped so a failure names the family.
+    const curves = [_]*const fn (f32) f32{
+        linear,        quadraticIn,   quadraticOut,   quadraticInOut,
+        cubicIn,       cubicOut,      cubicInOut,     sineIn,
+        sineOut,       sineInOut,     circularIn,     circularOut,
+        circularInOut, exponentialIn, exponentialOut, exponentialInOut,
+        backIn,        backOut,       backInOut,      bounceIn,
+        bounceOut,     bounceInOut,
+    };
+    for (curves) |f| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0), f(0), 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), f(1), 1e-4);
+        // Inputs are clamped: out-of-range time saturates instead of exploding.
+        try std.testing.expectApproxEqAbs(@as(f32, 0), f(-0.5), 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), f(1.5), 1e-4);
+    }
+
+    // `back*` overshoots: dips below 0 on the way in, past 1 on the way out.
+    try std.testing.expect(backIn(0.25) < 0.0);
+    try std.testing.expect(backOut(0.75) > 1.0);
+
+    // `bounceOut` stays within [0,1] and lands hops on the way up.
+    var t: f32 = 0;
+    while (t <= 1.0) : (t += 0.05) {
+        const b = bounceOut(t);
+        try std.testing.expect(b >= -1e-4 and b <= 1.0 + 1e-4);
+    }
+
+    // Symmetry of the smooth in/out families about the midpoint: f(0.5) ≈ 0.5.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), quadraticInOut(0.5), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cubicInOut(0.5), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), sineInOut(0.5), 1e-4);
 }
 
 test "approach saturates both ends" {

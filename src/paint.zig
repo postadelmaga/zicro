@@ -33,17 +33,58 @@ pub const Color = struct {
     }
 };
 
-/// Signed distance from point `(px, py)` to a rounded rectangle: negative inside.
-pub fn roundedRectSdf(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, radius: f32) f32 {
+/// Per-corner radii for a rounded rectangle, in screen space (y grows downward), so
+/// `nw` is the top-left corner and `sw` the bottom-left. This is the shape the GPU
+/// instanced-quad path wants too: one struct, four radii, drives rect (all 0), circle
+/// (all = half the shorter side), pill, tab (top two only), or the window panel.
+pub const Corners = struct {
+    nw: f32 = 0,
+    ne: f32 = 0,
+    se: f32 = 0,
+    sw: f32 = 0,
+
+    /// The same radius on every corner (the plain rounded rect).
+    pub fn all(r: f32) Corners {
+        return .{ .nw = r, .ne = r, .se = r, .sw = r };
+    }
+    /// Round only the top two corners (tabs, sheet headers).
+    pub fn top(r: f32) Corners {
+        return .{ .nw = r, .ne = r, .se = 0, .sw = 0 };
+    }
+    /// Round only the bottom two corners.
+    pub fn bottom(r: f32) Corners {
+        return .{ .nw = 0, .ne = 0, .se = r, .sw = r };
+    }
+};
+
+/// Signed distance from `(px,py)` to a rounded rectangle with independent corner radii:
+/// negative inside. The active radius is picked by the quadrant the point falls in
+/// (relative to the rect centre), then clamped to the box's half-extent so an oversized
+/// radius degrades to a capsule/circle instead of inverting the field.
+pub fn roundedRectSdfPerCorner(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, c: Corners) f32 {
     const hw = w / 2.0;
     const hh = h / 2.0;
     const cx = x + hw;
     const cy = y + hh;
-    const qx = @abs(px - cx) - (hw - radius);
-    const qy = @abs(py - cy) - (hh - radius);
+    const dx = px - cx;
+    const dy = py - cy;
+    // Quadrant select: right half → ne/se, left half → nw/sw; then bottom vs top by dy.
+    const r_unclamped = if (dx > 0.0)
+        (if (dy > 0.0) c.se else c.ne)
+    else
+        (if (dy > 0.0) c.sw else c.nw);
+    const r = @min(r_unclamped, @min(hw, hh));
+    const qx = @abs(dx) - (hw - r);
+    const qy = @abs(dy) - (hh - r);
     const ox = @max(qx, 0.0);
     const oy = @max(qy, 0.0);
-    return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0.0) - radius;
+    return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0.0) - r;
+}
+
+/// Signed distance from point `(px, py)` to a rounded rectangle: negative inside.
+/// Thin wrapper over [`roundedRectSdfPerCorner`] with one radius on every corner.
+pub fn roundedRectSdf(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, radius: f32) f32 {
+    return roundedRectSdfPerCorner(px, py, x, y, w, h, Corners.all(radius));
 }
 
 /// Signed distance from `(px,py)` to the line segment `a`→`b`: the capsule/stadium
@@ -500,6 +541,116 @@ pub const Canvas = struct {
         }
     }
 
+    /// Fill a rounded rect with independent corner radii (source-over, honoring the
+    /// canvas [`Format`]). Same primitive as [`fillRoundedRect`] but takes a [`Corners`]
+    /// — for tabs, sheet headers and any panel that rounds only some corners.
+    pub fn fillRoundedRectPerCorner(self: *Canvas, x: f32, y: f32, w: f32, h: f32, corners: Corners, color: Color) void {
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const cov = coverage(roundedRectSdfPerCorner(fx, fy, x, y, w, h, corners));
+                if (cov <= 0.0) continue;
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * cov);
+            }
+        }
+    }
+
+    /// Stroke a circular arc from angle `a0` to `a1` (radians, 0 = +x, growing clockwise
+    /// in screen space) at radius `radius` around `(cx,cy)`, as a rounded stroke of the
+    /// given `width`. The arc is flattened into short capsule segments and the whole span
+    /// is composited with a single coverage per pixel (min distance over the segments), so
+    /// the joints never darken from double-blending. Honors the canvas [`Format`].
+    pub fn drawArc(self: *Canvas, cx: f32, cy: f32, radius: f32, width: f32, a0: f32, a1: f32, color: Color) void {
+        const max_pts = 33;
+        // One segment per ~12°, clamped to the buffer we have; at least a couple.
+        const span = @abs(a1 - a0);
+        const want: usize = @intFromFloat(@ceil(span / (std.math.pi / 15.0)));
+        const segs = std.math.clamp(want, 2, max_pts - 1);
+        var pts: [max_pts][2]f32 = undefined;
+        var i: usize = 0;
+        while (i <= segs) : (i += 1) {
+            const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segs));
+            const a = a0 + (a1 - a0) * t;
+            pts[i] = .{ cx + radius * @cos(a), cy + radius * @sin(a) };
+        }
+
+        const r = width / 2.0;
+        const pad = radius + r + 1.0;
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(cx - pad)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(cy - pad)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(cx + pad)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(cy + pad)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                var d: f32 = std.math.floatMax(f32);
+                var s: usize = 0;
+                while (s < segs) : (s += 1) {
+                    d = @min(d, segmentSdf(fx, fy, pts[s][0], pts[s][1], pts[s + 1][0], pts[s + 1][1]));
+                }
+                const cov = coverage(d - r);
+                if (cov <= 0.0) continue;
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * cov);
+            }
+        }
+    }
+
+    /// Draw an indeterminate loading spinner: a rotating arc whose length breathes,
+    /// exactly egui's `Spinner` geometry driven by an elapsed-time `phase` (seconds).
+    /// Feed a monotonic clock; the caller owns the tick, so this stays a pure primitive.
+    pub fn drawSpinner(self: *Canvas, cx: f32, cy: f32, radius: f32, width: f32, phase: f32, color: Color) void {
+        const start = phase * std.math.tau;
+        const end = start + (240.0 * std.math.pi / 180.0) * @sin(phase);
+        self.drawArc(cx, cy, radius, width, start, end, color);
+    }
+
+    /// Draw a determinate progress bar: a rounded `track` the full width, overlaid by a
+    /// rounded `fill` covering `progress` (clamped 0..1) of it. `radius` rounds both (pass
+    /// `h/2` for a pill). Honors the canvas [`Format`].
+    pub fn fillProgressBar(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, progress: f32, track: Color, fill: Color) void {
+        self.fillRoundedRect(x, y, w, h, radius, track);
+        const p = std.math.clamp(progress, 0.0, 1.0);
+        const fw = w * p;
+        // Below a pill's width the fill would render as a lens; skip it so an empty bar
+        // reads as empty rather than as a stray dot.
+        if (fw < @min(w, 2.0 * radius) - 0.5 and p < 1.0 and fw < 1.0) return;
+        self.fillRoundedRect(x, y, @max(fw, 2.0 * radius), h, radius, fill);
+    }
+
+    /// Draw an indeterminate progress bar: a rounded `track` with a `fill` chunk that
+    /// sweeps back and forth, driven by an elapsed-time `phase` (seconds). The chunk is a
+    /// third of the track and eases at the ends (a sine sweep), so it feels alive at rest.
+    pub fn fillProgressBarIndeterminate(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, phase: f32, track: Color, fill: Color) void {
+        self.fillRoundedRect(x, y, w, h, radius, track);
+        const chunk = w / 3.0;
+        // Sine sweep of the chunk's left edge across the free travel [0, w-chunk].
+        const travel = @max(0.0, w - chunk);
+        const s = (1.0 - @cos(phase * 2.0)) / 2.0; // 0..1, eased at both ends
+        const fx = x + travel * s;
+        const saved = self.setClip(
+            @intFromFloat(@max(0.0, x)),
+            @intFromFloat(@max(0.0, y)),
+            @intFromFloat(@max(0.0, w)),
+            @intFromFloat(@max(0.0, h)),
+        );
+        defer self.clip = saved;
+        self.fillRoundedRect(fx, y, chunk, h, radius, fill);
+    }
+
     /// Stroke the line segment `a`→`b` as a rounded (capsule) stroke of the given
     /// `width`, anti-aliased and source-over composited. The building block for the
     /// procedural window-control glyphs (✕, –).
@@ -682,6 +833,55 @@ test "sdf signs" {
     try std.testing.expect(roundedRectSdf(150, 150, 0, 0, 100, 100, 10) > 0);
     // The very corner pixel of the bounding box is outside the rounded shape.
     try std.testing.expect(roundedRectSdf(1, 1, 0, 0, 100, 100, 12) > 0);
+}
+
+test "per-corner sdf: uniform matches the single-radius field, asymmetry rounds one corner only" {
+    // With all four radii equal, the per-corner field is bit-for-bit the scalar one
+    // (this is what keeps the chrome fast-path reference test green).
+    var gx: f32 = 0.5;
+    while (gx < 100.0) : (gx += 7.0) {
+        var gy: f32 = 0.5;
+        while (gy < 100.0) : (gy += 7.0) {
+            const a = roundedRectSdf(gx, gy, 0, 0, 100, 100, 14);
+            const b = roundedRectSdfPerCorner(gx, gy, 0, 0, 100, 100, Corners.all(14));
+            try std.testing.expectEqual(a, b);
+        }
+    }
+    // A "tab" (top corners rounded, bottom square): the bottom-left pixel that a big
+    // radius would carve away is now *inside* the shape, while the top-left is outside.
+    const tab = Corners.top(20);
+    try std.testing.expect(roundedRectSdfPerCorner(2, 98, 0, 0, 100, 100, tab) < 0); // bottom-left: square
+    try std.testing.expect(roundedRectSdfPerCorner(2, 2, 0, 0, 100, 100, tab) > 0); // top-left: rounded away
+}
+
+test "spinner and progress primitives leave ink" {
+    const gpa = std.testing.allocator;
+    const W: u32 = 120;
+    const H: u32 = 60;
+    const pixels = try gpa.alloc(u32, W * H);
+    defer gpa.free(pixels);
+
+    const bg = packStraight(0.0, 0.0, 0.0, 1.0);
+    var canvas = Canvas.initRgba8(pixels, W, H);
+
+    // Spinner: a partial ring, so some pixels change and the very centre stays background.
+    @memset(pixels, bg);
+    canvas.drawSpinner(30, 30, 18, 4, 0.3, Color.rgba(120, 200, 255, 1.0));
+    var ink: usize = 0;
+    for (pixels) |p| {
+        if (p != bg) ink += 1;
+    }
+    try std.testing.expect(ink > 20);
+    try std.testing.expectEqual(bg, pixels[30 * W + 30]); // hollow centre
+
+    // Determinate bar at 50%: the left edge is filled, past 60% is still track colour.
+    @memset(pixels, bg);
+    const track = Color.rgba(40, 40, 50, 1.0);
+    const fill = Color.rgba(120, 200, 255, 1.0);
+    canvas.fillProgressBar(10, 25, 100, 10, 5, 0.5, track, fill);
+    const r_lo = unpackStraight(pixels[30 * W + 20]); // ~10% across → filled
+    const r_hi = unpackStraight(pixels[30 * W + 100]); // ~90% across → track
+    try std.testing.expect(r_lo[2] > r_hi[2]); // fill is bluer (higher B) than the track
 }
 
 test "chrome paints premultiplied" {
