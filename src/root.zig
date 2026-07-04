@@ -41,6 +41,7 @@ pub const bridge = @import("bridge.zig");
 pub const wl = @import("wl.zig");
 pub const text = @import("text.zig");
 pub const paint = @import("paint.zig");
+pub const scroll = @import("scroll.zig");
 pub const window = @import("window.zig");
 
 // -- out-of-process transports (the Rust `ipc` feature of micro-bus)
@@ -82,6 +83,7 @@ test {
     _ = @import("media_types.zig");
     _ = time;
     _ = anim;
+    _ = scroll;
     _ = input;
     _ = video;
     _ = audio;
