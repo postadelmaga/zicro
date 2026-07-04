@@ -266,50 +266,78 @@ pub const Canvas = struct {
         if (pw <= 0 or ph <= 0) return;
 
         const g = style.glass;
+
+        // Deep inside the panel the shadow is gone, the highlight ring has faded out and
+        // the glass fade is saturated, so every pixel is the same premultiplied glass
+        // colour. Fill that flat core with a memset and pay for the per-pixel SDF only in
+        // the edge/corner/shadow band — on a big window that skips the vast majority of
+        // pixels (each of which otherwise costs two `roundedRectSdf` evaluations).
+        const ga_full = g.a;
+        const core_px = packPremul(g.r * ga_full, g.g * ga_full, g.b * ga_full, ga_full);
+
+        // Band where anything varies: the ring reaches ~2.5px, the glass fade its own
+        // width; also stay clear of the rounded corners (guard >= corner radius).
+        const band = @max(@as(f32, 3.0), style.glass_fade_width + 1.0);
+        const guard = @max(style.corner_radius, band);
+        const cx0f = m + guard;
+        const cx1f = m + pw - guard;
+        const cy0f = m + guard;
+        const cy1f = m + ph - guard;
+        const has_core = (cx1f - cx0f) >= 1.0 and (cy1f - cy0f) >= 1.0;
+        const cx0: u32 = if (has_core) @intFromFloat(@ceil(cx0f)) else 0;
+        const cx1: u32 = if (has_core) @intFromFloat(@floor(cx1f)) else 0;
+        const cy0: u32 = if (has_core) @intFromFloat(@ceil(cy0f)) else 0;
+        const cy1: u32 = if (has_core) @intFromFloat(@floor(cy1f)) else 0;
+
         var y: u32 = 0;
         while (y < self.height) : (y += 1) {
             const fy = @as(f32, @floatFromInt(y)) + 0.5;
             const row = self.pixels[@as(usize, y) * self.width ..][0..self.width];
+            const core_row = has_core and y >= cy0 and y < cy1;
             var x: u32 = 0;
             while (x < self.width) : (x += 1) {
-                const fx = @as(f32, @floatFromInt(x)) + 0.5;
-
-                const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
-                const panel_cov = coverage(d_panel);
-
-                // Shadow: same shape, nudged down, smooth penumbra — and clipped to the
-                // outside of the panel so the glass stays clean over the blur.
-                const d_shadow = roundedRectSdf(fx, fy - style.shadow_offset_y, m, m, pw, ph, style.corner_radius);
-                const shadow = style.shadow_alpha *
-                    (1.0 - smoothstep(-style.shadow_blur, style.shadow_blur, d_shadow)) *
-                    (1.0 - panel_cov);
-
-                // 1px highlight ring hugging the panel edge from the inside.
-                const ring = coverage(@abs(d_panel + 1.0) - 1.0) * style.border_alpha * panel_cov;
-
-                // Composite back-to-front in premultiplied space, starting from the
-                // shadow (pure black at alpha `shadow`), then glass, then ring.
-                var glass_cov = panel_cov;
-                if (style.glass_fade_width > 0.0) {
-                    glass_cov *= smoothstep(0.0, style.glass_fade_width, -d_panel);
+                if (core_row and x == cx0 and cx1 > cx0) {
+                    @memset(row[cx0..cx1], core_px);
+                    x = cx1 - 1; // the loop's ++ resumes the band at cx1
+                    continue;
                 }
-                const ga = g.a * glass_cov;
-                var pr: f32 = 0.0;
-                var pg: f32 = 0.0;
-                var pb: f32 = 0.0;
-                var pa: f32 = shadow;
-                pr = g.r * ga + pr * (1.0 - ga);
-                pg = g.g * ga + pg * (1.0 - ga);
-                pb = g.b * ga + pb * (1.0 - ga);
-                pa = ga + pa * (1.0 - ga);
-                pr = ring + pr * (1.0 - ring);
-                pg = ring + pg * (1.0 - ring);
-                pb = ring + pb * (1.0 - ring);
-                pa = ring + pa * (1.0 - ring);
-
-                row[x] = packPremul(pr, pg, pb, pa);
+                const fx = @as(f32, @floatFromInt(x)) + 0.5;
+                row[x] = chromePixel(fx, fy, style, g, m, pw, ph);
             }
         }
+    }
+
+    /// One chrome pixel at sub-pixel `(fx,fy)`: drop shadow, rounded glass and the 1px
+    /// highlight ring, composited back-to-front in premultiplied space. The hot inner body
+    /// of `drawChrome`, kept separate so the flat-core fast path can skip it.
+    fn chromePixel(fx: f32, fy: f32, style: Style, g: Color, m: f32, pw: f32, ph: f32) u32 {
+        const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
+        const panel_cov = coverage(d_panel);
+
+        // Shadow: same shape, nudged down, smooth penumbra — clipped to the outside of the
+        // panel so the glass stays clean over the blur.
+        const d_shadow = roundedRectSdf(fx, fy - style.shadow_offset_y, m, m, pw, ph, style.corner_radius);
+        const shadow = style.shadow_alpha *
+            (1.0 - smoothstep(-style.shadow_blur, style.shadow_blur, d_shadow)) *
+            (1.0 - panel_cov);
+
+        // 1px highlight ring hugging the panel edge from the inside.
+        const ring = coverage(@abs(d_panel + 1.0) - 1.0) * style.border_alpha * panel_cov;
+
+        var glass_cov = panel_cov;
+        if (style.glass_fade_width > 0.0) {
+            glass_cov *= smoothstep(0.0, style.glass_fade_width, -d_panel);
+        }
+        const ga = g.a * glass_cov;
+        var pr: f32 = g.r * ga;
+        var pg: f32 = g.g * ga;
+        var pb: f32 = g.b * ga;
+        var pa: f32 = ga + shadow * (1.0 - ga);
+        pr = ring + pr * (1.0 - ring);
+        pg = ring + pg * (1.0 - ring);
+        pb = ring + pb * (1.0 - ring);
+        pa = ring + pa * (1.0 - ring);
+        return packPremul(pr, pg, pb, pa);
     }
 
     /// Blit straight-alpha RGBA pixels (zicro's `media.Frame` layout) into the canvas
@@ -581,4 +609,30 @@ test "chrome paints premultiplied" {
     try std.testing.expect((c >> 16 & 0xff) <= a and (c >> 8 & 0xff) <= a and (c & 0xff) <= a);
     // Corner of the gutter: fully transparent.
     try std.testing.expectEqual(@as(u32, 0), px[0]);
+}
+
+test "drawChrome flat-core equals the per-pixel reference" {
+    const gpa = std.testing.allocator;
+    const w: u32 = 220;
+    const h: u32 = 180;
+    // Non-trivial fade + radius so the core boundary is exercised near the corners.
+    const style = Style{ .glass_fade_width = 6.0, .corner_radius = 16.0 };
+
+    const fast = try gpa.alloc(u32, w * h);
+    defer gpa.free(fast);
+    var canvas = Canvas.init(fast, w, h);
+    canvas.drawChrome(style);
+
+    const m: f32 = @floatFromInt(style.margin);
+    const pw = @as(f32, @floatFromInt(w)) - 2.0 * m;
+    const ph = @as(f32, @floatFromInt(h)) - 2.0 * m;
+    const g = style.glass;
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const ref = Canvas.chromePixel(@as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5, style, g, m, pw, ph);
+            try std.testing.expectEqual(ref, fast[y * w + x]);
+        }
+    }
 }
