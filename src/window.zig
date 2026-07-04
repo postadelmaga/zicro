@@ -22,10 +22,12 @@ pub const Options = struct {
 pub const Window = switch (builtin.os.tag) {
     .linux => @import("window_wayland.zig").Window,
     .windows => @import("window_win32.zig").Window,
+    .macos => @import("window_cocoa.zig").Window,
     else => struct {
         gpa: std.mem.Allocator,
-        pub fn init(gpa: std.mem.Allocator, opts: Options) !*@This() {
+        pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*@This() {
             _ = opts;
+            _ = io;
             const self = try gpa.create(@This());
             self.* = .{ .gpa = gpa };
             return self;

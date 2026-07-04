@@ -37,6 +37,19 @@ const protocol = @import("protocol.zig");
 const pool_mod = @import("pool.zig");
 const SlabPool = pool_mod.SlabPool;
 
+// The envelope and the subscriber inbox live in their own files (this broker only routes);
+// see [`message`](message.zig) and [`inbox`](inbox.zig).
+const message = @import("message.zig");
+const inbox_mod = @import("inbox.zig");
+const Shared = message.Shared;
+const SpaceSignal = inbox_mod.SpaceSignal;
+const Inbox = inbox_mod.Inbox;
+
+/// A received-envelope handle onto one shared allocation — see [`message.Msg`].
+pub const Msg = message.Msg;
+/// The consumer handle handed out by every `subscribe*` — see [`inbox.Receiver`].
+pub const Receiver = inbox_mod.Receiver;
+
 pub const Envelope = protocol.Envelope;
 pub const Channel = protocol.Channel;
 pub const ModuleId = protocol.ModuleId;
@@ -54,7 +67,7 @@ pub const Overflow = enum {
     block,
 };
 
-pub const BusError = error{ Disconnected, OutOfMemory };
+pub const BusError = inbox_mod.BusError;
 
 /// A point-in-time snapshot of one channel's traffic, from [`LocalBus.channelMetrics`].
 pub const ChannelMetrics = struct {
@@ -64,252 +77,6 @@ pub const ChannelMetrics = struct {
     dropped: u64 = 0,
     /// Live subscribers on the channel right now.
     subscribers: usize = 0,
-};
-
-// --- the shared, reference-counted envelope --------------------------------------------
-
-const Shared = struct {
-    refs: std.atomic.Value(usize),
-    /// The slab pool this envelope's block came from (and returns to). Each in-flight
-    /// envelope holds one pool reference, so messages can outlive the bus safely.
-    pool: *SlabPool,
-    /// Length of the slab (a size class, or exact when oversize) — what gets recycled.
-    cap: usize,
-    env: Envelope, // slices point into this same slab, right after the header
-
-    /// One slab carries the header *and* the three strings: a publish is a single pool
-    /// acquire — recycled, so **zero allocator calls in steady state** — and the envelope
-    /// reads from one cache-warm contiguous block.
-    fn create(pool: *SlabPool, from: ModuleId, channel: Channel, payload: []const u8) Allocator.Error!*Shared {
-        const total = @sizeOf(Shared) + from.len + channel.len + payload.len;
-        const slab = try pool.acquire(total);
-        const s: *Shared = @ptrCast(slab.ptr);
-        var off: usize = @sizeOf(Shared);
-        const from_d = slab[off..][0..from.len];
-        @memcpy(from_d, from);
-        off += from.len;
-        const channel_d = slab[off..][0..channel.len];
-        @memcpy(channel_d, channel);
-        off += channel.len;
-        const payload_d = slab[off..][0..payload.len];
-        @memcpy(payload_d, payload);
-        s.* = .{
-            .refs = .init(1),
-            .pool = pool.retain(),
-            .cap = slab.len,
-            .env = .{ .from = from_d, .channel = channel_d, .payload = payload_d },
-        };
-        return s;
-    }
-
-    fn retain(s: *Shared) *Shared {
-        _ = s.refs.fetchAdd(1, .monotonic);
-        return s;
-    }
-
-    fn release(s: *Shared) void {
-        if (s.refs.fetchSub(1, .acq_rel) == 1) {
-            const pool = s.pool;
-            const raw: [*]align(pool_mod.slab_align) u8 = @ptrCast(@alignCast(s));
-            pool.recycle(raw[0..s.cap]);
-            pool.release();
-        }
-    }
-};
-
-/// One received envelope. A cheap handle onto a shared allocation: read it via
-/// [`Msg.env`], release it with [`Msg.deinit`].
-pub const Msg = struct {
-    shared: *Shared,
-
-    pub fn env(m: *const Msg) *const Envelope {
-        return &m.shared.env;
-    }
-
-    pub fn deinit(m: Msg) void {
-        m.shared.release();
-    }
-};
-
-// --- the subscriber inbox ----------------------------------------------------------------
-
-/// The bus-wide "an inbox freed space" eventcount. A publisher doing a `.block` fan-out
-/// may be waiting on space in *several* inboxes at once, and a futex can only wait on one
-/// address — so every pop that empties a slot of a *full* ring signals here instead, and
-/// the publisher waits here. Reference-counted (bus + every inbox) because receivers can
-/// outlive the bus and still pop. Thanks to the waiter-gated [`sync.Signal`], when no
-/// publisher is blocked a notify is a single atomic add.
-const SpaceSignal = struct {
-    gpa: Allocator,
-    refs: std.atomic.Value(usize),
-    signal: sync.Signal = .{},
-
-    fn create(gpa: Allocator) Allocator.Error!*SpaceSignal {
-        const sp = try gpa.create(SpaceSignal);
-        sp.* = .{ .gpa = gpa, .refs = .init(1) };
-        return sp;
-    }
-
-    fn retain(sp: *SpaceSignal) *SpaceSignal {
-        _ = sp.refs.fetchAdd(1, .monotonic);
-        return sp;
-    }
-
-    fn release(sp: *SpaceSignal) void {
-        if (sp.refs.fetchSub(1, .acq_rel) == 1) sp.gpa.destroy(sp);
-    }
-};
-
-/// A bounded MPSC ring of shared envelopes. Reference-counted because it is held by the
-/// bus (once per subscribed channel) *and* by the receiver; either side may go first.
-const Inbox = struct {
-    gpa: Allocator,
-    refs: std.atomic.Value(usize),
-    mutex: Io.Mutex = .init,
-    /// Bumped on every push/close — wakes blocked readers.
-    changed: sync.Signal = .{},
-    /// The bus-wide space signal — notified when a pop makes a full ring non-full (and on
-    /// close/receiver-gone), waking publishers blocked in a `.block` fan-out.
-    space: *SpaceSignal,
-    items: []*Shared, // ring storage
-    head: usize = 0,
-    len: usize = 0,
-    /// The bus is gone (deinit) — nothing more will ever arrive.
-    closed: bool = false,
-    /// The receiver is gone — pushes are pointless; publisher prunes on sight.
-    receiver_gone: bool = false,
-
-    fn create(gpa: Allocator, capacity: usize, initial_refs: usize, space: *SpaceSignal) Allocator.Error!*Inbox {
-        const inbox = try gpa.create(Inbox);
-        errdefer gpa.destroy(inbox);
-        const items = try gpa.alloc(*Shared, @max(capacity, 1));
-        inbox.* = .{ .gpa = gpa, .refs = .init(initial_refs), .items = items, .space = space.retain() };
-        return inbox;
-    }
-
-    fn retain(inbox: *Inbox) *Inbox {
-        _ = inbox.refs.fetchAdd(1, .monotonic);
-        return inbox;
-    }
-
-    fn release(inbox: *Inbox, io: Io) void {
-        if (inbox.refs.fetchSub(1, .acq_rel) == 1) {
-            // Last holder: drain whatever is still queued.
-            sync.lock(&inbox.mutex, io);
-            while (inbox.len > 0) {
-                inbox.items[inbox.head].release();
-                inbox.head = (inbox.head + 1) % inbox.items.len;
-                inbox.len -= 1;
-            }
-            sync.unlock(&inbox.mutex, io);
-            inbox.space.release();
-            inbox.gpa.free(inbox.items);
-            inbox.gpa.destroy(inbox);
-        }
-    }
-
-    const PushResult = enum { ok, full, gone };
-
-    /// Non-blocking push (both fan-outs). Takes ownership of one reference to `shared`
-    /// only on `.ok`. `.gone` means the receiver (or bus) went away — skip, don't retry.
-    fn tryPush(inbox: *Inbox, io: Io, shared: *Shared) PushResult {
-        sync.lock(&inbox.mutex, io);
-        defer sync.unlock(&inbox.mutex, io);
-        if (inbox.receiver_gone or inbox.closed) return .gone;
-        if (inbox.len == inbox.items.len) return .full;
-        inbox.items[(inbox.head + inbox.len) % inbox.items.len] = shared.retain();
-        inbox.len += 1;
-        inbox.changed.notifyAll(io);
-        return .ok;
-    }
-
-    fn popLocked(inbox: *Inbox, io: Io) ?*Shared {
-        if (inbox.len == 0) return null;
-        const shared = inbox.items[inbox.head];
-        inbox.head = (inbox.head + 1) % inbox.items.len;
-        inbox.len -= 1;
-        // Publishers block only on a *full* ring — wake them at the half-drained mark
-        // (hysteresis), so a blocked publisher refills in bursts of capacity/2 instead of
-        // paying one futex round trip per slot. A draining receiver always crosses this
-        // mark on its way to empty, so a blocked publisher can never be stranded.
-        if (inbox.len == inbox.items.len / 2) inbox.space.signal.notifyAll(io);
-        return shared;
-    }
-
-    fn markClosed(inbox: *Inbox, io: Io) void {
-        sync.lock(&inbox.mutex, io);
-        inbox.closed = true;
-        inbox.changed.notifyAll(io);
-        inbox.space.signal.notifyAll(io); // a blocked publisher must see `closed`
-        sync.unlock(&inbox.mutex, io);
-    }
-};
-
-/// Receives envelopes from the bus — the merged inbox of one `subscribe*` call.
-pub const Receiver = struct {
-    inbox: *Inbox,
-    io: Io,
-
-    /// Block until the next envelope. `error.Disconnected` once the bus is gone and the
-    /// inbox is drained.
-    pub fn recv(r: *Receiver) BusError!Msg {
-        while (true) {
-            sync.lock(&r.inbox.mutex, r.io);
-            if (r.inbox.popLocked(r.io)) |shared| {
-                sync.unlock(&r.inbox.mutex, r.io);
-                return .{ .shared = shared };
-            }
-            if (r.inbox.closed) {
-                sync.unlock(&r.inbox.mutex, r.io);
-                return error.Disconnected;
-            }
-            const snapshot = r.inbox.changed.prepare();
-            sync.unlock(&r.inbox.mutex, r.io);
-            r.inbox.changed.waitSpin(r.io, snapshot);
-        }
-    }
-
-    /// Non-blocking poll: `null` when nothing is ready.
-    pub fn tryRecv(r: *Receiver) BusError!?Msg {
-        sync.lock(&r.inbox.mutex, r.io);
-        defer sync.unlock(&r.inbox.mutex, r.io);
-        if (r.inbox.popLocked(r.io)) |shared| return .{ .shared = shared };
-        if (r.inbox.closed) return error.Disconnected;
-        return null;
-    }
-
-    /// Block for at most `timeout_ns`. `null` on timeout — lets a module's loop wake
-    /// periodically to check a shutdown flag without a busy spin.
-    pub fn recvTimeout(r: *Receiver, timeout_ns: u64) BusError!?Msg {
-        const deadline = sync.deadlineAfterNs(r.io, timeout_ns);
-        while (true) {
-            sync.lock(&r.inbox.mutex, r.io);
-            if (r.inbox.popLocked(r.io)) |shared| {
-                sync.unlock(&r.inbox.mutex, r.io);
-                return .{ .shared = shared };
-            }
-            if (r.inbox.closed) {
-                sync.unlock(&r.inbox.mutex, r.io);
-                return error.Disconnected;
-            }
-            const snapshot = r.inbox.changed.prepare();
-            sync.unlock(&r.inbox.mutex, r.io);
-            if (sync.expired(r.io, deadline)) return null;
-            r.inbox.changed.waitTimeout(r.io, snapshot, .{ .deadline = deadline });
-        }
-    }
-
-    /// Unsubscribe: publishers stop delivering here and prune the inbox lazily.
-    pub fn deinit(r: *Receiver) void {
-        sync.lock(&r.inbox.mutex, r.io);
-        r.inbox.receiver_gone = true;
-        // Drain now so retained references don't linger until the bus prunes us.
-        while (r.inbox.popLocked(r.io)) |shared| shared.release();
-        r.inbox.changed.notifyAll(r.io);
-        r.inbox.space.signal.notifyAll(r.io); // a blocked publisher must see `receiver_gone`
-        sync.unlock(&r.inbox.mutex, r.io);
-        r.inbox.release(r.io);
-    }
 };
 
 // --- the broker ---------------------------------------------------------------------------
@@ -613,8 +380,27 @@ pub const LocalBus = struct {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
         if (bus.space == null) bus.space = try SpaceSignal.create(bus.gpa);
-        // One reference for the receiver plus one per channel entry on the bus.
-        const inbox = try Inbox.create(bus.gpa, capacity, 1 + channels.len, bus.space.?);
+        // Start with just the receiver's reference; each *successful* channel append adds
+        // one. If a mid-loop OOM aborts the subscription, the errdefers below detach the
+        // inbox from the channels already wired and drop every reference — no orphaned
+        // inbox (which would otherwise leak its ring, its SpaceSignal ref, and any retained
+        // values already pushed into it).
+        const inbox = try Inbox.create(bus.gpa, capacity, 1, bus.space.?);
+        errdefer inbox.release(bus.io);
+        var appended: usize = 0;
+        errdefer {
+            for (channels[0..appended]) |channel| {
+                if (bus.subs.getPtr(channel)) |list| {
+                    for (list.items, 0..) |it, i| {
+                        if (it == inbox) {
+                            _ = list.orderedRemove(i);
+                            break;
+                        }
+                    }
+                }
+                inbox.release(bus.io);
+            }
+        }
         for (channels) |channel| {
             // Hand the joiner the current value of a stateful channel right away.
             if (bus.retained.get(channel)) |shared| {
@@ -626,6 +412,8 @@ pub const LocalBus = struct {
                 gop.value_ptr.* = .empty;
             }
             try gop.value_ptr.append(bus.gpa, inbox);
+            _ = inbox.retain();
+            appended += 1;
         }
         return .{ .inbox = inbox, .io = bus.io };
     }

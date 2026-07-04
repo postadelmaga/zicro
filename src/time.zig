@@ -34,8 +34,11 @@ pub const Tick = struct {
 };
 
 fn intervalNsFromHz(hz: f64) u64 {
-    if (hz <= 0.0) return 0;
-    return @intFromFloat(std.time.ns_per_s / hz);
+    // A non-positive rate is a misconfiguration; fall back to 1 Hz rather than a 0 ns
+    // interval, which would turn `Clock.run` into a CPU-pinning spin loop. Floor every
+    // other rate at 1 ns so an absurdly high `hz` can't round down to the same trap.
+    if (hz <= 0.0) return std.time.ns_per_s;
+    return @max(@as(u64, @intFromFloat(std.time.ns_per_s / hz)), 1);
 }
 
 /// A source module that publishes a [`Tick`] on a channel at a fixed interval. Wire it

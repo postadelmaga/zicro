@@ -200,11 +200,14 @@ pub const StateWriter = struct {
         if (linux.errno(open_rc) != .SUCCESS) return error.ShmOpenFailed;
         const fd: std.posix.fd_t = @intCast(open_rc);
         errdefer _ = linux.close(fd);
+        // We just created (O_CREAT|O_EXCL) this /dev/shm object; unlink it on any failure
+        // below, or the live creating process orphans it (sweepOrphans only reaps names
+        // whose creator has exited).
+        errdefer _ = linux.unlink(path);
 
         w.cap = options.cap;
         const total = header + w.cap;
         if (linux.errno(linux.ftruncate(fd, @intCast(total))) != .SUCCESS) {
-            _ = linux.unlink(path);
             return error.ShmResizeFailed;
         }
         w.map = try std.posix.mmap(null, total, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);

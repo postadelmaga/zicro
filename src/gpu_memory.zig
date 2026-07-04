@@ -32,9 +32,9 @@ pub const Buffer = struct {
         const fd = try std.posix.memfd_create(name, 0);
         errdefer _ = linux.close(fd);
 
-        // Resize to the requested size via ftruncate syscall.
-        const rc = linux.ftruncate(fd, @intCast(size));
-        if (rc < 0) return error.FtruncateFailed;
+        // Resize to the requested size via ftruncate syscall. `linux.ftruncate` returns a
+        // `usize`-encoded result, so check the errno rather than a (never-negative) sign.
+        if (linux.errno(linux.ftruncate(fd, @intCast(size))) != .SUCCESS) return error.FtruncateFailed;
 
         // Map it into CPU address space. The GPU process will map the same fd
         // independently via its external memory importer.

@@ -13,6 +13,36 @@ const Io = std.Io;
 /// The clock every deadline and pace in zicro is measured on (monotonic while awake).
 pub const clock: Io.Clock = .awake;
 
+/// A shared reference count with the canonical Arc memory ordering. A new holder only
+/// needs atomicity, so [`retain`](RefCount.retain) increments `monotonic`; the final
+/// [`release`](RefCount.release) must both *observe* every prior holder's writes and
+/// *publish* its own before teardown, so it decrements `acq_rel`. `release` returns `true`
+/// exactly once — for the last holder, which owns the teardown. Consolidated here so the
+/// ordering lives in one place instead of being re-derived at every reference-counted type
+/// (the bus's `Shared`/`SpaceSignal`/`Inbox`, the slab `Pool`, the media `Rc`).
+pub const RefCount = struct {
+    n: std.atomic.Value(usize),
+
+    pub fn init(initial: usize) RefCount {
+        return .{ .n = .init(initial) };
+    }
+
+    /// Add a reference.
+    pub fn retain(rc: *RefCount) void {
+        _ = rc.n.fetchAdd(1, .monotonic);
+    }
+
+    /// Drop a reference; returns `true` iff this was the last one (run teardown then).
+    pub fn release(rc: *RefCount) bool {
+        return rc.n.fetchSub(1, .acq_rel) == 1;
+    }
+
+    /// The current count — for metrics/asserts, never for a decision that races a drop.
+    pub fn count(rc: *const RefCount) usize {
+        return rc.n.load(.monotonic);
+    }
+};
+
 /// A wait/notify epoch counter. Waiters snapshot the epoch, re-check their predicate under
 /// the caller's lock, then sleep until the epoch moves (or a timeout passes). Every state
 /// change that could unblock a waiter must call [`notifyAll`](Signal.notifyAll).

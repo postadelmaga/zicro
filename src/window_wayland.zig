@@ -5,11 +5,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     const wl = @import("wl.zig");
     const paint = @import("paint.zig");
     const window = @import("window.zig");
+    const sync = @import("sync.zig");
     const posix = std.posix;
     const linux = std.os.linux;
     const Allocator = std.mem.Allocator;
 
     gpa: Allocator,
+    io: std.Io,
     opts: window.Options,
 
     display: *wl.Display,
@@ -39,7 +41,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     buf_w: u32 = 0,
     buf_h: u32 = 0,
 
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     staged: Staged = .{},
     front: Staged = .{},
     wake_fd: posix.fd_t,
@@ -61,7 +63,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         fresh: bool = false,
     };
 
-    pub fn init(gpa: Allocator, opts: window.Options) !*Window {
+    pub fn init(gpa: Allocator, io: std.Io, opts: window.Options) !*Window {
         const display = wl.wl_display_connect(null) orelse return error.NoWaylandDisplay;
         errdefer wl.wl_display_disconnect(display);
 
@@ -74,6 +76,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
+            .io = io,
             .opts = opts,
             .display = display,
             .registry = wl.displayGetRegistry(display),
@@ -133,7 +136,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const need = @as(usize, width) * @as(usize, height) * 4;
         if (rgba.len < need) return;
         {
-            self.mutex.lock();
+            sync.lock(&self.mutex, self.io);
             defer self.mutex.unlock();
             self.staged.pixels.clearRetainingCapacity();
             self.staged.pixels.appendSlice(self.gpa, rgba[0..need]) catch {
@@ -177,9 +180,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             if (fds[1].revents & posix.POLL.IN != 0) {
                 var drained: u64 = 0;
                 _ = posix.read(self.wake_fd, std.mem.asBytes(&drained)) catch {};
-                self.mutex.lock();
+                sync.lock(&self.mutex, self.io);
                 const has_frame = self.staged.fresh;
-                self.mutex.unlock();
+                sync.unlock(&self.mutex, self.io);
                 if (has_frame) {
                     self.needs_redraw = true;
                 }
@@ -204,12 +207,12 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const content = window.Rect{ .x = 0, .y = 0, .w = @intCast(bw), .h = @intCast(bh) };
         if (self.opts.on_draw) |draw| draw(&canvas, content, self.opts.user);
 
-        self.mutex.lock();
+        sync.lock(&self.mutex, self.io);
         if (self.staged.fresh) {
             std.mem.swap(Staged, &self.staged, &self.front);
             self.staged.fresh = false;
         }
-        self.mutex.unlock();
+        sync.unlock(&self.mutex, self.io);
 
         if (self.front.width > 0) {
             const fw = @min(self.front.width, bw);
@@ -363,14 +366,19 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         .wm_capabilities = onToplevelWmCapabilities,
     };
 
-    fn onToplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, w: i32, h: i32, states: *wl.Array) callconv(.c) void {
+    fn onToplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, w: i32, h: i32, states_raw: ?*anyopaque) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        
+
         var is_fs = false;
-        const p: [*]const u32 = @ptrCast(@alignCast(states.data));
-        const n = states.size / 4;
-        for (p[0..n]) |state| {
-            if (state == wl.XDG_TOPLEVEL_STATE_FULLSCREEN) is_fs = true;
+        if (states_raw) |sr| {
+            const states: *const wl.Array = @ptrCast(@alignCast(sr));
+            if (states.data) |raw| {
+                const p: [*]const u32 = @ptrCast(@alignCast(raw));
+                const n = states.size / 4;
+                for (p[0..n]) |state| {
+                    if (state == wl.STATE_FULLSCREEN) is_fs = true;
+                }
+            }
         }
 
         self.fullscreen = is_fs;
@@ -390,7 +398,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.closed = true;
     }
     fn onToplevelConfigureBounds(_: ?*anyopaque, _: *wl.XdgToplevel, _: i32, _: i32) callconv(.c) void {}
-    fn onToplevelWmCapabilities(_: ?*anyopaque, _: *wl.XdgToplevel, _: *wl.Array) callconv(.c) void {}
+    fn onToplevelWmCapabilities(_: ?*anyopaque, _: *wl.XdgToplevel, _: ?*anyopaque) callconv(.c) void {}
 
     const seat_listener = wl.Seat.Listener{
         .capabilities = onSeatCapabilities,
@@ -446,19 +454,21 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         .axis_source = onPointerAxisSource,
         .axis_stop = onPointerAxisStop,
         .axis_discrete = onPointerAxisDiscrete,
+        .axis_value120 = onPointerAxisValue120,
+        .axis_relative_direction = onPointerAxisRelativeDirection,
     };
 
-    fn onPointerEnter(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: ?*wl.Surface, sx: f32, sy: f32) callconv(.c) void {
+    fn onPointerEnter(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: ?*wl.Surface, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_serial = serial;
-        self.pointer_x = sx;
-        self.pointer_y = sy;
+        self.pointer_x = wl.fixedToF32(sx);
+        self.pointer_y = wl.fixedToF32(sy);
     }
     fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}
-    fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, sx: f32, sy: f32) callconv(.c) void {
+    fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        self.pointer_x = sx;
-        self.pointer_y = sy;
+        self.pointer_x = wl.fixedToF32(sx);
+        self.pointer_y = wl.fixedToF32(sy);
     }
     fn onPointerButton(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
@@ -468,9 +478,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             if (self.seat) |seat| self.toplevel.?.move(seat, serial);
         }
     }
-    fn onPointerAxis(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: u32, _: f32) callconv(.c) void {}
+    fn onPointerAxis(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: u32, _: wl.Fixed) callconv(.c) void {}
     fn onPointerFrame(_: ?*anyopaque, _: *wl.Pointer) callconv(.c) void {}
     fn onPointerAxisSource(_: ?*anyopaque, _: *wl.Pointer, _: u32) callconv(.c) void {}
     fn onPointerAxisStop(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: u32) callconv(.c) void {}
     fn onPointerAxisDiscrete(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: i32) callconv(.c) void {}
+    fn onPointerAxisValue120(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: i32) callconv(.c) void {}
+    fn onPointerAxisRelativeDirection(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: u32) callconv(.c) void {}
 };

@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Linux-specific Wayland support
-    if (target.query.os_tag == .linux) {
+    if (target.result.os.tag == .linux) {
         zicro.linkSystemLibrary("wayland-client", .{});
 
         // We only need the xdg-shell stable protocol for basic windowing
@@ -29,6 +29,13 @@ pub fn build(b: *std.Build) void {
         scan.addFileArg(.{ .cwd_relative = xml });
         const c_file = scan.addOutputFileArg("protocol.c");
         zicro.addCSourceFile(.{ .file = c_file });
+    }
+
+    // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
+    if (target.result.os.tag == .macos) {
+        zicro.linkFramework("Cocoa", .{});
+        zicro.linkFramework("QuartzCore", .{});
+        zicro.linkFramework("CoreGraphics", .{});
     }
 
     // `zig build test` — every `test` block in the library.
@@ -49,13 +56,18 @@ pub fn build(b: *std.Build) void {
         .file = b.path("vendor/stb/stb_truetype_impl.c"),
         .flags = &.{ "-O2", "-fno-sanitize=undefined" },
     });
-    if (target.query.os_tag == .linux) {
+    if (target.result.os.tag == .linux) {
         zicro_fast.linkSystemLibrary("wayland-client", .{});
         const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
         const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
         scan.addFileArg(.{ .cwd_relative = xml });
         const c_file = scan.addOutputFileArg("protocol.c");
         zicro_fast.addCSourceFile(.{ .file = c_file });
+    }
+    if (target.result.os.tag == .macos) {
+        zicro_fast.linkFramework("Cocoa", .{});
+        zicro_fast.linkFramework("QuartzCore", .{});
+        zicro_fast.linkFramework("CoreGraphics", .{});
     }
 
     const bench_exe = b.addExecutable(.{

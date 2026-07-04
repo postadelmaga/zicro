@@ -49,8 +49,6 @@ pub const shmem = @import("shmem.zig");
 // -- GPU memory: autonomous, format-agnostic, API-bindable
 pub const gpu_memory = @import("gpu_memory.zig");
 pub const gpu_vulkan = @import("gpu_vulkan.zig");
-pub const gpu_wgpu = @import("gpu_wgpu.zig");
-pub const gpu_wgpu_native = @import("gpu_wgpu_native.zig");
 pub const gpu_wgpu_bridge_ffi = @import("gpu_wgpu_bridge_ffi.zig");
 
 // -- the short names an app usually wants
@@ -70,6 +68,10 @@ const sync = @import("sync.zig");
 test {
     _ = sync;
     _ = @import("pool.zig");
+    _ = @import("rc.zig");
+    _ = @import("message.zig");
+    _ = @import("inbox.zig");
+    _ = @import("worker_pool.zig");
     _ = protocol;
     _ = bus;
     _ = document;
@@ -86,8 +88,6 @@ test {
     _ = shmem;
     _ = gpu_memory;
     _ = gpu_vulkan;
-    _ = gpu_wgpu;
-    _ = gpu_wgpu_native;
     _ = gpu_wgpu_bridge_ffi;
     _ = text;
     _ = paint;

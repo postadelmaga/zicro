@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const sync = @import("sync.zig");
 
 /// Alignment of every slab the pool hands out — generous enough for any envelope header.
 pub const slab_align = 16;
@@ -116,7 +117,7 @@ const FreeRing = struct {
 /// methods are thread-safe and (aside from a cold-start alloc) lock-free.
 pub const SlabPool = struct {
     gpa: Allocator,
-    refs: std.atomic.Value(usize),
+    refs: sync.RefCount,
     rings: [class_sizes.len]FreeRing,
     cell_storage: []FreeRing.Cell, // one allocation backing every ring
 
@@ -143,13 +144,13 @@ pub const SlabPool = struct {
     }
 
     pub fn retain(pool: *SlabPool) *SlabPool {
-        _ = pool.refs.fetchAdd(1, .monotonic);
+        pool.refs.retain();
         return pool;
     }
 
     /// Drop one reference; the last one frees every cached slab and the pool itself.
     pub fn release(pool: *SlabPool) void {
-        if (pool.refs.fetchSub(1, .acq_rel) == 1) {
+        if (pool.refs.release()) {
             const gpa = pool.gpa;
             for (&pool.rings, class_sizes) |*ring, class| {
                 while (ring.pop()) |ptr| gpa.free(ptr[0..class]);

@@ -1,6 +1,6 @@
-//! # zrame.paint — the software canvas
+//! # zicro.paint — the software canvas
 //!
-//! Everything zrame puts on screen is drawn here, on the CPU, into a premultiplied
+//! Everything zicro puts on screen is drawn here, on the CPU, into a premultiplied
 //! ARGB8888 buffer (the wl_shm wire format). The window chrome is analytic: a rounded
 //! rectangle is a signed-distance function, the drop shadow is a smooth falloff of the
 //! same SDF, anti-aliasing falls out of the distance for free. No textures, no GPU —
@@ -9,7 +9,7 @@
 const std = @import("std");
 pub const text = @import("text.zig");
 
-/// Opzioni di disegno del testo: dimensione in pixel, stile (faccia) e colore.
+/// Text drawing options: pixel size, style (face) and color.
 pub const TextOpts = struct {
     size: u16 = 14,
     style: text.Style = .regular,
@@ -71,22 +71,22 @@ fn coverage(d: f32) f32 {
     return std.math.clamp(0.5 - d, 0.0, 1.0);
 }
 
-/// sRGB (0..1) → luce lineare (0..1). Serve per fondere l'antialiasing dei glifi
-/// in spazio lineare (resa tipografica): fondere la copertura direttamente in
-/// sRGB assottiglia e sporca i bordi del testo, specie su fondo scuro.
+/// sRGB (0..1) → linear light (0..1). Needed to blend glyph antialiasing in
+/// linear space (typographic rendering): blending coverage directly in sRGB
+/// thins and dirties text edges, especially on a dark background.
 fn srgbToLinear(u: f32) f32 {
     return if (u <= 0.04045) u / 12.92 else std.math.pow(f32, (u + 0.055) / 1.055, 2.4);
 }
 
-/// Luce lineare (0..1) → sRGB (0..1).
+/// Linear light (0..1) → sRGB (0..1).
 fn linearToSrgb(u: f32) f32 {
     const x = std.math.clamp(u, 0.0, 1.0);
     return if (x <= 0.0031308) x * 12.92 else 1.055 * std.math.pow(f32, x, 1.0 / 2.4) - 0.055;
 }
 
-/// "Font smoothing" in stile macOS: solleva la copertura media per ingrassare
-/// leggermente i tratti (macOS rende il testo più pieno e morbido del grayscale
-/// grezzo). Esponente < 1 → più pieno.
+/// macOS-style "font smoothing": lifts mid coverage to slightly fatten the
+/// strokes (macOS renders text fuller and softer than raw grayscale). Exponent
+/// < 1 → fuller.
 fn smoothCoverage(a: f32) f32 {
     return std.math.pow(f32, std.math.clamp(a, 0.0, 1.0), 0.72);
 }
@@ -506,10 +506,10 @@ pub const Canvas = struct {
         }
     }
 
-    /// Disegna `s` con `font` a partire da `x` (bordo sinistro) e `baseline_y`
-    /// (baseline del testo), avanzando la penna glifo per glifo. Compone la
-    /// copertura sopra i pixel premoltiplicati (source-over). Usa `font.ascent`
-    /// per convertire un bordo superiore in baseline se serve.
+    /// Draws `s` with `font` starting at `x` (left edge) and `baseline_y` (the
+    /// text baseline), advancing the pen glyph by glyph. Composites the coverage
+    /// over the premultiplied pixels (source-over). Use `font.ascent` to convert
+    /// a top edge into a baseline if needed.
     pub fn drawText(self: *Canvas, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts) void {
         var pen_x: i32 = x;
         var i: usize = 0;
@@ -524,7 +524,7 @@ pub const Canvas = struct {
         }
     }
 
-    /// Fonde la copertura di un glifo (colore straight) sul canvas premoltiplicato.
+    /// Blends a glyph's coverage (straight color) onto the premultiplied canvas.
     fn blitGlyph(self: *Canvas, g: *const text.Glyph, pen_x: i32, baseline_y: i32, color: Color) void {
         if (g.bitmap.len == 0) return;
         const gx0 = pen_x + g.xoff;
@@ -542,16 +542,16 @@ pub const Canvas = struct {
                 if (!self.inClip(@intCast(px), @intCast(py))) continue;
                 const cov = g.bitmap[@intCast(gy * g.w + gx)];
                 if (cov == 0) continue;
-                // Stem darkening in stile macOS + copertura → alpha.
+                // macOS-style stem darkening + coverage → alpha.
                 const a0 = smoothCoverage(@as(f32, @floatFromInt(cov)) / 255.0);
                 const sa = color.a * a0;
                 if (sa <= 0.0) continue;
                 const idx = @as(usize, @intCast(py)) * self.width + @as(usize, @intCast(px));
                 const dr, const dg, const db, const da = unpackPremul(self.pixels[idx]);
                 const inv = 1.0 - sa;
-                // "Over" gamma-corretto: fondi RGB in luce lineare (i canali premoltiplicati
-                // sono ~straight sul pannello opaco del chrome), poi torna a sRGB. L'alpha
-                // resta lineare (copertura geometrica).
+                // Gamma-correct "over": blend RGB in linear light (the premultiplied
+                // channels are ~straight over the chrome's opaque panel), then back to
+                // sRGB. The alpha stays linear (geometric coverage).
                 self.pixels[idx] = packPremul(
                     linearToSrgb(srgbToLinear(color.r) * sa + srgbToLinear(dr) * inv),
                     linearToSrgb(srgbToLinear(color.g) * sa + srgbToLinear(dg) * inv),
@@ -569,7 +569,7 @@ test "drawText produces ink and renders a preview" {
     const H: u32 = 90;
     const pixels = try gpa.alloc(u32, W * H);
     defer gpa.free(pixels);
-    // Sfondo scuro opaco.
+    // Opaque dark background.
     @memset(pixels, packPremul(0.07, 0.07, 0.1, 1.0));
 
     var canvas = Canvas.init(pixels, W, H);
@@ -579,7 +579,7 @@ test "drawText produces ink and renders a preview" {
     const v = font.vmetrics(34, .bold);
     canvas.drawText(&font, 20, 16 + v.ascent, "zrame text ✓ Ag", .{ .size = 34, .style = .bold, .color = Color.rgba(235, 238, 250, 1.0) });
 
-    // Molti pixel differiscono dallo sfondo (i glifi hanno lasciato inchiostro).
+    // Many pixels differ from the background (the glyphs left ink).
     const bg = packPremul(0.07, 0.07, 0.1, 1.0);
     var ink: usize = 0;
     for (pixels) |p| {

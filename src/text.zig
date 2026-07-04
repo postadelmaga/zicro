@@ -1,25 +1,25 @@
-//! # zrame.text — motore di testo nativo (stb_truetype)
+//! # zicro.text — native text engine (stb_truetype)
 //!
-//! Rasterizza glifi a una dimensione in pixel esatta (niente scaling → nitido) e
-//! li memorizza in cache come mappe di copertura (alpha 0..255). È estendibile:
-//! un font di default è embeddato (Hack regular+bold), ma ogni faccia può essere
-//! sostituita da byte TTF arbitrari (`setFace`) o caricata da disco (`loadFace`).
+//! Rasterizes glyphs at an exact pixel size (no scaling → crisp) and caches
+//! them as coverage maps (alpha 0..255). It is extensible: a default font is
+//! embedded (Hack regular+bold), but any face can be replaced with arbitrary
+//! TTF bytes (`setFace`) or loaded from disk (`loadFace`).
 //!
-//! Il *compositing* dei glifi sul canvas premoltiplicato vive in `paint.zig`
-//! (`Canvas.drawText`); qui c'è solo la rasterizzazione, senza dipendenze da paint.
+//! The glyph *compositing* onto the premultiplied canvas lives in `paint.zig`
+//! (`Canvas.drawText`); here there is only rasterization, with no dependency on paint.
 
 const std = @import("std");
 const c = @cImport({
     @cInclude("stb_truetype.h");
 });
 
-/// Facce disponibili. Il default embedda regular+bold; italic/bold_italic sono
-/// opzionali e, se assenti, ripiegano su bold/regular.
+/// Available faces. The default embeds regular+bold; italic/bold_italic are
+/// optional and, when absent, fall back to bold/regular.
 pub const Style = enum(u2) { regular = 0, bold = 1, italic = 2, bold_italic = 3 };
 
-/// Glifo rasterizzato: copertura (alpha 0..255) di dimensione w*h, offset dal
-/// punto di penna, baseline e avanzamento orizzontale (per font proporzionali).
-/// `bitmap` è di proprietà della cache.
+/// Rasterized glyph: coverage (alpha 0..255) of size w*h, offset from the pen
+/// point, baseline and horizontal advance (for proportional fonts).
+/// `bitmap` is owned by the cache.
 pub const Glyph = struct {
     w: i32,
     h: i32,
@@ -34,20 +34,20 @@ const default_bold = @embedFile("assets/Hack-Bold.ttf");
 
 const Face = struct {
     info: c.stbtt_fontinfo,
-    // Byte TTF posseduti (font caricato da disco): devono sopravvivere a `info`,
-    // che vi punta dentro. `null` per i font embeddati statici.
+    // Owned TTF bytes (font loaded from disk): they must outlive `info`, which
+    // points into them. `null` for statically embedded fonts.
     owned: ?[]u8 = null,
 };
 
 const CacheKey = struct { px: u16, style: Style, cp: u32 };
 
-/// Un font: fino a 4 facce + cache dei glifi condivisa (chiave px+stile+cp).
+/// A font: up to 4 faces + a shared glyph cache (key px+style+cp).
 pub const Font = struct {
     gpa: std.mem.Allocator,
     faces: [4]?Face = .{ null, null, null, null },
     cache: std.AutoHashMapUnmanaged(CacheKey, Glyph) = .empty,
 
-    /// Font di default: Hack regular + bold embeddati nel binario.
+    /// Default font: Hack regular + bold embedded in the binary.
     pub fn initDefault(gpa: std.mem.Allocator) !Font {
         var self = Font{ .gpa = gpa };
         errdefer self.deinit();
@@ -56,9 +56,9 @@ pub const Font = struct {
         return self;
     }
 
-    /// Imposta una faccia da byte TTF. Con `own = true` il `Font` prende possesso
-    /// di `ttf` e lo libera in `deinit` (font da disco); con `false` assume che i
-    /// byte restino validi per tutta la vita del font (embeddati statici).
+    /// Sets a face from TTF bytes. With `own = true` the `Font` takes ownership
+    /// of `ttf` and frees it in `deinit` (font from disk); with `false` it assumes
+    /// the bytes stay valid for the whole lifetime of the font (statically embedded).
     pub fn setFace(self: *Font, style: Style, ttf: []const u8, own: bool) !void {
         var face: Face = .{ .info = undefined, .owned = if (own) @constCast(ttf) else null };
         const p: [*c]const u8 = @ptrCast(ttf.ptr);
@@ -68,9 +68,9 @@ pub const Font = struct {
             return error.FontInit;
         }
         const idx = @intFromEnum(style);
-        // Sostituzione di una faccia: i glifi in cache di quello stile diventano
-        // stale, ma la chiave include lo stile e non la faccia — si svuota la
-        // cache per semplicità e correttezza (le facce si cambiano di rado).
+        // Replacing a face: the cached glyphs of that style go stale, but the key
+        // includes the style and not the face — the cache is cleared for
+        // simplicity and correctness (faces are changed rarely).
         if (self.faces[idx]) |old| {
             if (old.owned) |b| self.gpa.free(b);
             self.clearCache();
@@ -78,7 +78,7 @@ pub const Font = struct {
         self.faces[idx] = face;
     }
 
-    /// Carica una faccia da un file .ttf/.otf su disco (byte posseduti dal font).
+    /// Loads a face from a .ttf/.otf file on disk (bytes owned by the font).
     pub fn loadFace(self: *Font, style: Style, path: []const u8) !void {
         const bytes = try std.fs.cwd().readFileAlloc(self.gpa, path, 64 * 1024 * 1024);
         errdefer self.gpa.free(bytes);
@@ -91,8 +91,8 @@ pub const Font = struct {
         self.cache.clearRetainingCapacity();
     }
 
-    /// Faccia effettiva per uno stile, con fallback: bold_italic→italic→bold→
-    /// regular, così un font con sole regular+bold resta comunque utilizzabile.
+    /// Effective face for a style, with fallback: bold_italic→italic→bold→
+    /// regular, so a font with only regular+bold stays usable.
     fn faceFor(self: *Font, style: Style) ?*c.stbtt_fontinfo {
         const order: []const Style = switch (style) {
             .regular => &.{.regular},
@@ -110,7 +110,7 @@ pub const Font = struct {
         return c.stbtt_ScaleForPixelHeight(info, @floatFromInt(px));
     }
 
-    /// Glifo rasterizzato per (dimensione, stile, codepoint), da cache.
+    /// Rasterized glyph for (size, style, codepoint), from the cache.
     pub fn getGlyph(self: *Font, px: u16, style: Style, cp: u32) !*const Glyph {
         const key = CacheKey{ .px = px, .style = style, .cp = cp };
         if (self.cache.getPtr(key)) |g| return g;
@@ -145,7 +145,7 @@ pub const Font = struct {
         return self.cache.getPtr(key).?;
     }
 
-    /// Metriche verticali in pixel a una data dimensione/stile.
+    /// Vertical metrics in pixels at a given size/style.
     pub const VMetrics = struct { ascent: i32, descent: i32, line_gap: i32 };
     pub fn vmetrics(self: *Font, px: u16, style: Style) VMetrics {
         const info = self.faceFor(style) orelse return .{ .ascent = px, .descent = 0, .line_gap = 0 };
@@ -161,13 +161,13 @@ pub const Font = struct {
         };
     }
 
-    /// Altezza di riga (avanzamento verticale) in pixel.
+    /// Line height (vertical advance) in pixels.
     pub fn lineHeight(self: *Font, px: u16, style: Style) i32 {
         const v = self.vmetrics(px, style);
         return v.ascent - v.descent + v.line_gap;
     }
 
-    /// Larghezza in pixel di `s` (somma degli avanzamenti), per centrare/allineare.
+    /// Width in pixels of `s` (sum of advances), for centering/aligning.
     pub fn measure(self: *Font, px: u16, style: Style, s: []const u8) i32 {
         var width: i32 = 0;
         var i: usize = 0;
@@ -199,15 +199,15 @@ test "default font rasterizes a glyph" {
     const g = try font.getGlyph(24, .regular, 'A');
     try std.testing.expect(g.w > 0 and g.h > 0);
     try std.testing.expect(g.advance > 0);
-    // 'A' ha copertura non nulla da qualche parte.
+    // 'A' has non-zero coverage somewhere.
     var any: bool = false;
     for (g.bitmap) |cov| {
         if (cov > 0) any = true;
     }
     try std.testing.expect(any);
 
-    // La misura di una stringa cresce con i caratteri.
+    // A string's measure grows with its characters.
     try std.testing.expect(font.measure(24, .regular, "Hi") > font.measure(24, .regular, "H"));
-    // Il bold ripiega su una faccia valida (embeddata), lo spazio no-ink è ok.
+    // Bold falls back to a valid (embedded) face; a no-ink space is fine.
     _ = try font.getGlyph(18, .bold, 'g');
 }

@@ -297,9 +297,12 @@ pub const VulkanBuffer = struct {
     }
 };
 
-/// A Vulkan timeline semaphore: enables GPU-to-CPU synchronization.
-/// Wraps VK_KHR_timeline_semaphores for ordered, condition-variable-style waits.
-/// Semaphore fd can be exported for cross-process sync.
+/// **Stub — CPU-side value tracker only, NOT a real GPU semaphore.** The intended design
+/// is a `VK_KHR_timeline_semaphore` (the `vkCreateSemaphore`/`vkWaitSemaphores` externs are
+/// declared but never called), but this currently just tracks a monotonic `u64` in host
+/// memory: `semaphore`/`device` stay null and no GPU wait ever happens. It is safe for
+/// bookkeeping a value on the bus, but **must not** be relied on for GPU↔CPU ordering until
+/// it is backed by a real `VkSemaphore`.
 pub const VulkanSemaphore = struct {
     semaphore: ?VkSemaphore = null,
     value: u64 = 0,

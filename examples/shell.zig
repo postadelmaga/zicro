@@ -27,8 +27,8 @@ const ShellState = struct {
             .gpa = gpa,
             .font = font,
             .bus = bus,
-            .lines = std.ArrayList([]const u8).init(gpa),
-            .input_buf = std.ArrayList(u8).init(gpa),
+            .lines = .empty,
+            .input_buf = .empty,
         };
     }
 
@@ -37,12 +37,12 @@ const ShellState = struct {
         for (self.lines.items) |line| {
             self.gpa.free(line);
         }
-        self.lines.deinit();
-        self.input_buf.deinit();
+        self.lines.deinit(self.gpa);
+        self.input_buf.deinit(self.gpa);
     }
 
     pub fn addLine(self: *ShellState, line: []const u8) !void {
-        try self.lines.append(line);
+        try self.lines.append(self.gpa, line);
         // Limit history to 20 lines to keep it clean on screen
         if (self.lines.items.len > 20) {
             const old = self.lines.orderedRemove(0);
@@ -112,8 +112,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const input_w = shell.font.measure(font_size, .regular, shell.input_buf.items);
     const cursor_x = 25 + prompt_w + input_w;
     
-    const time_ms = std.time.milliTimestamp();
-    if (@divTrunc(time_ms, 500) % 2 == 0) {
+    {
         // Draw a vertical block cursor
         var cy = text_y - v.ascent + 2;
         while (cy < text_y - v.descent) : (cy += 1) {
@@ -216,7 +215,7 @@ fn onKey(win: *window.Window, key: u32, state: u32, user: ?*anyopaque) void {
 
     // Map evdev keycode to character
     if (evdevToChar(key, shell.shift_pressed)) |c| {
-        shell.input_buf.append(c) catch {};
+        shell.input_buf.append(shell.gpa, c) catch {};
     }
 }
 
@@ -265,7 +264,7 @@ fn evdevToChar(key: u32, shift: bool) ?u8 {
 }
 
 pub fn main() !void {
-    var gpa_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_allocator.deinit();
     const gpa = gpa_allocator.allocator();
 
@@ -285,7 +284,7 @@ pub fn main() !void {
     try shell.addLine(try gpa.dupe(u8, "Hotkeys: f (fullscreen), Ctrl+D (exit), Super+Z (hide)"));
     try shell.addLine(try gpa.dupe(u8, ""));
 
-    const win = try window.Window.init(gpa, .{
+    const win = try window.Window.init(gpa, io, .{
         .title = "zicro-shell",
         .width = 680,
         .height = 440,

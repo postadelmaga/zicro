@@ -52,57 +52,10 @@ pub const PixelFormat = types.PixelFormat;
 pub const Frame = types.Frame;
 pub const AudioBlock = types.AudioBlock;
 
-/// An atomically reference-counted immutable slice — the port of `Arc<[T]>`. Cloning a
-/// handle ([`Rc.retain`]) is a counter bump; the buffer is freed on the last
-/// [`Rc.release`].
-pub fn Rc(comptime T: type) type {
-    return struct {
-        inner: *Inner,
-
-        const Inner = struct {
-            refs: std.atomic.Value(usize),
-            gpa: Allocator,
-            data: []T,
-        };
-
-        const Self = @This();
-
-        /// Allocate a shared copy of `data`.
-        pub fn init(gpa: Allocator, data: []const T) Allocator.Error!Self {
-            const inner = try gpa.create(Inner);
-            errdefer gpa.destroy(inner);
-            const copy = try gpa.dupe(T, data);
-            inner.* = .{ .refs = .init(1), .gpa = gpa, .data = copy };
-            return .{ .inner = inner };
-        }
-
-        /// Allocate a shared zero-filled buffer of `len` elements.
-        pub fn initZeroed(gpa: Allocator, len: usize) Allocator.Error!Self {
-            const inner = try gpa.create(Inner);
-            errdefer gpa.destroy(inner);
-            const buf = try gpa.alloc(T, len);
-            @memset(buf, std.mem.zeroes(T));
-            inner.* = .{ .refs = .init(1), .gpa = gpa, .data = buf };
-            return .{ .inner = inner };
-        }
-
-        pub fn slice(self: Self) []const T {
-            return self.inner.data;
-        }
-
-        pub fn retain(self: Self) Self {
-            _ = self.inner.refs.fetchAdd(1, .monotonic);
-            return self;
-        }
-
-        pub fn release(self: Self) void {
-            if (self.inner.refs.fetchSub(1, .acq_rel) == 1) {
-                self.inner.gpa.free(self.inner.data);
-                self.inner.gpa.destroy(self.inner);
-            }
-        }
-    };
-}
+/// An atomically reference-counted immutable slice — the port of `Arc<[T]>`. Defined in
+/// [`rc`](rc.zig) and re-exported here (both the data plane and the payload types share it
+/// without importing each other); see there for the semantics.
+pub const Rc = @import("rc.zig").Rc;
 
 fn maybeDeinit(comptime T: type, value: *T) void {
     if (comptime std.meta.hasFn(T, "deinit")) value.deinit();

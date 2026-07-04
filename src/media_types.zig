@@ -1,11 +1,11 @@
-//! The two canonical media payloads. Both wrap their buffer in an [`Rc`](media.Rc) so
+//! The two canonical media payloads. Both wrap their buffer in an [`Rc`](rc.Rc) so
 //! moving one across a channel (or retaining a handle for a second sink) is a pointer
 //! bump, not a copy — the whole point of the data plane.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const media = @import("media.zig");
+const rc = @import("rc.zig");
 
 /// How the bytes of a [`Frame`] are laid out. Kept minimal on purpose; an app adds
 /// variants in its own renderer if it needs more.
@@ -30,7 +30,7 @@ pub const Frame = struct {
     height: u32,
     format: PixelFormat,
     /// Tightly packed `width * height * bytesPerPixel` bytes.
-    pixels: media.Rc(u8),
+    pixels: rc.Rc(u8),
 
     /// Build a frame over a shared copy of `pixels`, checking the buffer length matches
     /// the geometry.
@@ -47,7 +47,7 @@ pub const Frame = struct {
             .width = width,
             .height = height,
             .format = format,
-            .pixels = try media.Rc(u8).init(gpa, pixels),
+            .pixels = try rc.Rc(u8).init(gpa, pixels),
         };
     }
 
@@ -72,13 +72,13 @@ pub const AudioBlock = struct {
     sample_rate: u32,
     channels: u16,
     /// Interleaved samples: `frames * channels` values, each in `-1.0..=1.0`.
-    samples: media.Rc(f32),
+    samples: rc.Rc(f32),
 
     pub fn init(gpa: Allocator, sample_rate: u32, channels: u16, samples: []const f32) Allocator.Error!AudioBlock {
         return .{
             .sample_rate = sample_rate,
             .channels = channels,
-            .samples = try media.Rc(f32).init(gpa, samples),
+            .samples = try rc.Rc(f32).init(gpa, samples),
         };
     }
 

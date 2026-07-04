@@ -40,14 +40,20 @@ One Zig file per Rust crate, one importable module:
 src/
   # micro-kernel — generic, zero domain
   protocol.zig   Envelope, Topic(T), ChannelKind          (zero logic)
-  bus.zig        LocalBus broker + Receiver               (+ retained, metrics)
+  message.zig    Shared (pooled, ref-counted envelope) + Msg   (bus internal)
+  inbox.zig      SpaceSignal + Inbox ring + Receiver       (bounded MPSC, backpressure)
+  bus.zig        LocalBus broker (routing)                (+ retained, metrics)
   pool.zig       size-classed slab recycler               (zero-alloc publish, internal)
+  sync.zig       Signal (eventcount) + RefCount + Io helpers   (shared primitives)
+  rc.zig         Rc(T) — the Arc<[T]> port                 (shared by media + payloads)
   document.zig   History(S), Doc(S, A) + reducer          (undo/redo, transactional)
-  core.zig       Module, ModuleCtx, Runtime + worker pool (the in-process kernel)
+  worker_pool.zig  the shared offload thread pool          (owned by Runtime)
+  core.zig       Module, ModuleCtx, Runtime               (the in-process kernel)
 
   # framework — opinionated sources → world → sinks, built only on the kernel
   app.zig        App builder + WorldModule(S, A)          (declarative wiring)
-  media.zig      zero-copy data plane: latest() + bounded()  (Rc, Frame, AudioBlock)
+  media.zig      zero-copy data plane: latest() + bounded()  (triple buffer + SPSC ring)
+  media_types.zig  Frame + AudioBlock                     (the two canonical payloads)
   time.zig       Clock source (Tick) + Pacer frame-limiter
   input.zig      device-neutral InputEvent + InputMapper(A) → bus actions
   video.zig      FrameSink contract + VideoSink module (+ headless BufferSink)
@@ -58,7 +64,26 @@ src/
   # out-of-process transports — the Rust `ipc` feature of micro-bus
   ipc.zig        channel pair + stdio codec (JSON lines / postcard, wire-compatible)
   shmem.zig      seqlock'd latest-value shared-memory slot   (/dev/shm, Linux)
+
+  # graphics & windowing — a software-rendered shell (Wayland / Win32)
+  window.zig         cross-platform Window facade         (selects the backend by OS)
+  window_wayland.zig Wayland backend (xdg-shell, SHM double-buffer)   (Linux)
+  window_win32.zig   Win32 backend (layered popup)                    (Windows)
+  wl.zig             hand-written Wayland client bindings  (xdg-shell via wayland-scanner)
+  paint.zig          Canvas: software rasterizer          (rects, strokes, text blit)
+  text.zig           stb_truetype font wrapper (Hack embedded)
+
+  # GPU export plane — autonomous, format-agnostic buffers (bridge-connected, WIP)
+  gpu_memory.zig          memfd-backed exportable buffers  (zero-copy GPU import)
+  gpu_vulkan.zig          Vulkan external-memory/semaphore wrappers   (partly stubbed)
+  gpu_wgpu_bridge_ffi.zig FFI to the external zicro-wgpu-bridge (Rust wgpu-core)
 ```
+
+> **Note.** The graphics and GPU layers are newer than the kernel/framework and are the
+> WIP frontier: they compile on Linux (Wayland) and Windows, but the GPU export plane is
+> not yet wired into a render path and the `gpu_wgpu_bridge_ffi` seam needs the external
+> [`zicro-wgpu-bridge`](https://github.com/postadelmaga/zicro-wgpu-bridge) linked to do
+> anything at runtime.
 
 ## Try it
 
@@ -66,6 +91,7 @@ src/
 zig build test                  # the whole suite (kernel + framework)
 zig build run-counter           # the bare kernel
 zig build run-world_counter     # the App + world spine
+zig build run-shell             # the software-rendered windowing shell (Wayland/Win32)
 zig build bench                 # the performance contract (ReleaseFast; add `-- --quick` for a fast pass)
 ```
 

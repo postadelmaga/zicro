@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     const paint = @import("paint.zig");
     const window = @import("window.zig");
+    const sync = @import("sync.zig");
     const Allocator = std.mem.Allocator;
 
     // Win32 FFI Types and Constants
@@ -18,7 +19,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     const LRESULT = isize;
     const WPARAM = usize;
     const LPARAM = isize;
-    const WNDPROC = *const fn (HWND, u32, WPARAM, LPARAM) callconv(.stdcall) LRESULT;
+    const WNDPROC = *const fn (HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 
     const WNDCLASSEXW = extern struct {
         cbSize: u32 = @sizeOf(WNDCLASSEXW),
@@ -74,7 +75,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     };
 
     // Win32 APIs (Container-level declarations)
-    extern "user32" fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) callconv(.stdcall) u16;
+    extern "user32" fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) callconv(.winapi) u16;
     extern "user32" fn CreateWindowExW(
         dwExStyle: u32,
         lpClassName: [*:0]const u16,
@@ -88,16 +89,16 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         hMenu: ?*anyopaque,
         hInstance: HINSTANCE,
         lpParam: ?*anyopaque,
-    ) callconv(.stdcall) HWND;
+    ) callconv(.winapi) HWND;
 
-    extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.stdcall) i32;
-    extern "user32" fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.stdcall) LRESULT;
-    extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) callconv(.stdcall) i32;
-    extern "user32" fn PeekMessageW(lpMsg: *MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32, wRemoveMsg: u32) callconv(.stdcall) i32;
-    extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.stdcall) i32;
-    extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.stdcall) LRESULT;
-    extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.stdcall) void;
-    extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: i32) callconv(.stdcall) i32;
+    extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.winapi) i32;
+    extern "user32" fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
+    extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) callconv(.winapi) i32;
+    extern "user32" fn PeekMessageW(lpMsg: *MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32, wRemoveMsg: u32) callconv(.winapi) i32;
+    extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) i32;
+    extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
+    extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.winapi) void;
+    extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: i32) callconv(.winapi) i32;
     extern "user32" fn UpdateLayeredWindow(
         hWnd: HWND,
         hdcDst: HDC,
@@ -108,21 +109,21 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         crKey: u32,
         pblend: *const BLENDFUNCTION,
         dwFlags: u32,
-    ) callconv(.stdcall) i32;
+    ) callconv(.winapi) i32;
 
-    extern "user32" fn GetDC(hWnd: HWND) callconv(.stdcall) HDC;
-    extern "user32" fn ReleaseDC(hWnd: HWND, hDC: HDC) callconv(.stdcall) i32;
-    extern "user32" fn GetWindowLongW(hWnd: HWND, nIndex: i32) callconv(.stdcall) i32;
-    extern "user32" fn SetWindowLongW(hWnd: HWND, nIndex: i32, dwNewLong: i32) callconv(.stdcall) i32;
-    extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: ?*anyopaque) callconv(.stdcall) i32;
-    extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: HWND, X: i32, Y: i32, cx: i32, cy: i32, uFlags: u32) callconv(.stdcall) i32;
-    extern "user32" fn GetSystemMetrics(nIndex: i32) callconv(.stdcall) i32;
-    extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) callconv(.stdcall) isize;
-    extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) callconv(.stdcall) isize;
-    extern "user32" fn ReleaseCapture() callconv(.stdcall) i32;
-    extern "user32" fn SendMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.stdcall) LRESULT;
+    extern "user32" fn GetDC(hWnd: HWND) callconv(.winapi) HDC;
+    extern "user32" fn ReleaseDC(hWnd: HWND, hDC: HDC) callconv(.winapi) i32;
+    extern "user32" fn GetWindowLongW(hWnd: HWND, nIndex: i32) callconv(.winapi) i32;
+    extern "user32" fn SetWindowLongW(hWnd: HWND, nIndex: i32, dwNewLong: i32) callconv(.winapi) i32;
+    extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: ?*anyopaque) callconv(.winapi) i32;
+    extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: HWND, X: i32, Y: i32, cx: i32, cy: i32, uFlags: u32) callconv(.winapi) i32;
+    extern "user32" fn GetSystemMetrics(nIndex: i32) callconv(.winapi) i32;
+    extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) callconv(.winapi) isize;
+    extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) callconv(.winapi) isize;
+    extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
+    extern "user32" fn SendMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
 
-    extern "gdi32" fn CreateCompatibleDC(hdc: HDC) callconv(.stdcall) HDC;
+    extern "gdi32" fn CreateCompatibleDC(hdc: HDC) callconv(.winapi) HDC;
     extern "gdi32" fn CreateDIBSection(
         hdc: HDC,
         pbmi: *const BITMAPINFO,
@@ -130,11 +131,11 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         ppvBits: *?*anyopaque,
         hSection: ?*anyopaque,
         offset: u32,
-    ) callconv(.stdcall) HBITMAP;
-    extern "gdi32" fn SelectObject(hdc: HDC, h: *anyopaque) callconv(.stdcall) ?*anyopaque;
-    extern "gdi32" fn DeleteObject(ho: *anyopaque) callconv(.stdcall) i32;
-    extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.stdcall) i32;
-    extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.stdcall) HINSTANCE;
+    ) callconv(.winapi) HBITMAP;
+    extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.winapi) i32;
+    extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) i32;
+    extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.winapi) HINSTANCE;
 
     // Constants
     const WS_EX_LAYERED: u32 = 0x00080000;
@@ -147,6 +148,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     const PM_REMOVE: u32 = 1;
 
     gpa: Allocator,
+    io: std.Io,
     opts: window.Options,
     hwnd: HWND = null,
     closed: bool = false,
@@ -158,12 +160,13 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     pixels: []u32 = &.{},
     width: u32,
     height: u32,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
-    pub fn init(gpa: Allocator, opts: window.Options) !*Window {
+    pub fn init(gpa: Allocator, io: std.Io, opts: window.Options) !*Window {
         const self = try gpa.create(Window);
         self.* = .{
             .gpa = gpa,
+            .io = io,
             .opts = opts,
             .width = opts.width,
             .height = opts.height,
@@ -210,10 +213,10 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         self.fullscreen = !self.fullscreen;
         // Basic Win32 fullscreen toggle
         if (self.fullscreen) {
-            self.saved_style = @intCast(GetWindowLongW(h, -16)); // GWL_STYLE
+            self.saved_style = @bitCast(GetWindowLongW(h, -16)); // GWL_STYLE
             _ = GetWindowRect(h, &self.saved_rect);
 
-            _ = SetWindowLongW(h, -16, @intCast(WS_POPUP));
+            _ = SetWindowLongW(h, -16, @bitCast(WS_POPUP));
             const w = GetSystemMetrics(0); // SM_CXSCREEN
             const h_scr = GetSystemMetrics(1); // SM_CYSCREEN
             _ = SetWindowPos(h, null, 0, 0, w, h_scr, 0x0040); // SWP_SHOWWINDOW
@@ -221,7 +224,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
             self.height = @intCast(h_scr);
             self.pixels = self.gpa.realloc(self.pixels, self.width * self.height) catch self.pixels;
         } else {
-            _ = SetWindowLongW(h, -16, @intCast(self.saved_style));
+            _ = SetWindowLongW(h, -16, @bitCast(self.saved_style));
             const w = self.saved_rect.right - self.saved_rect.left;
             const h_rec = self.saved_rect.bottom - self.saved_rect.top;
             _ = SetWindowPos(h, null, self.saved_rect.left, self.saved_rect.top, w, h_rec, 0x0040);
@@ -236,7 +239,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     }
 
     pub fn presentRgba(self: *Window, w: u32, h: u32, rgba: []const u8) void {
-        self.mutex.lock();
+        sync.lock(&self.mutex, self.io);
         defer self.mutex.unlock();
 
         const copy_w = @min(w, self.width);
@@ -307,27 +310,27 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
                     self.closed = true;
                 }
             } else {
-                self.mutex.lock();
+                sync.lock(&self.mutex, self.io);
                 @memset(self.pixels, 0); // transparent background
                 var canvas = paint.Canvas.init(self.pixels, self.width, self.height);
                 const content = window.Rect{ .x = 0, .y = 0, .w = @intCast(self.width), .h = @intCast(self.height) };
                 if (self.opts.on_draw) |draw| draw(&canvas, content, self.opts.user);
                 self.updateLayered();
-                self.mutex.unlock();
-                std.Thread.sleep(16 * std.time.ns_per_ms); // 60 FPS pacing
+                sync.unlock(&self.mutex, self.io);
+                sync.sleepNs(self.io, 16 * std.time.ns_per_ms); // 60 FPS pacing
             }
         }
     }
 
-    fn wndProc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) callconv(.stdcall) LRESULT {
+    fn wndProc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
         if (msg == 0x0001) { // WM_CREATE
-            const create_struct = @as(*const extern struct { lpCreateParams: ?*anyopaque }, @ptrCast(@alignCast(lparam)));
-            _ = SetWindowLongPtrW(hwnd, -21, @intCast(@intFromPtr(create_struct.lpCreateParams))); // GWLP_USERDATA
+            const create_struct: *const extern struct { lpCreateParams: ?*anyopaque } = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            _ = SetWindowLongPtrW(hwnd, -21, @bitCast(@intFromPtr(create_struct.lpCreateParams))); // GWLP_USERDATA
         }
 
         const ptr = GetWindowLongPtrW(hwnd, -21);
         if (ptr != 0) {
-            const self = @as(*Window, @ptrFromInt(@as(usize, @intCast(ptr))));
+            const self = @as(*Window, @ptrFromInt(@as(usize, @bitCast(ptr))));
             switch (msg) {
                 0x0002 => { // WM_DESTROY
                     self.closed = true;

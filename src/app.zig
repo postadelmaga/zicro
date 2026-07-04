@@ -112,6 +112,7 @@ pub const App = struct {
         const bus_ptr = try gpa.create(bus_mod.LocalBus);
         errdefer gpa.destroy(bus_ptr);
         bus_ptr.* = bus_mod.LocalBus.init(gpa, io);
+        errdefer bus_ptr.deinit();
         const rt = try core.Runtime.init(gpa, io, bus_ptr);
         return .{ .gpa = gpa, .io = io, .bus_ptr = bus_ptr, .rt = rt };
     }
@@ -119,6 +120,10 @@ pub const App = struct {
     /// Free the bus. Call after [`App.join`] / [`App.shutdownAndJoin`] (receivers handed
     /// out by [`bus`](App.bus) stay valid — they only go quiet).
     pub fn deinit(app: *App) void {
+        // Freeing the bus while modules are still running would leave their threads with a
+        // dangling bus pointer — deinit is only valid once every module has stopped (via
+        // join / shutdownAndJoin).
+        std.debug.assert(app.liveCount() == 0);
         app.bus_ptr.deinit();
         app.gpa.destroy(app.bus_ptr);
     }
