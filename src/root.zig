@@ -31,6 +31,7 @@ pub const core = @import("core.zig");
 pub const app = @import("app.zig");
 pub const media = @import("media.zig");
 pub const time = @import("time.zig");
+pub const anim = @import("anim.zig");
 pub const input = @import("input.zig");
 pub const video = @import("video.zig");
 pub const audio = @import("audio.zig");
@@ -80,6 +81,7 @@ test {
     _ = media;
     _ = @import("media_types.zig");
     _ = time;
+    _ = anim;
     _ = input;
     _ = video;
     _ = audio;
