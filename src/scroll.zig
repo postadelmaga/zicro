@@ -240,6 +240,14 @@ pub const Scroll = struct {
         return false;
     }
 
+    /// The pointer left the scrollable surface: clear hover so the bars fade back to
+    /// rest. Any in-progress thumb drag is intentionally kept (a grab outlives the
+    /// pointer leaving the surface); `onButtonUp` ends it.
+    pub fn onLeave(self: *Scroll) void {
+        self.in_area = false;
+        self.over_bar = .{ false, false };
+    }
+
     /// Primary-button release. Returns true if it ended an in-progress drag.
     pub fn onButtonUp(self: *Scroll) bool {
         const was = self.dragging != null;
