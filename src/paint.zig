@@ -110,6 +110,26 @@ fn unpackPremul(px: u32) [4]f32 {
     };
 }
 
+/// Pack straight-alpha channels (each in [0,1]) into an RGBA8888 pixel — bytes
+/// `R,G,B,A` in memory (little-endian), the layout an app hands to a compositor.
+fn packStraight(r: f32, g: f32, b: f32, a: f32) u32 {
+    const ri: u32 = @intFromFloat(std.math.clamp(r, 0.0, 1.0) * 255.0 + 0.5);
+    const gi: u32 = @intFromFloat(std.math.clamp(g, 0.0, 1.0) * 255.0 + 0.5);
+    const bi: u32 = @intFromFloat(std.math.clamp(b, 0.0, 1.0) * 255.0 + 0.5);
+    const ai: u32 = @intFromFloat(std.math.clamp(a, 0.0, 1.0) * 255.0 + 0.5);
+    return (ai << 24) | (bi << 16) | (gi << 8) | ri;
+}
+
+/// Unpack an RGBA8888 pixel (bytes `R,G,B,A`) into straight `{ r, g, b, a }` floats.
+fn unpackStraight(px: u32) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt(px & 0xff)) / 255.0,
+        @as(f32, @floatFromInt((px >> 8) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt((px >> 16) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt(px >> 24)) / 255.0,
+    };
+}
+
 /// How the window chrome looks. All lengths are in buffer pixels.
 pub const Style = struct {
     /// Corner radius of the glass panel.
@@ -212,11 +232,24 @@ pub const Style = struct {
     }
 };
 
+/// Pixel layout a [`Canvas`] reads and writes.
+pub const Format = enum {
+    /// Premultiplied ARGB8888 (the wl_shm wire format) — the default.
+    argb_premul,
+    /// Straight-alpha RGBA8888 (bytes `R,G,B,A` in memory), e.g. an app's own
+    /// compositor buffer that it hands to a Wayland surface as content. Currently
+    /// honored by [`Canvas.fillRoundedRect`] (all `zicro.scroll` needs); the
+    /// chrome/glyph/blit primitives assume `argb_premul`.
+    rgba_straight,
+};
+
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.
 pub const Canvas = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    /// Pixel layout of `pixels` (see [`Format`]).
+    format: Format = .argb_premul,
     /// Optional scissor rect (pixel bounds, `x1`/`y1` exclusive). When set, every draw
     /// primitive is confined to it — how apps keep scrolled content from bleeding over
     /// the chrome. `null` = draw to the whole canvas.
@@ -227,6 +260,42 @@ pub const Canvas = struct {
     pub fn init(pixels: []u32, width: u32, height: u32) Canvas {
         std.debug.assert(pixels.len == @as(usize, width) * @as(usize, height));
         return .{ .pixels = pixels, .width = width, .height = height };
+    }
+
+    /// Wrap a straight-alpha RGBA8888 buffer (bytes `R,G,B,A` per pixel — the layout
+    /// an app hands to a compositor as surface content) as a canvas. `pixels` is the
+    /// `u32` view of that buffer (its backing bytes must be 4-byte aligned). Lets apps
+    /// that composite their own frame reuse `zicro.scroll`'s bar drawing in place.
+    pub fn initRgba8(pixels: []u32, width: u32, height: u32) Canvas {
+        std.debug.assert(pixels.len == @as(usize, width) * @as(usize, height));
+        return .{ .pixels = pixels, .width = width, .height = height, .format = .rgba_straight };
+    }
+
+    /// Source-over a straight color (`sr,sg,sb` straight in [0,1], coverage-scaled
+    /// alpha `sa`) onto packed pixel `dst`, honoring the canvas [`Format`]. The
+    /// premultiplied branch is the hot default and is byte-identical to the inline
+    /// blend it replaced.
+    inline fn overColor(self: *const Canvas, dst: u32, sr: f32, sg: f32, sb: f32, sa: f32) u32 {
+        switch (self.format) {
+            .argb_premul => {
+                const dr, const dg, const db, const da = unpackPremul(dst);
+                const inv = 1.0 - sa;
+                return packPremul(sr * sa + dr * inv, sg * sa + dg * inv, sb * sa + db * inv, sa + da * inv);
+            },
+            .rgba_straight => {
+                const dr, const dg, const db, const da = unpackStraight(dst);
+                const inv = 1.0 - sa;
+                const oa = sa + da * inv;
+                if (oa <= 0.0) return packStraight(0, 0, 0, 0);
+                // De-premultiply the blended result back to straight alpha.
+                return packStraight(
+                    (sr * sa + dr * da * inv) / oa,
+                    (sg * sa + dg * da * inv) / oa,
+                    (sb * sa + db * da * inv) / oa,
+                    oa,
+                );
+            },
+        }
     }
 
     /// Restrict subsequent drawing to `(x,y,w,h)` (canvas coords), intersected with the
@@ -426,15 +495,7 @@ pub const Canvas = struct {
                 const cov = coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
                 if (cov <= 0.0) continue;
                 const sa = color.a * cov;
-
-                const dr, const dg, const db, const da = unpackPremul(row[px]);
-                const inv = 1.0 - sa;
-                row[px] = packPremul(
-                    color.r * sa + dr * inv,
-                    color.g * sa + dg * inv,
-                    color.b * sa + db * inv,
-                    sa + da * inv,
-                );
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, sa);
             }
         }
     }
@@ -586,6 +647,33 @@ test "drawText produces ink and renders a preview" {
         if (p != bg) ink += 1;
     }
     try std.testing.expect(ink > 100);
+}
+
+test "straight-alpha canvas: fillRoundedRect over opaque RGBA8 background" {
+    const gpa = std.testing.allocator;
+    const W: u32 = 40;
+    const H: u32 = 40;
+    const pixels = try gpa.alloc(u32, W * H);
+    defer gpa.free(pixels);
+    // Opaque red background in straight RGBA8 bytes (R=255,G=0,B=0,A=255).
+    @memset(pixels, packStraight(1.0, 0.0, 0.0, 1.0));
+
+    var canvas = Canvas.initRgba8(pixels, W, H);
+    // Fully opaque white fill over the whole canvas → center pixel becomes white.
+    canvas.fillRoundedRect(0, 0, W, H, 4, Color.rgba(255, 255, 255, 1.0));
+
+    const center = pixels[@as(usize, H / 2) * W + W / 2];
+    const r, const g, const b, const a = unpackStraight(center);
+    try std.testing.expect(r > 0.98 and g > 0.98 and b > 0.98 and a > 0.98);
+
+    // Half-alpha black over the opaque red leaves a *straight* result: alpha stays 1,
+    // RGB darkens toward black (0.5*0 + 0.5*red).
+    @memset(pixels, packStraight(1.0, 0.0, 0.0, 1.0));
+    canvas.fillRoundedRect(0, 0, W, H, 0, Color.rgba(0, 0, 0, 0.5));
+    const cr, const cg, const cb, const ca = unpackStraight(pixels[@as(usize, H / 2) * W + W / 2]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cr, 0.02);
+    try std.testing.expect(cg < 0.02 and cb < 0.02);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), ca, 0.01);
 }
 
 test "sdf signs" {
