@@ -128,6 +128,70 @@ pub const BufferSink = struct {
     }
 };
 
+// --- GPU frames (zero-copy dmabuf) ---------------------------------------------------------
+//
+// The twin of [`Frame`]/[`FrameSink`] for the frames that never touch the CPU: a
+// render target exported as a dmabuf and handed to a backend that can import it
+// (a Wayland linux-dmabuf subsurface, a KMS plane). This is what keeps the fast
+// present path — a marcher/upscaler writes a GPU image, the backend commits it
+// with no copy and no per-frame allocation. Purely additive: CPU-only sinks just
+// don't implement [`GpuFrameSink`], and nothing here touches the [`Frame`] path.
+
+/// One dmabuf plane. RGBA is single-plane; the array leaves room for YUV/multiplanar.
+pub const DmabufPlane = struct {
+    fd: std.posix.fd_t,
+    offset: u32 = 0,
+    stride: u32,
+};
+
+/// A frame that lives on the GPU as a dmabuf. The producer keeps ownership of the
+/// plane fds — a sink imports them and must NOT close them.
+pub const GpuFrame = struct {
+    width: u32,
+    height: u32,
+    /// DRM fourcc of the buffer (e.g. `0x34324241` = 'AB24' = ABGR8888).
+    fourcc: u32,
+    /// DRM format modifier (`0` = LINEAR).
+    modifier: u64 = 0,
+    planes: []const DmabufPlane,
+    /// Double-buffer hint. A backend that caches one imported buffer per slot keys
+    /// on this, so re-presenting the same slot is a bare re-commit — no re-import.
+    slot: u8 = 0,
+};
+
+/// Implemented by a backend that can present a [`GpuFrame`] with no CPU copy.
+/// `present` returns `false` when the backend can't take this frame (unsupported
+/// modifier, no dmabuf support) so the caller can fall back to a CPU [`Frame`].
+pub const GpuFrameSink = struct {
+    ptr: *anyopaque,
+    presentFn: *const fn (*anyopaque, *const GpuFrame) bool,
+
+    /// Wrap any type with `pub fn presentGpu(self: *T, frame: *const GpuFrame) bool`.
+    pub fn of(comptime T: type, instance: *T) GpuFrameSink {
+        const Impl = struct {
+            fn present(ptr: *anyopaque, frame: *const GpuFrame) bool {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return self.presentGpu(frame);
+            }
+        };
+        return .{ .ptr = instance, .presentFn = Impl.present };
+    }
+
+    pub fn present(sink: GpuFrameSink, frame: *const GpuFrame) bool {
+        return sink.presentFn(sink.ptr, frame);
+    }
+};
+
+/// What a surface backend knows about its output geometry — filled from the real
+/// window/compositor size (or the configured offscreen size for a headless
+/// backend). The context-adaptive knob: a consumer sizes its render to this.
+pub const SurfaceInfo = struct {
+    width: u32,
+    height: u32,
+    /// Fractional / HiDPI scale (`1.0` = one buffer px per logical px).
+    scale: f32 = 1.0,
+};
+
 // --- tests ---------------------------------------------------------------------------------
 
 test "video sink presents the freshest frame" {
@@ -171,4 +235,41 @@ test "video sink presents the freshest frame" {
     defer last.deinit();
     try testing.expectEqual(@as(u32, 2), last.width);
     try testing.expectEqual(@as(u8, 2), last.pixels.slice()[0]);
+}
+
+test "GpuFrameSink wraps presentGpu, forwards the frame, and reports fallback" {
+    const testing = std.testing;
+    const Backend = struct {
+        got: ?GpuFrame = null,
+        ok: bool = true,
+        fn presentGpu(self: *@This(), f: *const GpuFrame) bool {
+            self.got = f.*;
+            return self.ok;
+        }
+    };
+    var be = Backend{};
+    const sink = GpuFrameSink.of(Backend, &be);
+
+    const planes = [_]DmabufPlane{.{ .fd = 7, .offset = 0, .stride = 4096 }};
+    const frame = GpuFrame{
+        .width = 1024,
+        .height = 512,
+        .fourcc = 0x34324241, // ABGR8888
+        .modifier = 0,
+        .planes = &planes,
+        .slot = 1,
+    };
+
+    // Success path: the frame reaches the backend intact.
+    try testing.expect(sink.present(&frame));
+    try testing.expect(be.got != null);
+    try testing.expectEqual(@as(u32, 1024), be.got.?.width);
+    try testing.expectEqual(@as(u32, 512), be.got.?.height);
+    try testing.expectEqual(@as(u8, 1), be.got.?.slot);
+    try testing.expectEqual(@as(std.posix.fd_t, 7), be.got.?.planes[0].fd);
+    try testing.expectEqual(@as(u32, 4096), be.got.?.planes[0].stride);
+
+    // Fallback path: a backend that can't take the frame returns false.
+    be.ok = false;
+    try testing.expect(!sink.present(&frame));
 }
