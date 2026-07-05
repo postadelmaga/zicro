@@ -12,6 +12,7 @@
 //! * Metal: MTLTexture from IOSurface (macOS; requires different export mechanism)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 
@@ -25,6 +26,11 @@ pub const Buffer = struct {
     /// Allocate a GPU-accessible buffer. The buffer is CPU-readable/writable,
     /// and its fd can be exported for GPU import via external memory APIs.
     pub fn allocate(gpa: Allocator, size: usize, name: []const u8) !Buffer {
+        // memfd zero-copy sharing is Linux-only. Other platforms need a different backend
+        // (Windows: D3D12/DXGI shared handles); until then callers fall back to CPU paths.
+        // The comptime guard also keeps the Linux memfd/mmap syscalls out of the link on
+        // non-Linux targets.
+        if (builtin.os.tag != .linux) return error.Unsupported;
         if (size == 0) return error.ZeroSize;
 
         // Create a memfd — an anonymous file descriptor backed by RAM, suitable
@@ -90,8 +96,11 @@ pub const Buffer = struct {
     /// Free the buffer. The underlying memfd is closed; any GPU process holding
     /// a reference to the exported fd can still use it until it releases its import.
     pub fn deinit(self: *Buffer, gpa: Allocator) void {
-        std.posix.munmap(self.ptr);
-        _ = linux.close(self.fd);
+        // Mirror `allocate`: the memfd/mmap only ever exist on Linux.
+        if (builtin.os.tag == .linux) {
+            std.posix.munmap(self.ptr);
+            _ = linux.close(self.fd);
+        }
         gpa.free(self.name);
     }
 };
