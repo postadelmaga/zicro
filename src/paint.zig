@@ -471,6 +471,13 @@ pub const Canvas = struct {
         const sw_f: f32 = @floatFromInt(src_w);
         const sh_f: f32 = @floatFromInt(src_h);
 
+        // When the style asks for no rounding, fade or margin, the panel/content masks are 1
+        // everywhere — skip both per-pixel `roundedRectSdf` evals (two sqrts each). Opaque
+        // source pixels then become a straight packed write with no blend. This is the opaque
+        // full-window present path (ZUER_OPAQUE); the glass path keeps the full SDF masking.
+        const trivial = style.margin == 0 and style.corner_radius == 0 and style.content_radius == 0 and
+            style.content_fade_width == 0 and style.border_anim_width == 0;
+
         var sy: u32 = 0;
         while (sy < src_h) : (sy += 1) {
             const y = dst_y + sy;
@@ -482,24 +489,38 @@ pub const Canvas = struct {
             while (sx < src_w) : (sx += 1) {
                 const x = dst_x + sx;
                 if (x >= self.width) break;
-                const fx = @as(f32, @floatFromInt(x)) + 0.5;
-                const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
-                const mask = coverage(d_panel);
-                if (mask <= 0.0) continue;
-
-                const d_content = roundedRectSdf(fx, fy, dx_f, dy_f, sw_f, sh_f, style.content_radius);
-                var content_cov = coverage(d_content);
-                if (content_cov <= 0.0) continue;
-
-                if (style.content_fade_width > 0.0) {
-                    content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
-                }
-
-                if (style.border_anim_width > 0.0) {
-                    content_cov *= 1.0 - smoothstep(0.0, style.border_anim_width, -d_panel);
-                }
-
                 const sp = src_row[@as(usize, sx) * 4 ..][0..4];
+
+                // Trivial-mask fast path: no SDF, and a fully-opaque source pixel is a direct
+                // packed write (ARGB8888, premultiplied == the color for a==255).
+                if (trivial) {
+                    if (sp[3] == 0) continue;
+                    if (sp[3] == 255) {
+                        row[x] = 0xFF000000 | (@as(u32, sp[0]) << 16) | (@as(u32, sp[1]) << 8) | @as(u32, sp[2]);
+                        continue;
+                    }
+                }
+
+                const fx = @as(f32, @floatFromInt(x)) + 0.5;
+                var mask: f32 = 1.0;
+                var content_cov: f32 = 1.0;
+                if (!trivial) {
+                    const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
+                    mask = coverage(d_panel);
+                    if (mask <= 0.0) continue;
+
+                    const d_content = roundedRectSdf(fx, fy, dx_f, dy_f, sw_f, sh_f, style.content_radius);
+                    content_cov = coverage(d_content);
+                    if (content_cov <= 0.0) continue;
+
+                    if (style.content_fade_width > 0.0) {
+                        content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
+                    }
+                    if (style.border_anim_width > 0.0) {
+                        content_cov *= 1.0 - smoothstep(0.0, style.border_anim_width, -d_panel);
+                    }
+                }
+
                 const sa = @as(f32, @floatFromInt(sp[3])) / 255.0 * mask * content_cov;
                 if (sa <= 0.0) continue;
                 const sr = @as(f32, @floatFromInt(sp[0])) / 255.0;
