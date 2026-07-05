@@ -10,6 +10,12 @@ namespaces that never touch the kernel — the opinionated **`sources → world 
 framework: time, input, video, audio, a zero-copy media plane, and a bus-over-byte-stream
 bridge.
 
+**Cross-platform by design.** zicro (with [zrame](../Zrame) on top) owns the OS so the
+apps built on the Frame architecture don't have to. Everything that touches the platform
+— the `Window` (Wayland on Linux, Win32 on Windows, Cocoa on macOS), shared memory, GPU
+buffers — sits behind a per-OS backend selected at compile time; the framework surface a
+Frame app sees is identical on every OS.
+
 </div>
 
 ---
