@@ -32,9 +32,10 @@ const dormant_width: f32 = 2.0;
 const expanded_width: f32 = 10.0;
 const min_thumb: f32 = 12.0;
 const inner_margin: f32 = 3.0;
-const grab_cross: f32 = 14.0; // hover/grab cross-width, independent of the visual width
-// Opacity ramps: dormant → area-hover → bar-interact.
-const bg_active: f32 = 0.4;
+const grab_tol: f32 = 8.0; // extra hover/grab reach beyond the bar's visual width (lead-in)
+// Opacity ramps. The track background only shows while the pointer is on the bar
+// (aiming/dragging): on plain area-hover just the thumb fades in, so a translucent
+// full-height strip never sits over the content.
 const bg_interact: f32 = 0.7;
 const handle_active: f32 = 0.6;
 const handle_interact: f32 = 1.0;
@@ -145,8 +146,13 @@ pub const Scroll = struct {
         const cross = if (d == 1) x else y;
         const s = self.barStart(d);
         if (along < s or along > s + self.barLen(d)) return false;
-        const cx = self.barCross(d, grab_cross);
-        return cross >= cx and cross <= cx + grab_cross + 2.0;
+        // Interactive band hugs the bar's *current* visual width (so it engages right at
+        // the thin dormant bar instead of a fixed strip reaching well to its side) plus a
+        // small tolerance, and grows as the bar swells so hovering the widened bar never
+        // drops the hover. Right/bottom-aligned to the viewport edge.
+        const reach = self.visualWidth(d) + inner_margin + grab_tol;
+        const edge = if (d == 1) self.viewport.x + self.viewport.w else self.viewport.y + self.viewport.h;
+        return cross >= edge - reach and cross <= edge;
     }
 
     fn inViewport(self: *const Scroll, x: f32, y: f32) bool {
@@ -180,7 +186,9 @@ pub const Scroll = struct {
             const interacting = (self.dragging != null and self.dragging.? == d);
             const inter_f = if (interacting) 1.0 else bh;
 
-            const bg_op = @max(anim.lerp(0.0, bg_active, ah), anim.lerp(0.0, bg_interact, inter_f)) * show;
+            // Track background only on bar interaction (not area-hover), so hovering the
+            // content shows just the thumb — no translucent full-height strip over it.
+            const bg_op = anim.lerp(0.0, bg_interact, inter_f) * show;
             const handle_op = @max(anim.lerp(0.0, handle_active, ah), anim.lerp(0.0, handle_interact, inter_f)) * show;
 
             const w = self.visualWidth(d);
@@ -383,4 +391,39 @@ test "wheel notches smooth in over several ticks" {
     }
     try std.testing.expect(s.offset[1] > 0); // it moved
     try std.testing.expectEqual(@as(f32, 0), s.unprocessed[1]);
+}
+
+test "both bars render when content overflows on both axes (h-bar not dropped)" {
+    // Reproduce zuer's wide.csv geometry: viewport 1600x900, content 2725x8449 →
+    // overflow on both axes. With the pointer in the content the two thumbs must both
+    // paint — this guards against a regression where the horizontal bar goes missing.
+    const alloc = std.testing.allocator;
+    const W: u32 = 1600;
+    const H: u32 = 900;
+    const buf = try alloc.alloc(u32, @as(usize, W) * H);
+    defer alloc.free(buf);
+    @memset(buf, 0);
+    var canvas = paint.Canvas.initRgba8(buf, W, H);
+
+    var s = Scroll{};
+    s.setViewport(.{ .x = 0, .y = 0, .w = @floatFromInt(W), .h = @floatFromInt(H) });
+    s.setContent(2725, 8449);
+    _ = s.onMotion(800, 450); // pointer well inside → area hover
+    var i: usize = 0;
+    while (i < 60) : (i += 1) _ = s.tick(0.05); // ramp show[] and area_hover to ~1
+    s.draw(&canvas);
+
+    // Count painted (non-zero) pixels in the bottom strip (horizontal bar) and the
+    // right strip (vertical bar).
+    var bottom: usize = 0;
+    var right: usize = 0;
+    for (0..H) |y| {
+        for (0..W) |x| {
+            if (buf[y * W + x] == 0) continue;
+            if (y >= H - 16) bottom += 1;
+            if (x >= W - 16) right += 1;
+        }
+    }
+    try std.testing.expect(right > 0); // vertical bar paints (known-good)
+    try std.testing.expect(bottom > 0); // horizontal bar must paint too
 }
