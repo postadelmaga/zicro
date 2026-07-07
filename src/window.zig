@@ -23,6 +23,14 @@ pub const Window = switch (builtin.os.tag) {
     .linux => @import("window_wayland.zig").Window,
     .windows => @import("window_win32.zig").Window,
     .macos => @import("window_cocoa.zig").Window,
+    // Z-Scenic (Z#76 phase 2): Z's freestanding userspace target. Zicro
+    // itself never natively targets `.freestanding` (its own build.zig has
+    // no such target), so this branch is only ever selected when Z's
+    // build.zig cross-compiles Zicro code with -Dzicro-src — and that build
+    // always wires the "zrt"/"scenic_protocol" modules window_z.zig needs,
+    // the same way Zisky's build.zig always wires "zrt"/"gfx_config" for
+    // its own freestanding programs.
+    .freestanding => @import("window_z.zig").Window,
     else => struct {
         gpa: std.mem.Allocator,
         pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*@This() {
