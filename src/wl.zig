@@ -68,6 +68,7 @@ pub extern const wl_buffer_interface: Interface;
 pub extern const wl_seat_interface: Interface;
 pub extern const wl_pointer_interface: Interface;
 pub extern const wl_keyboard_interface: Interface;
+pub extern const wl_touch_interface: Interface;
 pub extern const xdg_wm_base_interface: Interface;
 pub extern const xdg_surface_interface: Interface;
 pub extern const xdg_toplevel_interface: Interface;
@@ -79,6 +80,10 @@ pub extern const wl_subcompositor_interface: Interface;
 pub extern const wl_subsurface_interface: Interface;
 pub extern const zwp_linux_dmabuf_v1_interface: Interface;
 pub extern const zwp_linux_buffer_params_v1_interface: Interface;
+pub extern const wp_viewporter_interface: Interface;
+pub extern const wp_viewport_interface: Interface;
+pub extern const wp_fractional_scale_manager_v1_interface: Interface;
+pub extern const wp_fractional_scale_v1_interface: Interface;
 
 /// 24.8 fixed point, the wire format of pointer coordinates.
 pub const Fixed = i32;
@@ -294,6 +299,7 @@ pub const BufferParams = opaque {
 
 pub const SEAT_CAPABILITY_POINTER: u32 = 1;
 pub const SEAT_CAPABILITY_KEYBOARD: u32 = 2;
+pub const SEAT_CAPABILITY_TOUCH: u32 = 4;
 pub const BTN_LEFT: u32 = 0x110;
 pub const BTN_RIGHT: u32 = 0x111;
 pub const BTN_MIDDLE: u32 = 0x112;
@@ -342,6 +348,11 @@ pub const Seat = opaque {
         const p = wl_proxy_marshal_flags(proxy(self), 1, &wl_keyboard_interface, version(self), 0, @as(?*Proxy, null));
         return @ptrCast(p.?);
     }
+
+    pub fn getTouch(self: *Seat) *Touch {
+        const p = wl_proxy_marshal_flags(proxy(self), 2, &wl_touch_interface, version(self), 0, @as(?*Proxy, null));
+        return @ptrCast(p.?);
+    }
 };
 
 pub const Pointer = opaque {
@@ -361,6 +372,25 @@ pub const Pointer = opaque {
     };
 
     pub fn setListener(self: *Pointer, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+};
+
+pub const Touch = opaque {
+    /// The full wl_touch event set, in opcode order (libwayland indexes the implementation
+    /// array by opcode); entries past the bound version are never invoked. `id` is the
+    /// per-touchpoint slot; `x`/`y` are surface-local, like the pointer's.
+    pub const Listener = extern struct {
+        down: *const fn (data: ?*anyopaque, touch: *Touch, serial: u32, time: u32, surface: ?*Surface, id: i32, x: Fixed, y: Fixed) callconv(.c) void,
+        up: *const fn (data: ?*anyopaque, touch: *Touch, serial: u32, time: u32, id: i32) callconv(.c) void,
+        motion: *const fn (data: ?*anyopaque, touch: *Touch, time: u32, id: i32, x: Fixed, y: Fixed) callconv(.c) void,
+        frame: *const fn (data: ?*anyopaque, touch: *Touch) callconv(.c) void,
+        cancel: *const fn (data: ?*anyopaque, touch: *Touch) callconv(.c) void,
+        shape: *const fn (data: ?*anyopaque, touch: *Touch, id: i32, major: Fixed, minor: Fixed) callconv(.c) void,
+        orientation: *const fn (data: ?*anyopaque, touch: *Touch, id: i32, orientation: Fixed) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *Touch, listener: *const Listener, data: ?*anyopaque) void {
         addListener(self, listener, data);
     }
 };
@@ -538,5 +568,44 @@ pub const CursorShapeDevice = opaque {
 
     pub fn setShape(self: *CursorShapeDevice, serial: u32, shape: u32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, serial, shape);
+    }
+};
+
+/// `wp_viewporter` (stable): crop/scale a surface — the half of HiDPI that lets a
+/// physically-sized buffer present at a logical size.
+pub const Viewporter = opaque {
+    // requests: 0 = destroy, 1 = get_viewport(new_id, surface)
+    pub fn getViewport(self: *Viewporter, surface: *Surface) *Viewport {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &wp_viewport_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(surface)));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const Viewport = opaque {
+    // requests: 0 = destroy, 1 = set_source(4×fixed), 2 = set_destination(int, int)
+    pub fn setDestination(self: *Viewport, w: i32, h: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), 0, w, h);
+    }
+};
+
+/// `wp_fractional_scale_v1` (staging): the compositor's preferred fractional scale for
+/// a surface, in 120ths (120 = 1.0, 132 = 1.1). Pair with a [`Viewport`]: render the
+/// buffer at `logical × scale` and set the viewport destination to the logical size.
+pub const FractionalScaleManager = opaque {
+    // requests: 0 = destroy, 1 = get_fractional_scale(new_id, surface)
+    pub fn getFractionalScale(self: *FractionalScaleManager, surface: *Surface) *FractionalScale {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &wp_fractional_scale_v1_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(surface)));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const FractionalScale = opaque {
+    pub const Listener = extern struct {
+        /// `scale` is the preferred scale × 120.
+        preferred_scale: *const fn (data: ?*anyopaque, obj: *FractionalScale, scale: u32) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *FractionalScale, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
     }
 };
