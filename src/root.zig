@@ -43,6 +43,8 @@ pub const wl = @import("wl.zig");
 pub const text = @import("text.zig");
 pub const paint = @import("paint.zig");
 pub const scroll = @import("scroll.zig");
+pub const widget = @import("widget.zig");
+pub const keymap = @import("keymap.zig");
 pub const window = @import("window.zig");
 
 // -- out-of-process transports (the Rust `ipc` feature of micro-bus)
@@ -96,5 +98,7 @@ test {
     _ = gpu_wgpu_bridge_ffi;
     _ = text;
     _ = paint;
+    _ = widget;
+    _ = keymap;
     _ = window;
 }
