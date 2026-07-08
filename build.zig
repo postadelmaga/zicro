@@ -29,6 +29,13 @@ pub fn build(b: *std.Build) void {
         scan.addFileArg(.{ .cwd_relative = xml });
         const c_file = scan.addOutputFileArg("protocol.c");
         zicro.addCSourceFile(.{ .file = c_file });
+        // xdg-decoration: server-side window frames (title bar, close/min/max
+        // from the compositor) for windows that opt in via Options.decorations.
+        const deco_xml = "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml";
+        const deco_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        deco_scan.addFileArg(.{ .cwd_relative = deco_xml });
+        const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
+        zicro.addCSourceFile(.{ .file = deco_c });
     }
 
     // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
@@ -63,6 +70,11 @@ pub fn build(b: *std.Build) void {
         scan.addFileArg(.{ .cwd_relative = xml });
         const c_file = scan.addOutputFileArg("protocol.c");
         zicro_fast.addCSourceFile(.{ .file = c_file });
+        const deco_xml = "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml";
+        const deco_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        deco_scan.addFileArg(.{ .cwd_relative = deco_xml });
+        const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
+        zicro_fast.addCSourceFile(.{ .file = deco_c });
     }
     if (target.result.os.tag == .macos) {
         zicro_fast.linkFramework("Cocoa", .{});

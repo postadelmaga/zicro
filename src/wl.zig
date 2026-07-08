@@ -72,6 +72,8 @@ pub extern const wl_touch_interface: Interface;
 pub extern const xdg_wm_base_interface: Interface;
 pub extern const xdg_surface_interface: Interface;
 pub extern const xdg_toplevel_interface: Interface;
+pub extern const zxdg_decoration_manager_v1_interface: Interface;
+pub extern const zxdg_toplevel_decoration_v1_interface: Interface;
 pub extern const ext_background_effect_manager_v1_interface: Interface;
 pub extern const ext_background_effect_surface_v1_interface: Interface;
 pub extern const wp_cursor_shape_manager_v1_interface: Interface;
@@ -468,6 +470,14 @@ pub const XdgToplevel = opaque {
         addListener(self, listener, data);
     }
 
+    /// set_parent (opcode 1): stacking/placement hint — the child stays above
+    /// its parent and compositors place it relative to the parent (KWin
+    /// centers transient dialogs). Both toplevels must live on the same
+    /// connection. Null detaches.
+    pub fn setParent(self: *XdgToplevel, parent: ?*XdgToplevel) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, @as(?*Proxy, @ptrCast(parent)));
+    }
+
     pub fn setTitle(self: *XdgToplevel, title: [*:0]const u8) void {
         _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), 0, title);
     }
@@ -520,6 +530,37 @@ pub const XdgToplevel = opaque {
     /// unset_fullscreen (opcode 12): returns to windowed state.
     pub fn unsetFullscreen(self: *XdgToplevel) void {
         _ = wl_proxy_marshal_flags(proxy(self), 12, null, version(self), 0);
+    }
+};
+
+// --- zxdg_decoration_manager_v1 (server-side window frames) -------------------------------
+
+pub const DECORATION_MODE_CLIENT_SIDE: u32 = 1;
+pub const DECORATION_MODE_SERVER_SIDE: u32 = 2;
+
+pub const ZxdgDecorationManager = opaque {
+    /// get_toplevel_decoration (opcode 1). Must be created BEFORE the toplevel
+    /// has a committed buffer (protocol error otherwise).
+    pub fn getToplevelDecoration(self: *ZxdgDecorationManager, toplevel: *XdgToplevel) *ZxdgToplevelDecoration {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &zxdg_toplevel_decoration_v1_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(toplevel)));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const ZxdgToplevelDecoration = opaque {
+    pub const Listener = extern struct {
+        /// configure: the mode the compositor settled on (client or server side).
+        configure: *const fn (data: ?*anyopaque, decoration: *ZxdgToplevelDecoration, mode: u32) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *ZxdgToplevelDecoration, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
+    /// set_mode (opcode 1): ask for a decoration mode; the compositor answers
+    /// with a configure (it may override the preference).
+    pub fn setMode(self: *ZxdgToplevelDecoration, mode: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, mode);
     }
 };
 

@@ -26,6 +26,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     toplevel: ?*wl.XdgToplevel = null,
     keyboard: ?*wl.Keyboard = null,
     pointer: ?*wl.Pointer = null,
+    decoration_manager: ?*wl.ZxdgDecorationManager = null,
+    decoration: ?*wl.ZxdgToplevelDecoration = null,
 
     width: u32,
     height: u32,
@@ -49,6 +51,25 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     pointer_serial: u32 = 0,
+
+    // Multi-window on ONE connection (window-server shape): children share
+    // the root's display/registry/globals and are driven by the root's run()
+    // loop. Focus targets live on the root — the seat is connection-global,
+    // wl enter events carry the surface, and we route per window.
+    parent: ?*Window = null,
+    children: std.ArrayList(*Window) = .empty,
+    pointer_target: ?*Window = null,
+    keyboard_target: ?*Window = null,
+
+    // Key repeat (root only): Wayland compositors do NOT repeat keys for
+    // clients — wl_keyboard just announces rate/delay and the client
+    // synthesizes. The run() loop re-delivers the held key to its target.
+    repeat_rate: i32 = 25, // presses/sec; 0 = repeat disabled by compositor
+    repeat_delay: i32 = 400, // ms before the first synthetic repeat
+    repeat_key: u32 = 0,
+    repeat_down: bool = false,
+    repeat_target: ?*Window = null,
+    repeat_at: i64 = 0, // ms timestamp of the next synthetic press
 
     const BufferSlot = struct {
         buffer: ?*wl.Buffer = null,
@@ -102,17 +123,132 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         toplevel.setTitle(opts.title.ptr);
         self.toplevel = toplevel;
 
+        // Server-side frame (title bar, close/min/max): negotiate BEFORE the
+        // first commit — creating the decoration after a buffer is attached
+        // is a protocol error. Missing manager = compositor without the
+        // protocol: stay borderless, nothing else changes.
+        if (opts.decorations) {
+            if (self.decoration_manager) |manager| {
+                const decoration = manager.getToplevelDecoration(toplevel);
+                decoration.setListener(&decoration_listener, self);
+                decoration.setMode(wl.DECORATION_MODE_SERVER_SIDE);
+                self.decoration = decoration;
+            }
+        }
+
         surface.commit();
         if (wl.wl_display_roundtrip(self.display) < 0) return error.WaylandIo;
         return self;
     }
 
+    /// Create a window on the PARENT's connection, driven by the parent's
+    /// run() loop, with `xdg_toplevel.set_parent` so the compositor anchors
+    /// it (dialogs/panels stay above and near their parent). MUST be called
+    /// on the parent's loop thread (e.g. from its on_tick callback): proxy
+    /// creation is interleaved with the loop's dispatch.
+    pub fn initChild(parent: *Window, opts: window.Options) !*Window {
+        const self = try parent.gpa.create(Window);
+        errdefer parent.gpa.destroy(self);
+        self.* = .{
+            .gpa = parent.gpa,
+            .io = parent.io,
+            .opts = opts,
+            .display = parent.display,
+            .registry = parent.registry,
+            .compositor = parent.compositor,
+            .shm = parent.shm,
+            .wm_base = parent.wm_base,
+            .seat = parent.seat,
+            .decoration_manager = parent.decoration_manager,
+            .width = opts.width,
+            .height = opts.height,
+            .wake_fd = parent.wake_fd, // shared: one loop, one wake
+            .parent = parent,
+        };
+
+        const surface = self.compositor.?.createSurface();
+        self.surface = surface;
+        const xdg_surface = self.wm_base.?.getXdgSurface(surface);
+        xdg_surface.setListener(&xdg_surface_listener, self);
+        self.xdg_surface = xdg_surface;
+        const toplevel = xdg_surface.getToplevel();
+        toplevel.setListener(&toplevel_listener, self);
+        toplevel.setTitle(opts.title.ptr);
+        toplevel.setParent(parent.toplevel);
+        self.toplevel = toplevel;
+
+        if (opts.decorations) {
+            if (self.decoration_manager) |manager| {
+                const decoration = manager.getToplevelDecoration(toplevel);
+                decoration.setListener(&decoration_listener, self);
+                decoration.setMode(wl.DECORATION_MODE_SERVER_SIDE);
+                self.decoration = decoration;
+            }
+        }
+
+        surface.commit();
+        try parent.children.append(parent.gpa, self);
+        // No roundtrip: the running loop dispatches the configure; redraw
+        // waits on `configured` as usual.
+        _ = wl.wl_display_flush(self.display);
+        return self;
+    }
+
+    /// Tear down a child window: destroy its proxies and remove it from the
+    /// parent. Runs on the loop thread (run() reaps closed children with it).
+    fn deinitChild(self: *Window) void {
+        const parent = self.parent.?;
+        if (parent.pointer_target == self) parent.pointer_target = null;
+        if (parent.keyboard_target == self) parent.keyboard_target = null;
+        if (parent.repeat_target == self) {
+            parent.repeat_target = null;
+            parent.repeat_down = false;
+        }
+        for (parent.children.items, 0..) |child, i| {
+            if (child == self) {
+                _ = parent.children.orderedRemove(i);
+                break;
+            }
+        }
+        self.dropBuffers();
+        self.staged.pixels.deinit(self.gpa);
+        self.front.pixels.deinit(self.gpa);
+        if (self.decoration) |d| wl.wl_proxy_destroy(@ptrCast(d));
+        if (self.toplevel) |t| wl.wl_proxy_destroy(@ptrCast(t));
+        if (self.xdg_surface) |x| wl.wl_proxy_destroy(@ptrCast(x));
+        if (self.surface) |s| s.destroy();
+        _ = wl.wl_display_flush(self.display);
+        self.children.deinit(self.gpa);
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    /// Update the toplevel title at runtime (apps rename windows per
+    /// document, macOS-style).
+    pub fn setTitle(self: *Window, title: [*:0]const u8) void {
+        if (self.toplevel) |toplevel| {
+            toplevel.setTitle(title);
+            if (self.surface) |surface| surface.commit();
+        }
+    }
+
     pub fn deinit(self: *Window) void {
+        // Children die with their root (their proxies live on this
+        // connection). Notify each — the embedder unregisters its handle —
+        // then destroy.
+        while (self.children.items.len > 0) {
+            const child = self.children.items[self.children.items.len - 1];
+            if (child.opts.on_close) |cb| cb(child, child.opts.user);
+            child.deinitChild();
+        }
+        self.children.deinit(self.gpa);
         self.dropBuffers();
         self.staged.pixels.deinit(self.gpa);
         self.front.pixels.deinit(self.gpa);
         if (self.keyboard) |k| wl.wl_proxy_destroy(@ptrCast(k));
         if (self.pointer) |p| wl.wl_proxy_destroy(@ptrCast(p));
+        if (self.decoration) |d| wl.wl_proxy_destroy(@ptrCast(d));
+        if (self.decoration_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
         if (self.toplevel) |t| wl.wl_proxy_destroy(@ptrCast(t));
         if (self.xdg_surface) |x| wl.wl_proxy_destroy(@ptrCast(x));
         if (self.surface) |s| s.destroy();
@@ -164,7 +300,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
                 .{ .fd = wl.wl_display_get_fd(self.display), .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.wake_fd, .events = posix.POLL.IN, .revents = 0 },
             };
-            _ = posix.poll(&fds, -1) catch |err| {
+            var timeout: i32 = if (self.opts.tick_ms > 0) @intCast(self.opts.tick_ms) else -1;
+            if (self.repeat_down) {
+                const wait = self.repeat_at - nowMs();
+                const rep_ms: i32 = @intCast(@max(1, @min(wait, 1000)));
+                timeout = if (timeout < 0) rep_ms else @min(timeout, rep_ms);
+            }
+            _ = posix.poll(&fds, timeout) catch |err| {
                 wl.wl_display_cancel_read(self.display);
                 return err;
             };
@@ -180,16 +322,49 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             if (fds[1].revents & posix.POLL.IN != 0) {
                 var drained: u64 = 0;
                 _ = posix.read(self.wake_fd, std.mem.asBytes(&drained)) catch {};
-                sync.lock(&self.mutex, self.io);
-                const has_frame = self.staged.fresh;
-                sync.unlock(&self.mutex, self.io);
-                if (has_frame) {
-                    self.needs_redraw = true;
-                }
+                self.latchStaged();
+                for (self.children.items) |child| child.latchStaged();
+            }
+
+            // Outside the prepare_read/read_events critical section: the tick
+            // callback may mark redraws, create child windows, or (indirectly)
+            // touch window state.
+            if (self.opts.on_tick) |tick| tick(self, self.opts.user);
+
+            // Synthetic key repeat: re-deliver the held key at the seat's
+            // announced cadence (the release event stops it in onKey).
+            if (self.repeat_down and nowMs() >= self.repeat_at) {
+                const target = self.repeat_target orelse self;
+                if (target.opts.on_key) |cb|
+                    cb(target, self.repeat_key, wl.KEYBOARD_KEY_STATE_PRESSED, target.opts.user);
+                const rate = @max(1, self.repeat_rate);
+                self.repeat_at = nowMs() + @max(1, @divTrunc(1000, @as(i64, rate)));
+            }
+
+            // Reap children closed by the compositor or the embedder. The
+            // on_close callback sees a still-valid window; the pointer dies
+            // right after it returns.
+            var i: usize = 0;
+            while (i < self.children.items.len) {
+                const child = self.children.items[i];
+                if (child.closed) {
+                    if (child.opts.on_close) |cb| cb(child, child.opts.user);
+                    child.deinitChild(); // removes itself from children
+                } else i += 1;
             }
 
             if (self.configured and self.needs_redraw) try self.redraw();
+            for (self.children.items) |child| {
+                if (child.configured and child.needs_redraw) child.redraw() catch {};
+            }
         }
+    }
+
+    fn latchStaged(self: *Window) void {
+        sync.lock(&self.mutex, self.io);
+        const has_frame = self.staged.fresh;
+        sync.unlock(&self.mutex, self.io);
+        if (has_frame) self.needs_redraw = true;
     }
 
     fn redraw(self: *Window) !void {
@@ -337,6 +512,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             self.shm = @ptrCast(registry.bind(name, &wl.wl_shm_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "xdg_wm_base")) {
             self.wm_base = @ptrCast(registry.bind(name, &wl.xdg_wm_base_interface, @min(ver, 6)).?);
+        } else if (std.mem.eql(u8, iface, "zxdg_decoration_manager_v1")) {
+            self.decoration_manager = @ptrCast(registry.bind(name, &wl.zxdg_decoration_manager_v1_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "wl_seat")) {
             const seat: *wl.Seat = @ptrCast(registry.bind(name, &wl.wl_seat_interface, @min(ver, 5)).?);
             seat.setListener(&seat_listener, self);
@@ -350,6 +527,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     fn onPing(_: ?*anyopaque, wm_base: *wl.XdgWmBase, serial: u32) callconv(.c) void {
         wm_base.pong(serial);
     }
+
+    const decoration_listener = wl.ZxdgToplevelDecoration.Listener{
+        .configure = onDecorationConfigure,
+    };
+    /// The compositor may override the requested mode (e.g. force client-side):
+    /// we accept whatever it picks — server-side draws the frame for us,
+    /// client-side just leaves the window borderless as before.
+    fn onDecorationConfigure(_: ?*anyopaque, _: *wl.ZxdgToplevelDecoration, _: u32) callconv(.c) void {}
 
     const xdg_surface_listener = wl.XdgSurface.Listener{ .configure = onSurfaceConfigure };
     fn onSurfaceConfigure(data: ?*anyopaque, xdg_surface: *wl.XdgSurface, serial: u32) callconv(.c) void {
@@ -430,19 +615,69 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         .repeat_info = onKeyRepeatInfo,
     };
 
+    /// Seat listeners live on the root (the seat is connection-global); the
+    /// wl enter events carry the surface — resolve it to root or child.
+    fn targetFor(self: *Window, surface: ?*wl.Surface) *Window {
+        if (surface) |s| {
+            if (self.surface == s) return self;
+            for (self.children.items) |child| {
+                if (child.surface == s) return child;
+            }
+        }
+        return self;
+    }
+
     fn onKeymap(_: ?*anyopaque, _: *wl.Keyboard, _: u32, fd: i32, _: u32) callconv(.c) void {
         _ = linux.close(fd);
     }
-    fn onKeyEnter(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface, _: ?*anyopaque) callconv(.c) void {}
-    fn onKeyLeave(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface) callconv(.c) void {}
+    fn onKeyEnter(data: ?*anyopaque, _: *wl.Keyboard, _: u32, surface: ?*wl.Surface, _: ?*anyopaque) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.keyboard_target = self.targetFor(surface);
+    }
+    fn onKeyLeave(data: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.repeat_down = false; // focus gone: the release will never arrive
+    }
+
+    /// Monotonic milliseconds (std.time.milliTimestamp lives behind std.Io
+    /// in Zig 0.16; the repeat pacing only needs a raw monotonic clock).
+    fn nowMs() i64 {
+        var ts: linux.timespec = undefined;
+        _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+        return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+    }
+
+    /// Modifiers hold state rather than produce input: never auto-repeated
+    /// (evdev codes: ctrl, shift, alt, meta, capslock).
+    fn isModifierKey(key: u32) bool {
+        return switch (key) {
+            29, 42, 54, 56, 58, 97, 100, 125, 126 => true,
+            else => false,
+        };
+    }
 
     fn onKey(data: ?*anyopaque, _: *wl.Keyboard, _: u32, _: u32, key: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
+        const target = self.keyboard_target orelse self;
+        if (state == wl.KEYBOARD_KEY_STATE_PRESSED) {
+            if (!isModifierKey(key) and self.repeat_rate > 0) {
+                self.repeat_key = key;
+                self.repeat_down = true;
+                self.repeat_target = target;
+                self.repeat_at = nowMs() + self.repeat_delay;
+            }
+        } else if (key == self.repeat_key) {
+            self.repeat_down = false;
+        }
+        if (target.opts.on_key) |cb| cb(target, key, state, target.opts.user);
     }
 
     fn onKeyModifiers(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
-    fn onKeyRepeatInfo(_: ?*anyopaque, _: *wl.Keyboard, _: i32, _: i32) callconv(.c) void {}
+    fn onKeyRepeatInfo(data: ?*anyopaque, _: *wl.Keyboard, rate: i32, delay: i32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.repeat_rate = rate;
+        self.repeat_delay = delay;
+    }
 
     const pointer_listener = wl.Pointer.Listener{
         .enter = onPointerEnter,
@@ -458,27 +693,46 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         .axis_relative_direction = onPointerAxisRelativeDirection,
     };
 
-    fn onPointerEnter(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: ?*wl.Surface, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {
+    fn onPointerEnter(data: ?*anyopaque, _: *wl.Pointer, serial: u32, surface: ?*wl.Surface, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_serial = serial;
         self.pointer_x = wl.fixedToF32(sx);
         self.pointer_y = wl.fixedToF32(sy);
+        self.pointer_target = self.targetFor(surface);
     }
     fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}
     fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_x = wl.fixedToF32(sx);
         self.pointer_y = wl.fixedToF32(sy);
+        const target = self.pointer_target orelse self;
+        if (target.opts.on_mouse) |cb| cb(target, .{ .kind = .motion, .x = self.pointer_x, .y = self.pointer_y }, target.opts.user);
     }
     fn onPointerButton(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_serial = serial;
+        const target = self.pointer_target orelse self;
+        if (target.opts.on_mouse) |cb| {
+            const kind: window.MouseEvent.Kind = if (state == wl.KEYBOARD_KEY_STATE_PRESSED) .press else .release;
+            cb(target, .{ .kind = kind, .x = self.pointer_x, .y = self.pointer_y, .button = button }, target.opts.user);
+            return;
+        }
         // BTN_LEFT is 272. Drag window anywhere to move if borderless
-        if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and !self.fullscreen) {
-            if (self.seat) |seat| self.toplevel.?.move(seat, serial);
+        if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and !target.fullscreen) {
+            if (self.seat) |seat| target.toplevel.?.move(seat, serial);
         }
     }
-    fn onPointerAxis(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: u32, _: wl.Fixed) callconv(.c) void {}
+    fn onPointerAxis(data: ?*anyopaque, _: *wl.Pointer, _: u32, axis: u32, value: wl.Fixed) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (axis != 0) return; // vertical only
+        const target = self.pointer_target orelse self;
+        if (target.opts.on_mouse) |cb| cb(target, .{
+            .kind = .scroll,
+            .x = self.pointer_x,
+            .y = self.pointer_y,
+            .scroll_dy = wl.fixedToF32(value),
+        }, target.opts.user);
+    }
     fn onPointerFrame(_: ?*anyopaque, _: *wl.Pointer) callconv(.c) void {}
     fn onPointerAxisSource(_: ?*anyopaque, _: *wl.Pointer, _: u32) callconv(.c) void {}
     fn onPointerAxisStop(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: u32) callconv(.c) void {}

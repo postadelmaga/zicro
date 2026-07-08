@@ -10,12 +10,43 @@ pub const Rect = struct {
     h: i32,
 };
 
+/// A pointer event in surface (content) coordinates, y growing downward.
+pub const MouseEvent = struct {
+    kind: Kind,
+    x: f32,
+    y: f32,
+    /// evdev BTN_* code for press/release (272 = left, 273 = right, 274 = middle).
+    button: u32 = 0,
+    /// Vertical scroll amount for `.scroll` (positive = content up).
+    scroll_dy: f32 = 0,
+
+    pub const Kind = enum { motion, press, release, scroll };
+};
+
 pub const Options = struct {
     title: [:0]const u8 = "zicro-shell",
     width: u32 = 720,
     height: u32 = 460,
     on_draw: ?*const fn (canvas: *paint.Canvas, content: Rect, user: ?*anyopaque) void = null,
     on_key: ?*const fn (window: *Window, key: u32, state: u32, user: ?*anyopaque) void = null,
+    /// When set, pointer events are delivered to the app and the default
+    /// drag-anywhere window move is disabled (UI apps own their clicks).
+    on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) void = null,
+    /// Periodic callback from the event loop (runtime pumps: dispatch queues,
+    /// timers, animations). 0 disables ticking and the loop blocks on events.
+    on_tick: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
+    tick_ms: u32 = 0,
+    /// Ask the compositor for a server-side frame (title bar with close/
+    /// minimize/maximize) via xdg-decoration. Default off: zicro shells are
+    /// borderless drag-anywhere surfaces; app windows (e.g. zart) opt in.
+    /// Falls back silently to borderless when the compositor lacks the
+    /// protocol.
+    decorations: bool = false,
+    /// Fired when a CHILD window (see `Window.initChild`) is torn down — the
+    /// compositor closed it or the app set `closed`. The window pointer is
+    /// valid only for the duration of the callback; it is destroyed right
+    /// after. Root windows signal close by `run()` returning, as before.
+    on_close: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
     user: ?*anyopaque = null,
 };
 
