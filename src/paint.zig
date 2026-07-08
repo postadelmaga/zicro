@@ -720,6 +720,7 @@ pub const Canvas = struct {
         }
 
         const r = width / 2.0;
+        const sag = radius * (1.0 - @cos(std.math.pi / 30.0));
         const pad = radius + r + 1.0;
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(cx - pad)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(cy - pad)));
@@ -740,7 +741,10 @@ pub const Canvas = struct {
                 const dcx = fx - cx;
                 const dcy = fy - cy;
                 const dc = @sqrt(dcx * dcx + dcy * dcy);
-                if (@abs(dc - radius) - r > 0.5) continue;
+                // The chords dip inside the circle by up to the sagitta
+                // (radius·(1−cos 6°) at 12°/segment) — widen the band so
+                // large-radius arcs keep their inner AA pixels.
+                if (@abs(dc - radius) - r > 0.5 + sag) continue;
                 var d: f32 = std.math.floatMax(f32);
                 var s: usize = 0;
                 while (s < segs) : (s += 1) {

@@ -102,13 +102,15 @@ const chrome_style = paint.Style{
 const text_pad: i32 = @as(i32, @intCast(chrome_style.margin)) + 14;
 
 // window_z.zig's redraw() no longer clears the canvas for us (see its own
-// doc comment), so drawChrome runs exactly ONCE — every key press repaints
+// doc comment), so drawChrome runs once PER SIZE — every key press repaints
 // (window_z.zig's run() loop), and re-running drawChrome's per-pixel SDF
 // evaluation every keystroke measured ~1-2s under this target's soft-float
 // emulation (fine once, unusable at typing speed). Later frames just flatten
 // the text region back to the glass color — a plain-color fill, no SDF — so
-// old glyphs don't smear as the input line changes.
-var chrome_painted = false;
+// old glyphs don't smear as the input line changes. Tracking the painted
+// size (not a bare bool) keeps this correct when window_z grows resize.
+var chrome_w: i32 = 0;
+var chrome_h: i32 = 0;
 
 /// Same premultiply as paint.zig's private `packPremul`, re-derived here
 /// since it isn't exported — kept in sync with `chrome_style.glass` by
@@ -130,16 +132,25 @@ fn premulPack(c: paint.Color) u32 {
 // color is the practical fix until the compositor does real alpha blending.
 const desktop_bg: u32 = 0xFF10_1826;
 
-/// One-time post-pass over drawChrome's output: pixels below `alpha_cut`
-/// (drawChrome's transparent gutter, and the outer half of the AA'd panel
-/// edge) become opaque `desktop_bg` instead of premultiplied-near-black.
-/// Cheap (plain reads/compares, no SDF) — folded into the one-time chrome
-/// cost, not run per keystroke.
+/// One-time post-pass over drawChrome's output: every non-opaque pixel (the
+/// transparent gutter, the drop shadow, the AA'd panel edge) is source-over
+/// composited onto opaque `desktop_bg` — the shadow keeps its shading instead
+/// of flattening to the background (the old `alpha_cut` threshold erased it:
+/// peak shadow alpha ~115 < 128). Cheap (integer per-pixel blend, no SDF) —
+/// folded into the one-time chrome cost, not run per keystroke.
 fn fixupGutter(canvas: *paint.Canvas) void {
-    const alpha_cut: u32 = 128;
+    const dr: u32 = (desktop_bg >> 16) & 0xff;
+    const dg: u32 = (desktop_bg >> 8) & 0xff;
+    const db: u32 = desktop_bg & 0xff;
     for (canvas.pixels) |*p| {
         const a = (p.* >> 24) & 0xff;
-        if (a < alpha_cut) p.* = desktop_bg;
+        if (a == 255) continue;
+        const inv = 255 - a;
+        // Premultiplied source-over with an opaque destination.
+        const r = ((p.* >> 16) & 0xff) + (dr * inv + 127) / 255;
+        const g = ((p.* >> 8) & 0xff) + (dg * inv + 127) / 255;
+        const b = (p.* & 0xff) + (db * inv + 127) / 255;
+        p.* = 0xFF00_0000 | (@min(r, 255) << 16) | (@min(g, 255) << 8) | @min(b, 255);
     }
 }
 
@@ -164,10 +175,11 @@ fn clearContentArea(canvas: *paint.Canvas, content: window.Rect) void {
 fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const shell: *ShellState = @ptrCast(@alignCast(user.?));
 
-    if (!chrome_painted) {
+    if (chrome_w != content.w or chrome_h != content.h) {
         canvas.drawChrome(chrome_style);
         fixupGutter(canvas);
-        chrome_painted = true;
+        chrome_w = content.w;
+        chrome_h = content.h;
     } else {
         clearContentArea(canvas, content);
     }
