@@ -35,6 +35,7 @@ pub const anim = @import("anim.zig");
 pub const input = @import("input.zig");
 pub const video = @import("video.zig");
 pub const audio = @import("audio.zig");
+pub const audio_device = @import("audio_device.zig");
 pub const bridge = @import("bridge.zig");
 
 // -- graphics and windowing layer (Wayland/Win32)

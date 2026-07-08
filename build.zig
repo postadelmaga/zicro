@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
     // Linux-specific Wayland support
     if (target.result.os.tag == .linux) {
         zicro.linkSystemLibrary("wayland-client", .{});
+        zicro.linkSystemLibrary("asound", .{}); // ALSA: backend audio (audio_device.zig)
 
         // We only need the xdg-shell stable protocol for basic windowing
         const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
@@ -43,6 +44,9 @@ pub fn build(b: *std.Build) void {
         const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
         zicro.addCSourceFile(.{ .file = deco_c });
     }
+    // winmm: backend audio waveOut (audio_device.zig) su Windows.
+    if (target.result.os.tag == .windows) zicro.linkSystemLibrary("winmm", .{});
+
     // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
     // Only libobjc and the CG functions are needed at LINK time — AppKit classes resolve
     // by name at runtime (objc_getClass), Cocoa is linked for its load command alone.
@@ -70,6 +74,7 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.os.tag == .linux) {
         zicro_fast.linkSystemLibrary("wayland-client", .{});
+        zicro_fast.linkSystemLibrary("asound", .{});
         const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
         const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
         scan.addFileArg(.{ .cwd_relative = xml });
@@ -81,6 +86,7 @@ pub fn build(b: *std.Build) void {
         const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
         zicro_fast.addCSourceFile(.{ .file = deco_c });
     }
+    if (target.result.os.tag == .windows) zicro_fast.linkSystemLibrary("winmm", .{});
     if (target.result.os.tag == .macos) addMacosLinks(b, zicro_fast, macos_sysroot);
 
     const bench_exe = b.addExecutable(.{
