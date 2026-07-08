@@ -397,10 +397,13 @@ pub const Touch = opaque {
     }
 };
 
+/// wl_keyboard.keymap_format: 1 = the fd carries an xkb v1 keymap text.
+pub const KEYBOARD_KEYMAP_FORMAT_XKB_V1: u32 = 1;
+
 pub const Keyboard = opaque {
     pub const Listener = extern struct {
-        /// Carries an mmap-able fd the listener must close (we read keys as raw evdev
-        /// codes, so the xkb keymap itself goes unused).
+        /// Carries an mmap-able fd the listener must close (mmap it to feed xkbcommon
+        /// when layout-correct text translation is wanted; raw evdev codes work without).
         keymap: *const fn (data: ?*anyopaque, keyboard: *Keyboard, format: u32, fd: i32, size: u32) callconv(.c) void,
         enter: *const fn (data: ?*anyopaque, keyboard: *Keyboard, serial: u32, surface: ?*Surface, keys: ?*anyopaque) callconv(.c) void,
         leave: *const fn (data: ?*anyopaque, keyboard: *Keyboard, serial: u32, surface: ?*Surface) callconv(.c) void,
@@ -411,6 +414,117 @@ pub const Keyboard = opaque {
 
     pub fn setListener(self: *Keyboard, listener: *const Listener, data: ?*anyopaque) void {
         addListener(self, listener, data);
+    }
+};
+
+// --- wl_data_device_manager (clipboard selection) ------------------------------------------
+// Core interfaces, exported by libwayland-client like wl_seat & co. Only the selection
+// (copy/paste) path is wrapped in full; DnD events exist in the listeners because the
+// slots must cover every opcode up to the bound version, but they can stay no-ops.
+
+pub extern const wl_data_device_manager_interface: Interface;
+pub extern const wl_data_device_interface: Interface;
+pub extern const wl_data_source_interface: Interface;
+pub extern const wl_data_offer_interface: Interface;
+
+pub const DataDeviceManager = opaque {
+    /// create_data_source (opcode 0): the offer side of a copy.
+    pub fn createDataSource(self: *DataDeviceManager) *DataSource {
+        const p = wl_proxy_marshal_flags(proxy(self), 0, &wl_data_source_interface, version(self), 0, @as(?*Proxy, null));
+        return @ptrCast(p.?);
+    }
+
+    /// get_data_device (opcode 1): the per-seat selection/DnD endpoint.
+    pub fn getDataDevice(self: *DataDeviceManager, seat: *Seat) *DataDevice {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &wl_data_device_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(seat)));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const DataSource = opaque {
+    pub const Listener = extern struct {
+        /// target: DnD-only feedback (mime the destination would accept); nullable.
+        target: *const fn (data: ?*anyopaque, source: *DataSource, mime_type: ?[*:0]const u8) callconv(.c) void,
+        /// send: a client asks for the data as `mime_type` — write it to `fd`, then close it.
+        send: *const fn (data: ?*anyopaque, source: *DataSource, mime_type: [*:0]const u8, fd: i32) callconv(.c) void,
+        /// cancelled: the selection was replaced (or the DnD aborted) — destroy the source.
+        cancelled: *const fn (data: ?*anyopaque, source: *DataSource) callconv(.c) void,
+        // v3 DnD lifecycle events: never fire for a plain selection, but the slots must exist.
+        dnd_drop_performed: *const fn (data: ?*anyopaque, source: *DataSource) callconv(.c) void,
+        dnd_finished: *const fn (data: ?*anyopaque, source: *DataSource) callconv(.c) void,
+        action: *const fn (data: ?*anyopaque, source: *DataSource, dnd_action: u32) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *DataSource, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
+    /// offer (opcode 0): advertise one mime type the source can produce.
+    pub fn offer(self: *DataSource, mime: [*:0]const u8) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), 0, mime);
+    }
+
+    pub fn destroy(self: *DataSource) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+};
+
+pub const DataDevice = opaque {
+    pub const Listener = extern struct {
+        /// data_offer: a new offer object was introduced; its mime types follow as
+        /// `wl_data_offer.offer` events, then `selection` (or a DnD `enter`) designates it.
+        data_offer: *const fn (data: ?*anyopaque, device: *DataDevice, offer: *DataOffer) callconv(.c) void,
+        enter: *const fn (data: ?*anyopaque, device: *DataDevice, serial: u32, surface: ?*Surface, x: Fixed, y: Fixed, offer: ?*DataOffer) callconv(.c) void,
+        leave: *const fn (data: ?*anyopaque, device: *DataDevice) callconv(.c) void,
+        motion: *const fn (data: ?*anyopaque, device: *DataDevice, time: u32, x: Fixed, y: Fixed) callconv(.c) void,
+        drop: *const fn (data: ?*anyopaque, device: *DataDevice) callconv(.c) void,
+        /// selection: `offer` is the new clipboard content (null = cleared). Replaces —
+        /// and obliges the client to destroy — the previously advertised offer.
+        selection: *const fn (data: ?*anyopaque, device: *DataDevice, offer: ?*DataOffer) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *DataDevice, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
+    /// set_selection (opcode 1): take clipboard ownership. `serial` must come from a
+    /// recent input event (key press / pointer button) or the compositor ignores it.
+    pub fn setSelection(self: *DataDevice, source: ?*DataSource, serial: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, @as(?*Proxy, @ptrCast(source)), serial);
+    }
+
+    /// release (opcode 2, destructor since v2); plain proxy destroy on a v1 device.
+    pub fn release(self: *DataDevice) void {
+        if (version(self) >= 2) {
+            _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), MARSHAL_FLAG_DESTROY);
+        } else {
+            wl_proxy_destroy(proxy(self));
+        }
+    }
+};
+
+pub const DataOffer = opaque {
+    pub const Listener = extern struct {
+        /// offer: one mime type the source can produce (sent once per type, right after
+        /// the introducing `wl_data_device.data_offer`).
+        offer: *const fn (data: ?*anyopaque, offer: *DataOffer, mime_type: [*:0]const u8) callconv(.c) void,
+        // v3 DnD-action events; no-ops for a plain selection offer.
+        source_actions: *const fn (data: ?*anyopaque, offer: *DataOffer, actions: u32) callconv(.c) void,
+        action: *const fn (data: ?*anyopaque, offer: *DataOffer, action: u32) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *DataOffer, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
+    /// receive (opcode 1): ask for the data as `mime`; the source writes into `fd`
+    /// (pass the write end of a pipe, then close our copy and read the other end).
+    pub fn receive(self: *DataOffer, mime: [*:0]const u8, fd: c_int) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, mime, fd);
+    }
+
+    pub fn destroy(self: *DataOffer) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), MARSHAL_FLAG_DESTROY);
     }
 };
 
