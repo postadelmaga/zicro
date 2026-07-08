@@ -1,0 +1,11 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ x86_64-macos, arm64-macos ]
+install-name: '/usr/lib/libobjc.A.dylib'
+exports:
+  - targets: [ x86_64-macos, arm64-macos ]
+    symbols: [ _objc_getClass, _sel_registerName, _objc_allocateClassPair,
+               _objc_registerClassPair, _class_addMethod, _objc_msgSend ]
+  - targets: [ x86_64-macos ]
+    symbols: [ _objc_msgSend_stret ]
+...

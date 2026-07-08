@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Cross-linking to macOS without an Apple SDK: a root that mirrors the macOS
+    // filesystem layout (System/Library/Frameworks + usr/lib), e.g. Darling's
+    // /usr/libexec/darling. The frameworks there are real Mach-O dylibs, so the
+    // linker consumes them directly.
+    const macos_sysroot = b.option([]const u8, "macos-sysroot", "macOS-shaped root (System/Library/Frameworks, usr/lib) for cross-linking, e.g. /usr/libexec/darling");
+
     // The zicro library module: the whole kernel + framework, one import.
     const zicro = b.addModule("zicro", .{
         .root_source_file = b.path("src/root.zig"),
@@ -37,13 +43,12 @@ pub fn build(b: *std.Build) void {
         const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
         zicro.addCSourceFile(.{ .file = deco_c });
     }
-
     // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
-    if (target.result.os.tag == .macos) {
-        zicro.linkFramework("Cocoa", .{});
-        zicro.linkFramework("QuartzCore", .{});
-        zicro.linkFramework("CoreGraphics", .{});
-    }
+    // Only libobjc and the CG functions are needed at LINK time — AppKit classes resolve
+    // by name at runtime (objc_getClass), Cocoa is linked for its load command alone.
+    // Without a sysroot the vendored .tbd stubs make the link SDK-free (the zig way:
+    // zig itself links libSystem from a bundled stub).
+    if (target.result.os.tag == .macos) addMacosLinks(b, zicro, macos_sysroot);
 
     // `zig build test` — every `test` block in the library.
     const mod_tests = b.addTest(.{ .root_module = zicro });
@@ -76,11 +81,7 @@ pub fn build(b: *std.Build) void {
         const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
         zicro_fast.addCSourceFile(.{ .file = deco_c });
     }
-    if (target.result.os.tag == .macos) {
-        zicro_fast.linkFramework("Cocoa", .{});
-        zicro_fast.linkFramework("QuartzCore", .{});
-        zicro_fast.linkFramework("CoreGraphics", .{});
-    }
+    if (target.result.os.tag == .macos) addMacosLinks(b, zicro_fast, macos_sysroot);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
@@ -116,4 +117,20 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step("run-" ++ name, "Run the " ++ name ++ " example");
         run_step.dependOn(&run_cmd.step);
     }
+}
+
+/// The macOS link set for a module: libobjc + Cocoa (load command) + CoreGraphics.
+/// `sysroot` (a macOS-shaped tree, e.g. Darling's /usr/libexec/darling) overrides the
+/// vendored .tbd stubs — those keep the default cross-link SDK-free.
+fn addMacosLinks(b: *std.Build, mod: *std.Build.Module, sysroot: ?[]const u8) void {
+    if (sysroot) |root| {
+        mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ root, "System", "Library", "Frameworks" }) });
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "usr", "lib" }) });
+    } else {
+        mod.addFrameworkPath(b.path("vendor/macos-stubs/System/Library/Frameworks"));
+        mod.addLibraryPath(b.path("vendor/macos-stubs/usr/lib"));
+    }
+    mod.linkSystemLibrary("objc", .{});
+    mod.linkFramework("Cocoa", .{});
+    mod.linkFramework("CoreGraphics", .{});
 }

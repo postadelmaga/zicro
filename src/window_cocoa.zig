@@ -1,10 +1,25 @@
 //! # zicro.window_cocoa — the macOS windowing backend
 //!
-//! A minimal software-rendered window, the Cocoa sibling of `window_wayland` (Linux) and
+//! A software-rendered window, the Cocoa sibling of `window_wayland` (Linux) and
 //! `window_win32` (Windows). It drives AppKit through the bare Objective-C runtime
 //! (`objc_msgSend`) rather than `@cImport`-ing the frameworks, so it type-checks under a
-//! cross-compile even without the macOS SDK; presentation is a premultiplied-ARGB
-//! `CGImage` pushed into the content view's layer each frame.
+//! cross-compile even without the macOS SDK.
+//!
+//! Presentation is a custom `NSView` subclass (built at runtime with
+//! `objc_allocateClassPair`) whose `drawRect:` draws a `CGImage` over the whole bounds via
+//! `CGContextDrawImage`. That is deliberately the *lowest common denominator* drawing
+//! path: it works on real AppKit **and** on Cocotron/Onyx2D (the AppKit Darling ships,
+//! which zart drives as a Linux window server) — unlike `CALayer.setContents:`, which
+//! Cocotron does not composite.
+//!
+//! Input follows the same dual-world rule: key events are decoded from
+//! `charactersIgnoringModifiers` (NOT `keyCode` — real macOS puts Apple virtual keycodes
+//! there, zart passes raw evdev, so the character is the only portable field) and mapped
+//! to the **evdev codes** the Wayland backend emits, so `on_key` handlers are identical
+//! across platforms. Modifier keys never arrive as key events on either world
+//! (`flagsChanged` on macOS, flag-bits-only under zart), so press/release transitions for
+//! Shift/Ctrl/Alt are synthesized from `modifierFlags` deltas — with **Command mapped to
+//! Ctrl**, the same normalization zart applies in the other direction.
 //!
 //! Linkage (see build.zig): `-framework Cocoa -framework QuartzCore -framework CoreGraphics`.
 
@@ -16,12 +31,24 @@ const builtin = @import("builtin");
 const id = ?*anyopaque;
 const SEL = ?*anyopaque;
 const Class = ?*anyopaque;
+const IMP = ?*const anyopaque;
 
 extern "c" fn objc_getClass(name: [*:0]const u8) Class;
 extern "c" fn sel_registerName(name: [*:0]const u8) SEL;
 /// The one true message send. Cast to the concrete signature at each call site (the
 /// selector never changes the C ABI), which is what the `msg*` helpers below do.
 extern "c" fn objc_msgSend() void;
+/// x86_64 only: message sends whose return value lands in memory (CGRect & co) must go
+/// through the _stret entry point. aarch64 has no such split — see `msgRect`.
+extern "c" fn objc_msgSend_stret() void;
+extern "c" fn objc_allocateClassPair(superclass: Class, name: [*:0]const u8, extra: usize) Class;
+extern "c" fn objc_registerClassPair(cls: Class) void;
+extern "c" fn class_addMethod(cls: Class, name: SEL, imp: IMP, types: [*:0]const u8) bool;
+
+/// AppKit classes are looked up by name at runtime (`objc_getClass`), so nothing from
+/// Cocoa is needed at link time — but dyld only maps frameworks with a load command in
+/// the binary. Referencing one real Cocoa data symbol keeps that load command alive.
+extern "c" var NSApp: id;
 
 extern "c" fn CGColorSpaceCreateDeviceRGB() ?*anyopaque;
 extern "c" fn CGColorSpaceRelease(space: ?*anyopaque) void;
@@ -41,6 +68,7 @@ extern "c" fn CGImageCreate(
     intent: u32,
 ) ?*anyopaque;
 extern "c" fn CGImageRelease(image: ?*anyopaque) void;
+extern "c" fn CGContextDrawImage(ctx: ?*anyopaque, rect: CGRect, image: ?*anyopaque) void;
 
 // Interpret each little-endian 32-bit pixel as 0xAARRGGBB, premultiplied — exactly the
 // layout `paint.Canvas` produces (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little).
@@ -51,6 +79,36 @@ const bitmap_info: u32 = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32L
 const CGPoint = extern struct { x: f64, y: f64 };
 const CGSize = extern struct { width: f64, height: f64 };
 const CGRect = extern struct { origin: CGPoint, size: CGSize };
+
+// NSEvent type numbers (Cocotron matches Apple's).
+const NSLeftMouseDown: u64 = 1;
+const NSLeftMouseUp: u64 = 2;
+const NSRightMouseDown: u64 = 3;
+const NSRightMouseUp: u64 = 4;
+const NSMouseMoved: u64 = 5;
+const NSLeftMouseDragged: u64 = 6;
+const NSRightMouseDragged: u64 = 7;
+const NSKeyDown: u64 = 10;
+const NSKeyUp: u64 = 11;
+const NSFlagsChanged: u64 = 12;
+const NSScrollWheel: u64 = 22;
+const NSOtherMouseDown: u64 = 25;
+const NSOtherMouseUp: u64 = 26;
+const NSOtherMouseDragged: u64 = 27;
+
+// NSEventModifierFlags bits.
+const ModShift: u64 = 1 << 17;
+const ModControl: u64 = 1 << 18;
+const ModOption: u64 = 1 << 19;
+const ModCommand: u64 = 1 << 20;
+
+// evdev codes emitted to `on_key`/`on_mouse` (same values the Wayland backend delivers).
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_LEFTALT: u32 = 56;
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 fn class(name: [*:0]const u8) Class {
     return objc_getClass(name);
@@ -71,6 +129,28 @@ fn msgBool(obj: id, sel: [*:0]const u8) bool {
     const f: *const fn (id, SEL) callconv(.c) bool = @ptrCast(&objc_msgSend);
     return f(obj, sel_registerName(sel));
 }
+/// `[obj sel]` → u64 (NSUInteger).
+fn msgU64(obj: id, sel: [*:0]const u8) u64 {
+    const f: *const fn (id, SEL) callconv(.c) u64 = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName(sel));
+}
+/// `[obj sel]` → f64 (CGFloat).
+fn msgF64(obj: id, sel: [*:0]const u8) f64 {
+    const f: *const fn (id, SEL) callconv(.c) f64 = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName(sel));
+}
+/// `[obj sel]` → CGPoint (two doubles: returned in registers, plain msgSend on both archs).
+fn msgPoint(obj: id, sel: [*:0]const u8) CGPoint {
+    const f: *const fn (id, SEL) callconv(.c) CGPoint = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName(sel));
+}
+/// `[obj sel]` → CGRect. Four doubles land in memory on x86_64 → the _stret entry point;
+/// aarch64 returns every struct through x8, one msgSend for everything.
+fn msgRect(obj: id, sel: [*:0]const u8) CGRect {
+    const entry = if (builtin.cpu.arch == .x86_64) &objc_msgSend_stret else &objc_msgSend;
+    const f: *const fn (id, SEL) callconv(.c) CGRect = @ptrCast(entry);
+    return f(obj, sel_registerName(sel));
+}
 /// `[obj sel:arg]` with an object argument → void.
 fn msgVoidId(obj: id, sel: [*:0]const u8, arg: id) void {
     const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
@@ -86,14 +166,92 @@ fn msgVoidInt(obj: id, sel: [*:0]const u8, arg: i64) void {
     const f: *const fn (id, SEL, i64) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(obj, sel_registerName(sel), arg);
 }
+/// `[obj sel:size]` with a CGSize argument → void.
+fn msgVoidSize(obj: id, sel: [*:0]const u8, arg: CGSize) void {
+    const f: *const fn (id, SEL, CGSize) callconv(.c) void = @ptrCast(&objc_msgSend);
+    f(obj, sel_registerName(sel), arg);
+}
+/// `[obj sel:point fromView:v]` → CGPoint (window → view coordinate conversion).
+fn msgConvertPoint(obj: id, p: CGPoint, from: id) CGPoint {
+    const f: *const fn (id, SEL, CGPoint, id) callconv(.c) CGPoint = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName("convertPoint:fromView:"), p, from);
+}
 /// `[NSString stringWithUTF8String:s]` (and friends taking a C string) → id.
 fn msgStr(cls: id, sel: [*:0]const u8, s: [*:0]const u8) id {
     const f: *const fn (id, SEL, [*:0]const u8) callconv(.c) id = @ptrCast(&objc_msgSend);
     return f(cls, sel_registerName(sel), s);
 }
+/// `[obj characterAtIndex:i]` → unichar.
+fn msgCharAt(obj: id, i: u64) u16 {
+    const f: *const fn (id, SEL, u64) callconv(.c) u16 = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName("characterAtIndex:"), i);
+}
 
 fn nsString(s: [*:0]const u8) id {
     return msgStr(class("NSString"), "stringWithUTF8String:", s);
+}
+
+// --- the content view subclass (runtime-built, drawRect: presents the framebuffer) -------
+
+/// view instance → Window lookup for `drawRect:` (main-thread only, tiny fixed table).
+const MAX_WINDOWS = 8;
+var g_views: [MAX_WINDOWS]id = @splat(null);
+var g_wins: [MAX_WINDOWS]?*anyopaque = @splat(null);
+var g_view_class: Class = null;
+
+fn registerView(view: id, win: *anyopaque) void {
+    for (&g_views, &g_wins) |*v, *w| {
+        if (v.* == null) {
+            v.* = view;
+            w.* = win;
+            return;
+        }
+    }
+}
+
+fn unregisterView(view: id) void {
+    for (&g_views, &g_wins) |*v, *w| {
+        if (v.* == view) {
+            v.* = null;
+            w.* = null;
+        }
+    }
+}
+
+fn windowForView(view: id) ?*anyopaque {
+    for (g_views, g_wins) |v, w| {
+        if (v == view) return w;
+    }
+    return null;
+}
+
+/// Build the `ZicroContentView` class once: an NSView that presents the window's
+/// framebuffer in `drawRect:` and accepts first-responder status for key events.
+fn ensureViewClass() Class {
+    if (g_view_class != null) return g_view_class;
+    const cls = objc_allocateClassPair(class("NSView"), "ZicroContentView", 0) orelse {
+        // Already registered by a previous instance in this process.
+        g_view_class = class("ZicroContentView");
+        return g_view_class;
+    };
+    _ = class_addMethod(cls, sel_registerName("drawRect:"), @ptrCast(&imp_drawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    _ = class_addMethod(cls, sel_registerName("acceptsFirstResponder"), @ptrCast(&imp_yes), "c@:");
+    _ = class_addMethod(cls, sel_registerName("isOpaque"), @ptrCast(&imp_yes), "c@:");
+    objc_registerClassPair(cls);
+    g_view_class = cls;
+    return cls;
+}
+
+fn imp_yes(_: id, _: SEL) callconv(.c) bool {
+    return true;
+}
+
+fn imp_drawRect(view: id, _: SEL, _: CGRect) callconv(.c) void {
+    const win_ptr = windowForView(view) orelse return;
+    if (builtin.os.tag == .macos) {
+        const self: *Window = @ptrCast(@alignCast(win_ptr));
+        self.drawIntoCurrentContext();
+    }
 }
 
 pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
@@ -109,7 +267,6 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     app: id = null,
     win: id = null,
     view: id = null,
-    layer: id = null,
 
     pixels: []u32 = &.{},
     width: u32,
@@ -117,6 +274,11 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     closed: bool = false,
     fullscreen: bool = false,
     mutex: std.Io.Mutex = .init,
+    /// Modifier state as last synthesized to `on_key` (evdev transitions) — see `syncMods`.
+    mods_shift: bool = false,
+    mods_ctrl: bool = false,
+    mods_alt: bool = false,
+    last_tick_ns: u64 = 0,
 
     // NSWindowStyleMask: Titled(1) | Closable(2) | Miniaturizable(4) | Resizable(8).
     const style_mask: u64 = 1 | 2 | 4 | 8;
@@ -136,8 +298,9 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
 
         self.pixels = try gpa.alloc(u32, opts.width * opts.height);
         errdefer gpa.free(self.pixels);
-        @memset(self.pixels, 0);
+        @memset(self.pixels, 0xFF000000);
 
+        std.mem.doNotOptimizeAway(&NSApp); // keep Cocoa's load command (see the extern above)
         const app = msgId(class("NSApplication"), "sharedApplication");
         self.app = app;
         msgVoidInt(app, "setActivationPolicy:", 0); // NSApplicationActivationPolicyRegular
@@ -159,11 +322,21 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         self.win = win;
 
         msgVoidId(win, "setTitle:", nsString(opts.title.ptr));
+        msgVoidBool(win, "setAcceptsMouseMovedEvents:", true);
 
-        const view = msgId(win, "contentView");
+        // Our own content view: drawRect: presents the framebuffer (see the class builder).
+        const vcls = ensureViewClass();
+        const view_alloc = msgId(vcls, "alloc");
+        const initWithFrame: *const fn (id, SEL, CGRect) callconv(.c) id = @ptrCast(&objc_msgSend);
+        const view = initWithFrame(
+            view_alloc,
+            sel_registerName("initWithFrame:"),
+            CGRect{ .origin = .{ .x = 0, .y = 0 }, .size = frame.size },
+        ) orelse return error.WindowCreationFailed;
         self.view = view;
-        msgVoidBool(view, "setWantsLayer:", true);
-        self.layer = msgId(view, "layer");
+        registerView(view, self);
+        msgVoidId(win, "setContentView:", view);
+        msgVoidId(win, "makeFirstResponder:", view);
 
         msgVoidBool(app, "activateIgnoringOtherApps:", true);
         msgVoidId(win, "makeKeyAndOrderFront:", null);
@@ -172,6 +345,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     }
 
     pub fn deinit(self: *Window) void {
+        if (self.view) |v| unregisterView(v);
         if (self.win) |w| msgVoidId(w, "close", null);
         self.gpa.free(self.pixels);
         self.gpa.destroy(self);
@@ -188,44 +362,80 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         msgVoidId(w, "miniaturize:", null);
     }
 
-    /// Push an external RGBA frame into the layer (thread-safe against the run loop).
+    pub fn close(self: *Window) void {
+        self.closed = true;
+    }
+
+    /// Resize so the *content* area becomes w×h (the OS frame grows around it).
+    pub fn setContentSize(self: *Window, w: u32, h: u32) void {
+        const win = self.win orelse return;
+        msgVoidSize(win, "setContentSize:", .{ .width = @floatFromInt(w), .height = @floatFromInt(h) });
+    }
+
+    /// Push an external ARGB frame (RGBA byte order in memory) into the framebuffer.
+    /// Thread-safe: stages under the mutex; the run loop's next present shows it.
     pub fn presentRgba(self: *Window, w: u32, h: u32, rgba: []const u8) void {
         const need = @as(usize, w) * @as(usize, h) * 4;
         if (rgba.len < need or w != self.width or h != self.height) return;
         sync.lock(&self.mutex, self.io);
         defer sync.unlock(&self.mutex, self.io);
-        @memcpy(std.mem.sliceAsBytes(self.pixels)[0..need], rgba[0..need]);
-        self.present();
+        // RGBA bytes → 0xAARRGGBB pixels (paint.Canvas layout).
+        for (self.pixels, 0..) |*px, i| {
+            const b = rgba[i * 4 ..];
+            px.* = (@as(u32, b[3]) << 24) | (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | b[2];
+        }
     }
 
-    /// Build a CGImage over the current framebuffer and hand it to the view's layer. The
-    /// image is copied by CoreGraphics into the layer, so releasing it here is safe.
-    fn present(self: *Window) void {
-        const layer = self.layer orelse return;
+    /// Called from `drawRect:` — wrap the framebuffer in a CGImage and draw it over the
+    /// view bounds through the *current* graphics context. The context of a non-flipped
+    /// view is standard y-up CG space, where `CGContextDrawImage` renders the image
+    /// upright (row 0 at the visual top) with no extra transform.
+    fn drawIntoCurrentContext(self: *Window) void {
+        const nsctx = msgId(class("NSGraphicsContext"), "currentContext") orelse return;
+        const ctx = msgId(nsctx, "graphicsPort") orelse return;
+        sync.lock(&self.mutex, self.io);
+        defer sync.unlock(&self.mutex, self.io);
         const cs = CGColorSpaceCreateDeviceRGB();
         defer CGColorSpaceRelease(cs);
         const bytes = std.mem.sliceAsBytes(self.pixels);
         const provider = CGDataProviderCreateWithData(null, bytes.ptr, bytes.len, null);
         defer CGDataProviderRelease(provider);
-        const image = CGImageCreate(
-            self.width,
-            self.height,
-            8,
-            32,
-            self.width * 4,
-            cs,
-            bitmap_info,
-            provider,
-            null,
-            false,
-            0,
-        );
+        const image = CGImageCreate(self.width, self.height, 8, 32, self.width * 4, cs, bitmap_info, provider, null, false, 0);
         defer CGImageRelease(image);
-        msgVoidId(layer, "setContents:", image);
+        CGContextDrawImage(ctx, .{
+            .origin = .{ .x = 0, .y = 0 },
+            .size = .{ .width = @floatFromInt(self.width), .height = @floatFromInt(self.height) },
+        }, image);
+    }
+
+    /// Mark the view dirty and run its display cycle now. We drive our own loop (no
+    /// NSRunLoop), so nothing else would flush the dirty rect.
+    fn present(self: *Window) void {
+        const view = self.view orelse return;
+        msgVoidBool(view, "setNeedsDisplay:", true);
+        if (self.win) |w| msgVoid(w, "displayIfNeeded");
+    }
+
+    /// Track the content view size; on change, reallocate the framebuffer.
+    fn syncSize(self: *Window) void {
+        const view = self.view orelse return;
+        const b = msgRect(view, "bounds");
+        const w: u32 = @intFromFloat(@max(b.size.width, 1));
+        const h: u32 = @intFromFloat(@max(b.size.height, 1));
+        if (w == self.width and h == self.height) return;
+        sync.lock(&self.mutex, self.io);
+        defer sync.unlock(&self.mutex, self.io);
+        const np = self.gpa.alloc(u32, @as(usize, w) * h) catch return;
+        @memset(np, 0xFF000000);
+        self.gpa.free(self.pixels);
+        self.pixels = np;
+        self.width = w;
+        self.height = h;
     }
 
     pub fn run(self: *Window) !void {
         const app = self.app orelse return;
+        msgVoid(app, "finishLaunching");
         const distant_past = msgId(class("NSDate"), "distantPast");
         const default_mode = nsString("kCFRunLoopDefaultMode");
         const nextEvent: *const fn (id, SEL, u64, id, id, bool) callconv(.c) id = @ptrCast(&objc_msgSend);
@@ -237,49 +447,222 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
                 const ev = nextEvent(app, next_sel, event_mask_any, distant_past, default_mode, true);
                 if (ev == null) break;
                 self.dispatch(ev);
-                msgVoidId(app, "sendEvent:", ev);
+                const send: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+                send(app, sel_registerName("sendEvent:"), ev);
             }
             // The user closed the window (red button) → the window is no longer visible.
+            // A miniaturized window also reports !isVisible, so check it too — minimizing
+            // must not quit the app.
             if (self.win) |w| {
-                if (!msgBool(w, "isVisible")) self.closed = true;
+                if (!msgBool(w, "isVisible") and !msgBool(w, "isMiniaturized")) self.closed = true;
             }
             if (self.closed) break;
 
-            sync.lock(&self.mutex, self.io);
-            @memset(self.pixels, 0);
-            var canvas = paint.Canvas.init(self.pixels, self.width, self.height);
-            const content = window.Rect{ .x = 0, .y = 0, .w = @intCast(self.width), .h = @intCast(self.height) };
-            if (self.opts.on_draw) |draw| draw(&canvas, content, self.opts.user);
+            self.syncSize();
+
+            if (self.opts.on_tick) |tick| {
+                const interval_ns = @as(u64, @max(self.opts.tick_ms, 1)) * std.time.ns_per_ms;
+                const now = nowNs();
+                if (now -% self.last_tick_ns >= interval_ns) {
+                    self.last_tick_ns = now;
+                    tick(self, self.opts.user);
+                }
+            }
+
+            if (self.opts.on_draw) |draw| {
+                sync.lock(&self.mutex, self.io);
+                @memset(self.pixels, 0xFF000000);
+                var canvas = paint.Canvas.init(self.pixels, self.width, self.height);
+                const content = window.Rect{ .x = 0, .y = 0, .w = @intCast(self.width), .h = @intCast(self.height) };
+                draw(&canvas, content, self.opts.user);
+                sync.unlock(&self.mutex, self.io);
+            }
             self.present();
-            sync.unlock(&self.mutex, self.io);
 
             msgVoid(app, "updateWindows");
             sync.sleepNs(self.io, 16 * std.time.ns_per_ms); // ~60 FPS pacing
         }
     }
 
-    /// Forward key events to the app's `on_key` before AppKit consumes them. `key` is the
-    /// raw macOS virtual keycode; mapping it to characters is the caller's concern (same
-    /// contract as the other backends, which pass platform-native codes).
-    fn dispatch(self: *Window, ev: id) void {
-        const cb = self.opts.on_key orelse return;
-        const ns_type = msgTypeU64(ev, "type");
-        // NSEventTypeKeyDown = 10, NSEventTypeKeyUp = 11.
-        const state: u32 = switch (ns_type) {
-            10 => 1,
-            11 => 0,
-            else => return,
-        };
-        const key: u32 = msgKeyCode(ev, "keyCode");
-        cb(self, key, state, self.opts.user);
+    /// Monotonic nanoseconds via raw libc (std.time timestamps live behind std.Io in Zig
+    /// 0.16; tick pacing only needs a raw monotonic clock — same idiom as the Wayland
+    /// backend's `nowMs`).
+    const Timespec = extern struct { sec: i64, nsec: i64 };
+    const CLOCK_MONOTONIC_DARWIN: c_int = 6;
+    extern "c" fn clock_gettime(clockid: c_int, tp: *Timespec) c_int;
+
+    fn nowNs() u64 {
+        var ts: Timespec = undefined;
+        if (clock_gettime(CLOCK_MONOTONIC_DARWIN, &ts) != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
     }
 
-    fn msgTypeU64(obj: id, sel: [*:0]const u8) u64 {
-        const f: *const fn (id, SEL) callconv(.c) u64 = @ptrCast(&objc_msgSend);
-        return f(obj, sel_registerName(sel));
+    // --- input dispatch -----------------------------------------------------------------
+
+    /// Route one NSEvent to the app callbacks, translating to the cross-platform contract
+    /// (evdev key/button codes, content coordinates with y growing downward).
+    fn dispatch(self: *Window, ev: id) void {
+        const ns_type = msgU64(ev, "type");
+
+        // Modifier transitions first, from the flags EVERY event carries: real macOS
+        // reports modifier presses only as flagsChanged, zart never posts them at all —
+        // the flag delta is the one signal both worlds deliver.
+        self.syncMods(msgU64(ev, "modifierFlags"));
+
+        switch (ns_type) {
+            NSKeyDown, NSKeyUp => {
+                const cb = self.opts.on_key orelse return;
+                const code = keyCodeOf(ev);
+                if (code == 0) return;
+                cb(self, code, if (ns_type == NSKeyDown) 1 else 0, self.opts.user);
+            },
+            NSLeftMouseDown, NSRightMouseDown, NSOtherMouseDown => {
+                const p = self.mouseAt(ev);
+                self.emitMouse(.{ .kind = .press, .x = p.x, .y = p.y, .button = buttonOf(ns_type) });
+            },
+            NSLeftMouseUp, NSRightMouseUp, NSOtherMouseUp => {
+                const p = self.mouseAt(ev);
+                self.emitMouse(.{ .kind = .release, .x = p.x, .y = p.y, .button = buttonOf(ns_type) });
+            },
+            NSMouseMoved, NSLeftMouseDragged, NSRightMouseDragged, NSOtherMouseDragged => {
+                const p = self.mouseAt(ev);
+                self.emitMouse(.{ .kind = .motion, .x = p.x, .y = p.y });
+            },
+            NSScrollWheel => {
+                const p = self.mouseAt(ev);
+                // deltaY > 0 = wheel up = content up, the same sign as the Wayland path.
+                const dy: f32 = @floatCast(msgF64(ev, "deltaY"));
+                self.emitMouse(.{ .kind = .scroll, .x = p.x, .y = p.y, .scroll_dy = dy * 10.0 });
+            },
+            else => {},
+        }
     }
-    fn msgKeyCode(obj: id, sel: [*:0]const u8) u16 {
-        const f: *const fn (id, SEL) callconv(.c) u16 = @ptrCast(&objc_msgSend);
-        return f(obj, sel_registerName(sel));
+
+    fn emitMouse(self: *Window, event: window.MouseEvent) void {
+        const cb = self.opts.on_mouse orelse return;
+        cb(self, event, self.opts.user);
+    }
+
+    /// Event location → content coordinates (origin top-left, y down). The view is not
+    /// flipped, so view coordinates are y-up: flip against the current content height.
+    fn mouseAt(self: *Window, ev: id) struct { x: f32, y: f32 } {
+        const view = self.view orelse return .{ .x = 0, .y = 0 };
+        const loc = msgPoint(ev, "locationInWindow");
+        const p = msgConvertPoint(view, loc, null);
+        const h: f64 = @floatFromInt(self.height);
+        return .{ .x = @floatCast(p.x), .y = @floatCast(h - p.y) };
+    }
+
+    /// Synthesize evdev press/release transitions for Shift/Ctrl/Alt from the modifier
+    /// flags. Command counts as Ctrl: it is the primary macOS shortcut modifier, and zart
+    /// normalizes Linux Ctrl to Command in the other direction — mapping both onto
+    /// KEY_LEFTCTRL makes Cmd+Z and Ctrl+Z the same `on_key` sequence everywhere.
+    fn syncMods(self: *Window, flags: u64) void {
+        const cb = self.opts.on_key orelse return;
+        const shift = flags & ModShift != 0;
+        const ctrl = flags & (ModControl | ModCommand) != 0;
+        const alt = flags & ModOption != 0;
+        if (shift != self.mods_shift) {
+            self.mods_shift = shift;
+            cb(self, KEY_LEFTSHIFT, @intFromBool(shift), self.opts.user);
+        }
+        if (ctrl != self.mods_ctrl) {
+            self.mods_ctrl = ctrl;
+            cb(self, KEY_LEFTCTRL, @intFromBool(ctrl), self.opts.user);
+        }
+        if (alt != self.mods_alt) {
+            self.mods_alt = alt;
+            cb(self, KEY_LEFTALT, @intFromBool(alt), self.opts.user);
+        }
     }
 };
+
+fn buttonOf(ns_type: u64) u32 {
+    return switch (ns_type) {
+        NSLeftMouseDown, NSLeftMouseUp => BTN_LEFT,
+        NSRightMouseDown, NSRightMouseUp => BTN_RIGHT,
+        else => BTN_MIDDLE,
+    };
+}
+
+/// The evdev keycode of a key event, decoded from `charactersIgnoringModifiers` (see the
+/// module doc: `keyCode` is not portable between real AppKit and zart). Returns 0 for
+/// keys outside the map.
+fn keyCodeOf(ev: id) u32 {
+    const chars = msgId(ev, "charactersIgnoringModifiers") orelse return 0;
+    if (msgU64(chars, "length") == 0) return 0;
+    return charToEvdev(msgCharAt(chars, 0));
+}
+
+/// US-layout character → evdev keycode. `charactersIgnoringModifiers` applies Shift
+/// (Apple semantics: it ignores everything EXCEPT Shift), so shifted symbols map to their
+/// physical key — the synthesized Shift state (see `syncMods`) carries the case signal.
+fn charToEvdev(c: u16) u32 {
+    return switch (c) {
+        'a', 'A' => 30,
+        'b', 'B' => 48,
+        'c', 'C' => 46,
+        'd', 'D' => 32,
+        'e', 'E' => 18,
+        'f', 'F' => 33,
+        'g', 'G' => 34,
+        'h', 'H' => 35,
+        'i', 'I' => 23,
+        'j', 'J' => 36,
+        'k', 'K' => 37,
+        'l', 'L' => 38,
+        'm', 'M' => 50,
+        'n', 'N' => 49,
+        'o', 'O' => 24,
+        'p', 'P' => 25,
+        'q', 'Q' => 16,
+        'r', 'R' => 19,
+        's', 'S' => 31,
+        't', 'T' => 20,
+        'u', 'U' => 22,
+        'v', 'V' => 47,
+        'w', 'W' => 17,
+        'x', 'X' => 45,
+        'y', 'Y' => 21,
+        'z', 'Z' => 44,
+        '1', '!' => 2,
+        '2', '@' => 3,
+        '3', '#' => 4,
+        '4', '$' => 5,
+        '5', '%' => 6,
+        '6', '^' => 7,
+        '7', '&' => 8,
+        '8', '*' => 9,
+        '9', '(' => 10,
+        '0', ')' => 11,
+        '-', '_' => 12,
+        '=', '+' => 13,
+        '[', '{' => 26,
+        ']', '}' => 27,
+        '\\', '|' => 43,
+        ';', ':' => 39,
+        '\'', '"' => 40,
+        '`', '~' => 41,
+        ',', '<' => 51,
+        '.', '>' => 52,
+        '/', '?' => 53,
+        ' ' => 57,
+        '\r', '\n', 0x03 => 28, // Return / keypad Enter
+        '\t' => 15,
+        0x1B => 1, // Escape
+        0x7F, 0x08 => 14, // Delete (backspace)
+        0xF700 => 103, // NSUpArrowFunctionKey
+        0xF701 => 108, // NSDownArrowFunctionKey
+        0xF702 => 105, // NSLeftArrowFunctionKey
+        0xF703 => 106, // NSRightArrowFunctionKey
+        0xF728 => 111, // NSDeleteFunctionKey (forward delete)
+        0xF729 => 102, // NSHomeFunctionKey
+        0xF72B => 107, // NSEndFunctionKey
+        0xF72C => 104, // NSPageUpFunctionKey
+        0xF72D => 109, // NSPageDownFunctionKey
+        0xF704...0xF70D => 59 + (@as(u32, c) - 0xF704), // F1..F10
+        0xF70E => 87, // F11
+        0xF70F => 88, // F12
+        else => 0,
+    };
+}

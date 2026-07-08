@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ x86_64-macos, arm64-macos ]
+install-name: '/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics'
+exports:
+  - targets: [ x86_64-macos, arm64-macos ]
+    symbols: [ _CGColorSpaceCreateDeviceRGB, _CGColorSpaceRelease,
+               _CGDataProviderCreateWithData, _CGDataProviderRelease,
+               _CGImageCreate, _CGImageRelease, _CGContextDrawImage ]
+...
