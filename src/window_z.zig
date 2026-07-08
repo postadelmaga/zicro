@@ -68,8 +68,16 @@ pub const Window = struct {
         self.gpa.destroy(self);
     }
 
+    /// No implicit clear-to-black before `on_draw` (unlike a typical
+    /// immediate-mode backend): `self.pixels` carries over between calls, so
+    /// an app whose background is expensive to repaint (e.g. a
+    /// `paint.Canvas.drawChrome` glass panel — real per-pixel SDF math,
+    /// costly under this target's soft-float emulation) can paint it once
+    /// and only touch the region that actually changed on later frames.
+    /// Every current on_draw callback already fills its own full canvas
+    /// (see examples/shell_z.zig), so this is sound today; a future app
+    /// that assumes an implicit clear needs to clear itself.
     fn redraw(self: *Window) void {
-        @memset(self.pixels, 0xFF000000); // opaque black, premultiplied ARGB
         var canvas = paint.Canvas.init(self.pixels, self.width, self.height);
         const content = window.Rect{ .x = 0, .y = 0, .w = @intCast(self.width), .h = @intCast(self.height) };
         if (self.opts.on_draw) |draw| draw(&canvas, content, self.opts.user);

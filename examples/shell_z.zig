@@ -82,25 +82,110 @@ fn canvasFb(canvas: *paint.Canvas, w: i32, h: i32) struct { ptr: [*]u32, width: 
     return .{ .ptr = canvas.pixels.ptr, .width = @intCast(w), .height = @intCast(h), .stride = @intCast(w) };
 }
 
+// Glass panel + drop shadow + highlight ring: pure SDF/coverage math in
+// paint.zig (roundedRectSdf, chromePixel, drawChrome itself), none of it
+// reaches text.zig's stb_truetype @cImport, so — unlike Canvas.drawText —
+// it's safe to use on the freestanding target. shell.zig (upstream) never
+// calls drawChrome either (it draws a flat translucent rect instead), so
+// this is a deliberate addition on top of the port, not parity with it.
+const chrome_style = paint.Style{
+    .corner_radius = 16,
+    .margin = 18,
+    .shadow_blur = 16,
+    .shadow_offset_y = 5,
+    .shadow_alpha = 0.45,
+    .glass = paint.Color.rgba(18, 20, 26, 0.82),
+    .border_alpha = 0.20,
+};
+// Text origin inside the glass panel: past the margin (the shadow/gutter
+// band) plus a little breathing room so glyphs don't hug the highlight ring.
+const text_pad: i32 = @as(i32, @intCast(chrome_style.margin)) + 14;
+
+// window_z.zig's redraw() no longer clears the canvas for us (see its own
+// doc comment), so drawChrome runs exactly ONCE — every key press repaints
+// (window_z.zig's run() loop), and re-running drawChrome's per-pixel SDF
+// evaluation every keystroke measured ~1-2s under this target's soft-float
+// emulation (fine once, unusable at typing speed). Later frames just flatten
+// the text region back to the glass color — a plain-color fill, no SDF — so
+// old glyphs don't smear as the input line changes.
+var chrome_painted = false;
+
+/// Same premultiply as paint.zig's private `packPremul`, re-derived here
+/// since it isn't exported — kept in sync with `chrome_style.glass` by
+/// construction (always called with that same Color).
+fn premulPack(c: paint.Color) u32 {
+    const a: u32 = @intFromFloat(std.math.clamp(c.a, 0.0, 1.0) * 255.0 + 0.5);
+    const r: u32 = @intFromFloat(std.math.clamp(c.r * c.a, 0.0, 1.0) * 255.0 + 0.5);
+    const g: u32 = @intFromFloat(std.math.clamp(c.g * c.a, 0.0, 1.0) * 255.0 + 0.5);
+    const b: u32 = @intFromFloat(std.math.clamp(c.b * c.a, 0.0, 1.0) * 255.0 + 0.5);
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+// zicro_host.zig's own `desktop` fill color (0x101826) — window_z.zig's
+// blitSurface does a raw word copy with no alpha blending (no compositor
+// alpha channel support yet), so drawChrome's transparent gutter/shadow
+// pixels (correctly near-zero alpha) land on screen as their near-zero
+// premultiplied RGB, i.e. solid black, not "see-through to the desktop
+// behind". Faking that by flattening low-alpha pixels to the desktop's own
+// color is the practical fix until the compositor does real alpha blending.
+const desktop_bg: u32 = 0xFF10_1826;
+
+/// One-time post-pass over drawChrome's output: pixels below `alpha_cut`
+/// (drawChrome's transparent gutter, and the outer half of the AA'd panel
+/// edge) become opaque `desktop_bg` instead of premultiplied-near-black.
+/// Cheap (plain reads/compares, no SDF) — folded into the one-time chrome
+/// cost, not run per keystroke.
+fn fixupGutter(canvas: *paint.Canvas) void {
+    const alpha_cut: u32 = 128;
+    for (canvas.pixels) |*p| {
+        const a = (p.* >> 24) & 0xff;
+        if (a < alpha_cut) p.* = desktop_bg;
+    }
+}
+
+/// Flat rectangular re-clear of the panel interior (inset by the chrome
+/// margin) — deliberately NOT rounded-corner-accurate like drawChrome's own
+/// SDF mask; `text_pad` keeps real content well clear of the 4 small corner
+/// pixels where that would show, so the mismatch is invisible in practice.
+fn clearContentArea(canvas: *paint.Canvas, content: window.Rect) void {
+    const m: i32 = @intCast(chrome_style.margin);
+    const x0: usize = @intCast(std.math.clamp(m, 0, content.w));
+    const y0: usize = @intCast(std.math.clamp(m, 0, content.h));
+    const x1: usize = @intCast(std.math.clamp(content.w - m, 0, content.w));
+    const y1: usize = @intCast(std.math.clamp(content.h - m, 0, content.h));
+    const core = premulPack(chrome_style.glass);
+    const stride: usize = @intCast(content.w);
+    var y: usize = y0;
+    while (y < y1) : (y += 1) {
+        @memset(canvas.pixels[y * stride + x0 .. y * stride + x1], core);
+    }
+}
+
 fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const shell: *ShellState = @ptrCast(@alignCast(user.?));
 
-    @memset(canvas.pixels, 0xFF12141A); // opaque premultiplied dark background
+    if (!chrome_painted) {
+        canvas.drawChrome(chrome_style);
+        fixupGutter(canvas);
+        chrome_painted = true;
+    } else {
+        clearContentArea(canvas, content);
+    }
     const fb = canvasFb(canvas, content.w, content.h);
 
     const line_h: i32 = font.GH + 2;
-    var text_y: i32 = 20;
+    var text_y: i32 = text_pad;
     for (shell.lines.items) |line| {
-        font.drawText(fb, 20, @intCast(text_y), line, 0xFFD7DCE6);
+        font.drawText(fb, @intCast(text_pad), @intCast(text_y), line, 0xFFD7DCE6);
         text_y += line_h;
     }
 
     const prompt = "zicro-z> ";
-    font.drawText(fb, 20, @intCast(text_y), prompt, 0xFF78E6A0);
+    font.drawText(fb, @intCast(text_pad), @intCast(text_y), prompt, 0xFF78E6A0);
     const prompt_w: i32 = @intCast(prompt.len * font.GW);
-    font.drawText(fb, @intCast(20 + prompt_w), @intCast(text_y), shell.input_buf.items, 0xFFFFFFFF);
+    font.drawText(fb, @intCast(text_pad + prompt_w), @intCast(text_y), shell.input_buf.items, 0xFFFFFFFF);
 
-    const cursor_x = 20 + prompt_w + @as(i32, @intCast(shell.input_buf.items.len * font.GW));
+    const cursor_x = text_pad + prompt_w + @as(i32, @intCast(shell.input_buf.items.len * font.GW));
     var cy: i32 = text_y;
     while (cy < text_y + font.GH) : (cy += 1) {
         var cx: i32 = 0;

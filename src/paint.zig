@@ -103,6 +103,8 @@ pub fn segmentSdf(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) f32 {
 }
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) f32 {
+    // Degenerate edges would divide by zero (NaN); step instead — same guard as anim.smoothstep.
+    if (edge1 == edge0) return if (x < edge0) 0.0 else 1.0;
     const t = std.math.clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t);
 }
@@ -131,6 +133,16 @@ fn linearToSrgb(u: f32) f32 {
 fn smoothCoverage(a: f32) f32 {
     return std.math.pow(f32, std.math.clamp(a, 0.0, 1.0), 0.72);
 }
+
+/// [`smoothCoverage`] tabulated over every u8 coverage value: glyph blitting reads
+/// coverage as a byte, so the table is exact (no interpolation) and replaces a `pow`
+/// per pixel with a load.
+const smooth_coverage_lut: [256]f32 = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, i| v.* = smoothCoverage(@as(f32, @floatFromInt(i)) / 255.0);
+    break :blk t;
+};
 
 /// Pack already-premultiplied channels (each in [0,1]) into an ARGB8888 pixel.
 fn packPremul(r: f32, g: f32, b: f32, a: f32) u32 {
@@ -478,6 +490,25 @@ pub const Canvas = struct {
         const trivial = style.margin == 0 and style.corner_radius == 0 and style.content_radius == 0 and
             style.content_fade_width == 0 and style.border_anim_width == 0;
 
+        // Flat-interior fast path for the glass (non-trivial) styles, mirroring the
+        // `drawChrome` core: deep enough inside *both* rounded rects every mask is
+        // saturated — panel coverage 1, content coverage 1 (or 0 with a border band:
+        // the band factor hits zero in the center, so those pixels are skipped whole).
+        // Inside the guard band both per-pixel `roundedRectSdf` evals (two sqrts each)
+        // vanish; this runs full-frame at 60Hz for glass windows.
+        const guard = @max(
+            @max(style.corner_radius, style.content_radius),
+            @max(style.content_fade_width, style.border_anim_width),
+        ) + 1.0;
+        const flat_px0 = m + guard;
+        const flat_px1 = m + pw - guard;
+        const flat_py0 = m + guard;
+        const flat_py1 = m + ph - guard;
+        const flat_cx0 = dx_f + guard;
+        const flat_cx1 = dx_f + sw_f - guard;
+        const flat_cy0 = dy_f + guard;
+        const flat_cy1 = dy_f + sh_f - guard;
+
         var sy: u32 = 0;
         while (sy < src_h) : (sy += 1) {
             const y = dst_y + sy;
@@ -505,19 +536,27 @@ pub const Canvas = struct {
                 var mask: f32 = 1.0;
                 var content_cov: f32 = 1.0;
                 if (!trivial) {
-                    const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
-                    mask = coverage(d_panel);
-                    if (mask <= 0.0) continue;
+                    const flat = fx >= flat_px0 and fx <= flat_px1 and fy >= flat_py0 and fy <= flat_py1 and
+                        fx >= flat_cx0 and fx <= flat_cx1 and fy >= flat_cy0 and fy <= flat_cy1;
+                    if (flat) {
+                        // Deep interior: with a border band the content faded to zero here.
+                        if (style.border_anim_width > 0.0) continue;
+                        // Otherwise mask and content_cov stay saturated at 1 — no SDF.
+                    } else {
+                        const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
+                        mask = coverage(d_panel);
+                        if (mask <= 0.0) continue;
 
-                    const d_content = roundedRectSdf(fx, fy, dx_f, dy_f, sw_f, sh_f, style.content_radius);
-                    content_cov = coverage(d_content);
-                    if (content_cov <= 0.0) continue;
+                        const d_content = roundedRectSdf(fx, fy, dx_f, dy_f, sw_f, sh_f, style.content_radius);
+                        content_cov = coverage(d_content);
+                        if (content_cov <= 0.0) continue;
 
-                    if (style.content_fade_width > 0.0) {
-                        content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
-                    }
-                    if (style.border_anim_width > 0.0) {
-                        content_cov *= 1.0 - smoothstep(0.0, style.border_anim_width, -d_panel);
+                        if (style.content_fade_width > 0.0) {
+                            content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
+                        }
+                        if (style.border_anim_width > 0.0) {
+                            content_cov *= 1.0 - smoothstep(0.0, style.border_anim_width, -d_panel);
+                        }
                     }
                 }
 
@@ -534,6 +573,82 @@ pub const Canvas = struct {
                     sg * sa + dg * inv,
                     sb * sa + db * inv,
                     sa + da * inv,
+                );
+            }
+        }
+    }
+
+    /// Blit an RGBA8 (straight-alpha, bytes R,G,B,A) sprite into the dst rect, source-over,
+    /// nearest-neighbour scaled and honoring clip + canvas [`Format`]. For app icons/thumbnails.
+    pub fn blitImage(self: *Canvas, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32) void {
+        if (dst_w == 0 or dst_h == 0 or src_w == 0 or src_h == 0) return;
+        const bx0: u32 = @intCast(@max(0, dst_x));
+        const by0: u32 = @intCast(@max(0, dst_y));
+        const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, dst_x + @as(i32, @intCast(dst_w))))));
+        const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        const inv: f32 = 1.0 / 255.0;
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const rel_y: u32 = @intCast(@as(i32, @intCast(py)) - dst_y);
+            const sy = @min(src_h - 1, rel_y * src_h / dst_h);
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+                const sx = @min(src_w - 1, rel_x * src_w / dst_w);
+                const si = (@as(usize, sy) * src_w + sx) * 4;
+                const a = src[si + 3];
+                if (a == 0) continue;
+                row[px] = self.overColor(
+                    row[px],
+                    @as(f32, @floatFromInt(src[si])) * inv,
+                    @as(f32, @floatFromInt(src[si + 1])) * inv,
+                    @as(f32, @floatFromInt(src[si + 2])) * inv,
+                    @as(f32, @floatFromInt(a)) * inv,
+                );
+            }
+        }
+    }
+
+    /// Like [`blitImage`] but rotated by `angle` radians about the dst-rect centre. Inverse-
+    /// rotates each output pixel back into the sprite; nearest-neighbour, alpha-over, clipped.
+    pub fn blitImageRot(self: *Canvas, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32) void {
+        if (dw <= 0 or dh <= 0 or src_w == 0 or src_h == 0) return;
+        const cx = dx + dw * 0.5;
+        const cy = dy + dh * 0.5;
+        const hd = 0.5 * @sqrt(dw * dw + dh * dh); // half-diagonal → bounding box
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(cx - hd)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(cy - hd)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(cx + hd)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(cy + hd)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        const ca = @cos(-angle);
+        const sa = @sin(-angle);
+        const inv: f32 = 1.0 / 255.0;
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const ry = @as(f32, @floatFromInt(py)) + 0.5 - cy;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const rx = @as(f32, @floatFromInt(px)) + 0.5 - cx;
+                const lx = rx * ca - ry * sa; // inverse-rotate into local dst space
+                const ly = rx * sa + ry * ca;
+                const u = (lx + dw * 0.5) / dw;
+                const v = (ly + dh * 0.5) / dh;
+                if (u < 0 or u >= 1 or v < 0 or v >= 1) continue;
+                const sx: u32 = @min(src_w - 1, @as(u32, @intFromFloat(u * @as(f32, @floatFromInt(src_w)))));
+                const sy: u32 = @min(src_h - 1, @as(u32, @intFromFloat(v * @as(f32, @floatFromInt(src_h)))));
+                const si = (@as(usize, sy) * src_w + sx) * 4;
+                const a = src[si + 3];
+                if (a == 0) continue;
+                row[px] = self.overColor(
+                    row[px],
+                    @as(f32, @floatFromInt(src[si])) * inv,
+                    @as(f32, @floatFromInt(src[si + 1])) * inv,
+                    @as(f32, @floatFromInt(src[si + 2])) * inv,
+                    @as(f32, @floatFromInt(a)) * inv,
                 );
             }
         }
@@ -618,6 +733,14 @@ pub const Canvas = struct {
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                // Ring-band early-out: every segment lies on the circle, so a pixel
+                // farther than the stroke half-width (+AA) from the ring can never get
+                // ink — skip the whole segment loop (one sqrt instead of up to 32).
+                // The bounding box is mostly interior/exterior; the spinner runs at 60Hz.
+                const dcx = fx - cx;
+                const dcy = fy - cy;
+                const dc = @sqrt(dcx * dcx + dcy * dcy);
+                if (@abs(dc - radius) - r > 0.5) continue;
                 var d: f32 = std.math.floatMax(f32);
                 var s: usize = 0;
                 while (s < segs) : (s += 1) {
@@ -674,7 +797,7 @@ pub const Canvas = struct {
 
     /// Stroke the line segment `a`→`b` as a rounded (capsule) stroke of the given
     /// `width`, anti-aliased and source-over composited. The building block for the
-    /// procedural window-control glyphs (✕, –).
+    /// procedural window-control glyphs (✕, –). Honors the canvas [`Format`].
     pub fn strokeSegment(self: *Canvas, ax: f32, ay: f32, bx: f32, by: f32, width: f32, color: Color) void {
         const r = width / 2.0;
         const minx = @min(ax, bx) - r - 1.0;
@@ -695,21 +818,14 @@ pub const Canvas = struct {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
                 const cov = coverage(segmentSdf(fx, fy, ax, ay, bx, by) - r);
                 if (cov <= 0.0) continue;
-                const sa = color.a * cov;
-                const dr, const dg, const db, const da = unpackPremul(row[px]);
-                const inv = 1.0 - sa;
-                row[px] = packPremul(
-                    color.r * sa + dr * inv,
-                    color.g * sa + dg * inv,
-                    color.b * sa + db * inv,
-                    sa + da * inv,
-                );
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * cov);
             }
         }
     }
 
     /// Stroke the outline of a rounded rect: coverage of `|sdf| - stroke/2`, so the fill
     /// stays hollow. The maximize ▢ and the restore double-square are drawn with this.
+    /// Honors the canvas [`Format`].
     pub fn strokeRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: Color) void {
         const hs = stroke / 2.0;
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - hs - 1)));
@@ -726,15 +842,7 @@ pub const Canvas = struct {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
                 const cov = coverage(@abs(roundedRectSdf(fx, fy, x, y, w, h, radius)) - hs);
                 if (cov <= 0.0) continue;
-                const sa = color.a * cov;
-                const dr, const dg, const db, const da = unpackPremul(row[px]);
-                const inv = 1.0 - sa;
-                row[px] = packPremul(
-                    color.r * sa + dr * inv,
-                    color.g * sa + dg * inv,
-                    color.b * sa + db * inv,
-                    sa + da * inv,
-                );
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * cov);
             }
         }
     }
@@ -764,6 +872,10 @@ pub const Canvas = struct {
         const gy0 = baseline_y + g.yoff;
         const W: i32 = @intCast(self.width);
         const H: i32 = @intCast(self.height);
+        // The text color is constant across the glyph: linearize it once, not per pixel.
+        const lin_r = srgbToLinear(color.r);
+        const lin_g = srgbToLinear(color.g);
+        const lin_b = srgbToLinear(color.b);
         var gy: i32 = 0;
         while (gy < g.h) : (gy += 1) {
             const py = gy0 + gy;
@@ -775,8 +887,8 @@ pub const Canvas = struct {
                 if (!self.inClip(@intCast(px), @intCast(py))) continue;
                 const cov = g.bitmap[@intCast(gy * g.w + gx)];
                 if (cov == 0) continue;
-                // macOS-style stem darkening + coverage → alpha.
-                const a0 = smoothCoverage(@as(f32, @floatFromInt(cov)) / 255.0);
+                // macOS-style stem darkening + coverage → alpha (LUT: coverage is a byte).
+                const a0 = smooth_coverage_lut[cov];
                 const sa = color.a * a0;
                 if (sa <= 0.0) continue;
                 const idx = @as(usize, @intCast(py)) * self.width + @as(usize, @intCast(px));
@@ -786,9 +898,9 @@ pub const Canvas = struct {
                 // channels are ~straight over the chrome's opaque panel), then back to
                 // sRGB. The alpha stays linear (geometric coverage).
                 self.pixels[idx] = packPremul(
-                    linearToSrgb(srgbToLinear(color.r) * sa + srgbToLinear(dr) * inv),
-                    linearToSrgb(srgbToLinear(color.g) * sa + srgbToLinear(dg) * inv),
-                    linearToSrgb(srgbToLinear(color.b) * sa + srgbToLinear(db) * inv),
+                    linearToSrgb(lin_r * sa + srgbToLinear(dr) * inv),
+                    linearToSrgb(lin_g * sa + srgbToLinear(dg) * inv),
+                    linearToSrgb(lin_b * sa + srgbToLinear(db) * inv),
                     sa + da * inv,
                 );
             }
