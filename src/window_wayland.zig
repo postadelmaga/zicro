@@ -17,6 +17,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     display: *wl.Display,
     registry: *wl.Registry,
     compositor: ?*wl.Compositor = null,
+    subcompositor: ?*wl.Subcompositor = null,
     shm: ?*wl.Shm = null,
     wm_base: ?*wl.XdgWmBase = null,
     seat: ?*wl.Seat = null,
@@ -24,6 +25,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     surface: ?*wl.Surface = null,
     xdg_surface: ?*wl.XdgSurface = null,
     toplevel: ?*wl.XdgToplevel = null,
+    subsurface: ?*wl.Subsurface = null, // anchored children (initSub) only
     keyboard: ?*wl.Keyboard = null,
     pointer: ?*wl.Pointer = null,
     decoration_manager: ?*wl.ZxdgDecorationManager = null,
@@ -194,6 +196,61 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         return self;
     }
 
+    /// Create an ANCHORED child: a wl_subsurface of the parent, composited
+    /// with it at an exact offset (parent surface coordinates, y-down from
+    /// its top-left) — the panel moves with its window, macOS-style. The
+    /// child may extend beyond the parent's bounds. No xdg role: the
+    /// compositor never resizes or closes it; input routes per-surface as
+    /// for any child. Same loop-thread contract as initChild. Falls back to
+    /// initChild (a parented toplevel) when wl_subcompositor is missing.
+    pub fn initSub(parent: *Window, opts: window.Options, x: i32, y: i32) !*Window {
+        const subcompositor = parent.subcompositor orelse return initChild(parent, opts);
+        const self = try parent.gpa.create(Window);
+        errdefer parent.gpa.destroy(self);
+        self.* = .{
+            .gpa = parent.gpa,
+            .io = parent.io,
+            .opts = opts,
+            .display = parent.display,
+            .registry = parent.registry,
+            .compositor = parent.compositor,
+            .subcompositor = subcompositor,
+            .shm = parent.shm,
+            .wm_base = parent.wm_base,
+            .seat = parent.seat,
+            .decoration_manager = parent.decoration_manager,
+            .width = opts.width,
+            .height = opts.height,
+            .wake_fd = parent.wake_fd,
+            .parent = parent,
+            // No configure event will ever arrive for a subsurface: it is
+            // drawable as soon as it exists.
+            .configured = true,
+            .needs_redraw = true,
+        };
+
+        const surface = self.compositor.?.createSurface();
+        self.surface = surface;
+        const sub = subcompositor.getSubsurface(surface, parent.surface.?);
+        sub.setPosition(x, y);
+        sub.setDesync(); // panels repaint on their own cadence
+        self.subsurface = sub;
+
+        try parent.children.append(parent.gpa, self);
+        // set_position latches on the PARENT's next commit.
+        parent.needs_redraw = true;
+        _ = wl.wl_display_flush(self.display);
+        return self;
+    }
+
+    /// Move an anchored child (parent-relative, y-down). Loop thread only.
+    pub fn setSubPosition(self: *Window, x: i32, y: i32) void {
+        const sub = self.subsurface orelse return;
+        sub.setPosition(x, y);
+        if (self.parent) |parent| parent.needs_redraw = true;
+        _ = wl.wl_display_flush(self.display);
+    }
+
     /// Tear down a child window: destroy its proxies and remove it from the
     /// parent. Runs on the loop thread (run() reaps closed children with it).
     fn deinitChild(self: *Window) void {
@@ -214,9 +271,12 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.staged.pixels.deinit(self.gpa);
         self.front.pixels.deinit(self.gpa);
         if (self.decoration) |d| wl.wl_proxy_destroy(@ptrCast(d));
+        if (self.subsurface) |ss| wl.wl_proxy_destroy(@ptrCast(ss));
         if (self.toplevel) |t| wl.wl_proxy_destroy(@ptrCast(t));
         if (self.xdg_surface) |x| wl.wl_proxy_destroy(@ptrCast(x));
         if (self.surface) |s| s.destroy();
+        // An unmapped subsurface leaves a hole until the parent recomposites.
+        parent.needs_redraw = true;
         _ = wl.wl_display_flush(self.display);
         self.children.deinit(self.gpa);
         const gpa = self.gpa;
@@ -485,7 +545,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.buf_w = bw;
         self.buf_h = bh;
 
-        self.xdg_surface.?.setWindowGeometry(0, 0, @intCast(bw), @intCast(bh));
+        // Subsurfaces have no xdg role: geometry is implicit in the buffer.
+        if (self.xdg_surface) |xs| xs.setWindowGeometry(0, 0, @intCast(bw), @intCast(bh));
         const input = self.compositor.?.createRegion();
         defer input.destroy();
         input.add(0, 0, @intCast(bw), @intCast(bh));
@@ -508,6 +569,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const iface = std.mem.span(interface);
         if (std.mem.eql(u8, iface, "wl_compositor")) {
             self.compositor = @ptrCast(registry.bind(name, &wl.wl_compositor_interface, @min(ver, 4)).?);
+        } else if (std.mem.eql(u8, iface, "wl_subcompositor")) {
+            self.subcompositor = @ptrCast(registry.bind(name, &wl.wl_subcompositor_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "wl_shm")) {
             self.shm = @ptrCast(registry.bind(name, &wl.wl_shm_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "xdg_wm_base")) {
