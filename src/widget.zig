@@ -199,6 +199,8 @@ pub const Theme = struct {
 /// One ordered text operation (see `Store.text_ops`).
 pub const TextOp = union(enum) { char: u8, key: Key };
 
+pub const Nav = enum { none, next, prev };
+
 /// Everything that must survive between frames. One per UI surface (window/panel).
 pub const Store = struct {
     gpa: std.mem.Allocator,
@@ -229,7 +231,20 @@ pub const Store = struct {
     active: Id = 0,
     focus: Id = 0,
     text_cursor: usize = 0,
+    /// Selection anchor of the focused text field: selection = anchor..cursor
+    /// (either order); null = no selection.
+    text_anchor: ?usize = null,
     modal: Id = 0,
+
+    // Tab traversal: request parsed in begin(), satisfied by the focusables laid
+    // out during the frame (wrap in end()).
+    nav: Nav = .none,
+    /// Set when Tab moved the focus here — the field selects-all on arrival.
+    focus_via_nav: Id = 0,
+
+    /// App-wide clipboard for ctrl+C/X/V between text fields. (OS clipboard
+    /// integration is the window layer's job — a later slice.)
+    clipboard: std.ArrayList(u8) = .empty,
 
     // dropdown overlay (geometry persists so next-frame clicks are claimed in begin())
     dd_open: Id = 0,
@@ -260,6 +275,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(s: *Store) void {
+        s.clipboard.deinit(s.gpa);
         s.dd_rects.deinit(s.gpa);
         s.anims.deinit(s.gpa);
         s.scrolls.deinit(s.gpa);
@@ -320,6 +336,13 @@ pub const Ui = struct {
     last_rect: Rect = .{},
     dd_draw: ?DdDraw = null,
     tt_draw: ?[]const u8 = null,
+
+    // Tab-traversal bookkeeping (frame-scoped, driven by navFocusHook).
+    focus_first: Id = 0,
+    focus_last: Id = 0,
+    focus_prev: Id = 0,
+    focus_take_next: bool = false,
+    focus_seen: bool = false,
 
     const DdDraw = struct { rect: Rect, options: []const []const u8, selected: usize, content_h: f32 };
 
@@ -439,6 +462,7 @@ pub const Ui = struct {
                         }
                     },
                     .enter => store.dd_pending = store.dd_hover,
+                    .tab => {}, // swallowed: no focus traversal under an open list
                     else => consumed = false,
                 }
                 if (consumed) {
@@ -474,6 +498,20 @@ pub const Ui = struct {
             }
         }
 
+        // Tab / Shift+Tab: focus traversal. Consumed here; satisfied by the
+        // focusables laid out this frame (navFocusHook), wrap resolved in end().
+        store.nav = .none;
+        if (store.dd_open == 0) {
+            var ki: usize = 0;
+            while (ki < store.keys_len) {
+                if (store.keys[ki] == .tab) {
+                    store.nav = if (store.shift_down) .prev else .next;
+                    std.mem.copyForwards(Key, store.keys[ki .. store.keys_len - 1], store.keys[ki + 1 .. store.keys_len]);
+                    store.keys_len -= 1;
+                } else ki += 1;
+            }
+        }
+
         var ui = Ui{
             .store = store,
             .canvas = canvas,
@@ -502,6 +540,26 @@ pub const Ui = struct {
         // Dropdown overlay pixels — after everything, so it sits on top.
         if (ui.dd_draw) |dd| ui.drawDropdownOverlay(dd);
         if (ui.tt_draw) |s| ui.drawTooltip(s);
+
+        // Unsatisfied Tab traversal: wrap around the ends, or focus the first
+        // focusable when nothing (or something no longer laid out) had focus.
+        if (ui.store.nav != .none) {
+            const s = ui.store;
+            if (ui.focus_first != 0) {
+                const wrap = switch (s.nav) {
+                    .next => ui.focus_first,
+                    .prev => ui.focus_last,
+                    .none => unreachable,
+                };
+                if (s.focus == 0 or !ui.focus_seen or ui.focus_take_next or
+                    (s.nav == .prev and s.focus == ui.focus_first))
+                {
+                    s.focus = wrap;
+                    s.focus_via_nav = wrap;
+                }
+            }
+            s.nav = .none;
+        }
 
         // A press nothing claimed grounds the interaction (so a later release over a
         // widget is not a click).
@@ -627,6 +685,34 @@ pub const Ui = struct {
 
     fn inputEnabled(ui: *Ui) bool {
         return ui.store.modal == 0 or ui.in_modal;
+    }
+
+    /// Every keyboard-focusable widget calls this once per frame, in layout order:
+    /// it satisfies a pending Tab request by handing the focus to the widget after
+    /// (or before) the currently focused one.
+    fn navFocusHook(ui: *Ui, id: Id) void {
+        const s = ui.store;
+        if (s.nav == .none or !ui.inputEnabled()) return;
+        if (ui.focus_first == 0) ui.focus_first = id;
+        if (ui.focus_take_next) {
+            ui.focus_take_next = false;
+            s.focus = id;
+            s.focus_via_nav = id;
+            s.nav = .none;
+        } else if (s.focus != 0 and id == s.focus) {
+            ui.focus_seen = true;
+            switch (s.nav) {
+                .next => ui.focus_take_next = true,
+                .prev => if (ui.focus_prev != 0) {
+                    s.focus = ui.focus_prev;
+                    s.focus_via_nav = ui.focus_prev;
+                    s.nav = .none;
+                }, // focused is the first: wrap to the last, resolved in end()
+                .none => unreachable,
+            }
+        }
+        ui.focus_prev = id;
+        ui.focus_last = id;
     }
 
     pub fn interact(ui: *Ui, id: Id, rect: Rect) Sig {
@@ -962,60 +1048,146 @@ pub const Ui = struct {
     pub const TextEdit = enum { idle, changed, submitted };
 
     /// Single-line editable text. `buf` is app-owned; edits allocate through the
-    /// store's gpa. Click to focus, Esc/Enter to unfocus (Enter reports `.submitted`).
+    /// store's gpa. Click to focus (drag selects), Tab reaches it (select-all),
+    /// shift+arrows/home/end select, ctrl+arrows jump words, ctrl+A/C/X/V use the
+    /// store clipboard. Esc/Enter unfocus (Enter reports `.submitted`).
     pub fn textField(ui: *Ui, id_str: []const u8, buf: *std.ArrayList(u8)) TextEdit {
         const t = ui.theme;
         const s = ui.store;
         const id = ui.makeId(id_str);
         const r = ui.allocRect(ui.availW(), t.ctl_h);
+        ui.navFocusHook(id);
         const sig = ui.interact(id, r);
         const focused = s.focus == id;
 
         if (sig.pressed) {
             if (!focused) {
                 s.focus = id;
-                s.text_cursor = buf.items.len;
+                s.text_anchor = null;
             }
-            // Place the caret at the clicked character (nearest boundary).
-            s.text_cursor = ui.caretFromX(buf.items, s.mouse_x - (r.x + t.pad_x));
+            const p = ui.caretFromX(buf.items, s.mouse_x - (r.x + t.pad_x));
+            if (s.shift_down and focused) {
+                if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+            } else {
+                s.text_anchor = null;
+            }
+            s.text_cursor = p;
         } else if (s.left_pressed and !sig.hovered and focused) {
             s.focus = 0; // click-away unfocuses
+            s.text_anchor = null;
+        } else if (s.active == id and s.left_down and s.focus == id) {
+            // Drag: extend the selection from the press point.
+            const p = ui.caretFromX(buf.items, s.mouse_x - (r.x + t.pad_x));
+            if (p != s.text_cursor) {
+                if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                s.text_cursor = p;
+            }
+        }
+
+        // Tab just landed here: select everything, caret at the end.
+        if (s.focus == id and s.focus_via_nav == id) {
+            s.focus_via_nav = 0;
+            s.text_anchor = 0;
+            s.text_cursor = buf.items.len;
         }
 
         var result: TextEdit = .idle;
         if (s.focus == id) {
             if (s.text_cursor > buf.items.len) s.text_cursor = buf.items.len;
+            if (s.text_anchor) |a| {
+                if (a > buf.items.len) s.text_anchor = buf.items.len;
+            }
             // Ordered stream: chars and editing keys interleave exactly as they arrived.
             for (s.text_ops[0..s.text_ops_len]) |op| switch (op) {
-                .char => |c| {
+                .char => |c| if (s.ctrl_down) switch (c) {
+                    'a' => {
+                        s.text_anchor = 0;
+                        s.text_cursor = buf.items.len;
+                    },
+                    'c' => _ = ui.copySelection(buf.items),
+                    'x' => if (ui.copySelection(buf.items)) {
+                        _ = ui.deleteSelection(buf);
+                        result = .changed;
+                    },
+                    'v' => if (s.clipboard.items.len > 0 or selRange(s) != null) {
+                        _ = ui.deleteSelection(buf);
+                        buf.insertSlice(s.gpa, s.text_cursor, s.clipboard.items) catch break;
+                        s.text_cursor += s.clipboard.items.len;
+                        result = .changed;
+                    },
+                    else => {},
+                } else {
+                    _ = ui.deleteSelection(buf);
                     buf.insert(s.gpa, s.text_cursor, c) catch break;
                     s.text_cursor += 1;
                     result = .changed;
                 },
                 .key => |k| switch (k) {
-                    .backspace => if (s.text_cursor > 0) {
+                    .backspace => if (ui.deleteSelection(buf)) {
+                        result = .changed;
+                    } else if (s.text_cursor > 0) {
                         const prev = prevBoundary(buf.items, s.text_cursor);
                         buf.replaceRange(s.gpa, prev, s.text_cursor - prev, &.{}) catch {};
                         s.text_cursor = prev;
                         result = .changed;
                     },
-                    .delete => if (s.text_cursor < buf.items.len) {
+                    .delete => if (ui.deleteSelection(buf)) {
+                        result = .changed;
+                    } else if (s.text_cursor < buf.items.len) {
                         const next = nextBoundary(buf.items, s.text_cursor);
                         buf.replaceRange(s.gpa, s.text_cursor, next - s.text_cursor, &.{}) catch {};
                         result = .changed;
                     },
-                    .left => s.text_cursor = prevBoundary(buf.items, s.text_cursor),
-                    .right => s.text_cursor = nextBoundary(buf.items, s.text_cursor),
-                    .home => s.text_cursor = 0,
-                    .end => s.text_cursor = buf.items.len,
+                    .left => {
+                        if (s.shift_down) {
+                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                            s.text_cursor = if (s.ctrl_down) prevWord(buf.items, s.text_cursor) else prevBoundary(buf.items, s.text_cursor);
+                        } else if (selRange(s)) |sel| {
+                            s.text_cursor = sel[0]; // collapse to the left edge
+                            s.text_anchor = null;
+                        } else {
+                            s.text_cursor = if (s.ctrl_down) prevWord(buf.items, s.text_cursor) else prevBoundary(buf.items, s.text_cursor);
+                        }
+                    },
+                    .right => {
+                        if (s.shift_down) {
+                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                            s.text_cursor = if (s.ctrl_down) nextWord(buf.items, s.text_cursor) else nextBoundary(buf.items, s.text_cursor);
+                        } else if (selRange(s)) |sel| {
+                            s.text_cursor = sel[1]; // collapse to the right edge
+                            s.text_anchor = null;
+                        } else {
+                            s.text_cursor = if (s.ctrl_down) nextWord(buf.items, s.text_cursor) else nextBoundary(buf.items, s.text_cursor);
+                        }
+                    },
+                    .home => {
+                        if (s.shift_down) {
+                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                        } else s.text_anchor = null;
+                        s.text_cursor = 0;
+                    },
+                    .end => {
+                        if (s.shift_down) {
+                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                        } else s.text_anchor = null;
+                        s.text_cursor = buf.items.len;
+                    },
                     .enter => {
                         s.focus = 0;
+                        s.text_anchor = null;
                         result = .submitted;
                     },
-                    .escape => s.focus = 0,
+                    .escape => {
+                        s.focus = 0;
+                        s.text_anchor = null;
+                    },
                     else => {},
                 },
             };
+            // An empty selection is no selection.
+            if (s.text_anchor) |a| {
+                if (a == s.text_cursor) s.text_anchor = null;
+            }
         }
 
         // draw
@@ -1034,6 +1206,18 @@ pub const Ui = struct {
         var inner = r;
         inner.x += t.pad_x;
         inner.w -= 2 * t.pad_x;
+
+        // Selection highlight under the glyphs.
+        if (s.focus == id) if (selRange(s)) |sel| {
+            const x0 = inner.x + ui.measureText(buf.items[0..sel[0]], t.font_size, .regular);
+            const x1 = inner.x + ui.measureText(buf.items[0..sel[1]], t.font_size, .regular);
+            const v = ui.font.vmetrics(t.font_size, .regular);
+            const sel_h: f32 = @floatFromInt(v.ascent - v.descent);
+            var sc = t.accent;
+            sc.a *= 0.35;
+            ui.canvas.fillRoundedRect(x0, r.y + (r.h - sel_h) / 2, x1 - x0, sel_h, 2, sc);
+        };
+
         ui.drawTextIn(inner, buf.items, .left, t.font_size, .regular, t.text);
 
         if (s.focus == id and @rem(@divTrunc(ui.now_ms, 530), 2) == 0) {
@@ -1058,6 +1242,46 @@ pub const Ui = struct {
             i = next;
         }
         return s.len;
+    }
+
+    /// Selection of the focused field as an ordered `[lo, hi]`, or null when empty.
+    fn selRange(s: *const Store) ?[2]usize {
+        const a = s.text_anchor orelse return null;
+        if (a == s.text_cursor) return null;
+        return .{ @min(a, s.text_cursor), @max(a, s.text_cursor) };
+    }
+
+    /// Delete the selection from `buf` (cursor lands at its start). False if none.
+    fn deleteSelection(ui: *Ui, buf: *std.ArrayList(u8)) bool {
+        const sel = selRange(ui.store) orelse return false;
+        buf.replaceRange(ui.store.gpa, sel[0], sel[1] - sel[0], &.{}) catch return false;
+        ui.store.text_cursor = sel[0];
+        ui.store.text_anchor = null;
+        return true;
+    }
+
+    /// Copy the selection into the store clipboard. False if none.
+    fn copySelection(ui: *Ui, chars: []const u8) bool {
+        const sel = selRange(ui.store) orelse return false;
+        ui.store.clipboard.clearRetainingCapacity();
+        ui.store.clipboard.appendSlice(ui.store.gpa, chars[sel[0]..sel[1]]) catch return false;
+        return true;
+    }
+
+    /// Start of the word before `i` (skip spaces, then the word).
+    fn prevWord(s: []const u8, i: usize) usize {
+        var j = i;
+        while (j > 0 and s[j - 1] == ' ') j -= 1;
+        while (j > 0 and s[j - 1] != ' ') j -= 1;
+        return j;
+    }
+
+    /// Start of the word after `i` (skip the word, then spaces).
+    fn nextWord(s: []const u8, i: usize) usize {
+        var j = i;
+        while (j < s.len and s[j] != ' ') j += 1;
+        while (j < s.len and s[j] == ' ') j += 1;
+        return j;
     }
 
     fn prevBoundary(s: []const u8, i: usize) usize {
@@ -1881,6 +2105,113 @@ test "radio: click picks exactly one option" {
     _ = ui.end();
     try testing.expect(changed);
     try testing.expectEqual(@as(usize, 1), sel);
+}
+
+test "textField: shift-selection, clipboard copy/paste, replace-typing" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "hello world");
+
+    // Focus with a click, then End → caret after "world".
+    var ui = h.frame(10, &.{ .{ .motion = .{ .x = 100, .y = 25 } }, .{ .button = .{ .button = BTN_LEFT, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    ui = h.frame(20, &.{ .{ .button = .{ .button = BTN_LEFT, .pressed = false } }, .{ .key = .{ .code = 107, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expect(h.store.focus != 0);
+    try testing.expectEqual(@as(usize, 11), h.store.text_cursor);
+
+    // Shift+Left ×5 selects "world"; ctrl+C copies it.
+    ui = h.frame(30, &.{ .{ .key = .{ .code = 42, .pressed = true } }, .{ .key = .{ .code = 105, .pressed = true } }, .{ .key = .{ .code = 105, .pressed = true } }, .{ .key = .{ .code = 105, .pressed = true } }, .{ .key = .{ .code = 105, .pressed = true } }, .{ .key = .{ .code = 105, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expectEqual(@as(?usize, 11), h.store.text_anchor);
+    try testing.expectEqual(@as(usize, 6), h.store.text_cursor);
+    ui = h.frame(40, &.{ .{ .key = .{ .code = 42, .pressed = false } }, .{ .key = .{ .code = 29, .pressed = true } }, .{ .key = .{ .code = 46, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expectEqualStrings("world", h.store.clipboard.items);
+    try testing.expectEqualStrings("hello world", buf.items); // copy does not edit
+
+    // Home, then ctrl+V pastes at the start.
+    ui = h.frame(50, &.{ .{ .key = .{ .code = 29, .pressed = false } }, .{ .key = .{ .code = 102, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    ui = h.frame(60, &.{ .{ .key = .{ .code = 29, .pressed = true } }, .{ .key = .{ .code = 47, .pressed = true } } });
+    const pasted = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expectEqual(Ui.TextEdit.changed, pasted);
+    try testing.expectEqualStrings("worldhello world", buf.items);
+    try testing.expectEqual(@as(usize, 5), h.store.text_cursor);
+
+    // Ctrl+A then a plain char replaces everything.
+    ui = h.frame(70, &.{.{ .key = .{ .code = 30, .pressed = true } }});
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    ui = h.frame(80, &.{ .{ .key = .{ .code = 29, .pressed = false } }, .{ .key = .{ .code = 16, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expectEqualStrings("q", buf.items);
+}
+
+test "textField: Tab traversal tra i campi, con wrap e Shift+Tab" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+    var b1: std.ArrayList(u8) = .empty;
+    var b2: std.ArrayList(u8) = .empty;
+    defer b1.deinit(gpa);
+    defer b2.deinit(gpa);
+    try b1.appendSlice(gpa, "uno");
+
+    const ids = blk: {
+        var ui2 = h.frame(5, &.{});
+        defer _ = ui2.end();
+        break :blk [2]Id{ ui2.makeId("f1"), ui2.makeId("f2") };
+    };
+    const build = struct {
+        fn run(ui: *Ui, a: *std.ArrayList(u8), b: *std.ArrayList(u8)) void {
+            _ = ui.textField("f1", a);
+            _ = ui.textField("f2", b);
+        }
+    }.run;
+
+    // Tab with nothing focused → the first field, with select-all on arrival.
+    var ui = h.frame(10, &.{.{ .key = .{ .code = 15, .pressed = true } }});
+    build(&ui, &b1, &b2);
+    _ = ui.end();
+    try testing.expectEqual(ids[0], h.store.focus);
+    ui = h.frame(20, &.{});
+    build(&ui, &b1, &b2);
+    _ = ui.end();
+    try testing.expectEqual(@as(?usize, 0), h.store.text_anchor);
+    try testing.expectEqual(@as(usize, 3), h.store.text_cursor);
+
+    // Tab → second field; Tab again → wraps back to the first.
+    ui = h.frame(30, &.{.{ .key = .{ .code = 15, .pressed = true } }});
+    build(&ui, &b1, &b2);
+    _ = ui.end();
+    try testing.expectEqual(ids[1], h.store.focus);
+    ui = h.frame(40, &.{.{ .key = .{ .code = 15, .pressed = true } }});
+    build(&ui, &b1, &b2);
+    _ = ui.end();
+    try testing.expectEqual(ids[0], h.store.focus);
+
+    // Shift+Tab from the first wraps backwards to the last.
+    ui = h.frame(50, &.{ .{ .key = .{ .code = 42, .pressed = true } }, .{ .key = .{ .code = 15, .pressed = true } } });
+    build(&ui, &b1, &b2);
+    _ = ui.end();
+    try testing.expectEqual(ids[1], h.store.focus);
+
+    // Shift+Tab again (shift still held) → back to the first.
+    ui = h.frame(60, &.{.{ .key = .{ .code = 15, .pressed = true } }});
+    build(&ui, &b1, &b2);
+    _ = ui.end();
+    try testing.expectEqual(ids[0], h.store.focus);
 }
 
 test "slider: press on track sets the value" {
