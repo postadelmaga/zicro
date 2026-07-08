@@ -247,8 +247,25 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     pub fn setSubPosition(self: *Window, x: i32, y: i32) void {
         const sub = self.subsurface orelse return;
         sub.setPosition(x, y);
-        if (self.parent) |parent| parent.needs_redraw = true;
+        if (self.parent) |parent| parent.requestRedraw();
         _ = wl.wl_display_flush(self.display);
+    }
+
+    /// Signal the event loop to repaint this window on its next iteration.
+    /// Thread-safe: may be called from any thread.
+    pub fn requestRedraw(self: *Window) void {
+        @atomicStore(bool, &self.needs_redraw, true, .release);
+        // Wake the poll() in run() so the redraw is not delayed until the
+        // next Wayland event or tick timeout.
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+    }
+
+    /// Request the event loop to exit. Thread-safe.
+    pub fn requestClose(self: *Window) void {
+        @atomicStore(bool, &self.closed, true, .release);
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
     /// Tear down a child window: destroy its proxies and remove it from the

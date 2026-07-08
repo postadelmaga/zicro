@@ -244,6 +244,21 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         _ = ShowWindow(self.hwnd, 6); // SW_MINIMIZE / SW_SHOWMINIMIZED
     }
 
+    /// Signal the event loop to repaint on its next iteration. Thread-safe.
+    pub fn requestRedraw(self: *Window) void {
+        // run() is a PeekMessage poll that redraws every idle cycle (≤16 ms),
+        // so there is nothing to wake — the next cycle repaints regardless.
+        _ = self;
+    }
+
+    /// Request the event loop to exit. Thread-safe.
+    pub fn requestClose(self: *Window) void {
+        // run() polls `closed` every cycle (≤16 ms), so the flag alone is enough.
+        // NOT PostQuitMessage: that posts WM_QUIT to the CALLING thread's queue,
+        // which does nothing for run() and can spuriously quit a caller's own loop.
+        @atomicStore(bool, &self.closed, true, .release);
+    }
+
     pub fn presentRgba(self: *Window, w: u32, h: u32, rgba: []const u8) void {
         // Same guard as the Wayland/Cocoa backends: a short buffer must not be indexed.
         const need = @as(usize, w) * @as(usize, h) * 4;
