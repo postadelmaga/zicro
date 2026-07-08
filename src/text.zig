@@ -59,14 +59,13 @@ pub const Font = struct {
     /// Sets a face from TTF bytes. With `own = true` the `Font` takes ownership
     /// of `ttf` and frees it in `deinit` (font from disk); with `false` it assumes
     /// the bytes stay valid for the whole lifetime of the font (statically embedded).
+    /// On error the caller keeps ownership of `ttf` even with `own = true` (see
+    /// `loadFace`, whose errdefer frees the bytes — freeing here too would double-free).
     pub fn setFace(self: *Font, style: Style, ttf: []const u8, own: bool) !void {
         var face: Face = .{ .info = undefined, .owned = if (own) @constCast(ttf) else null };
         const p: [*c]const u8 = @ptrCast(ttf.ptr);
         const off = c.stbtt_GetFontOffsetForIndex(p, 0);
-        if (c.stbtt_InitFont(&face.info, p, off) == 0) {
-            if (own) self.gpa.free(@constCast(ttf));
-            return error.FontInit;
-        }
+        if (c.stbtt_InitFont(&face.info, p, off) == 0) return error.FontInit;
         const idx = @intFromEnum(style);
         // Replacing a face: the cached glyphs of that style go stale, but the key
         // includes the style and not the face — the cache is cleared for
@@ -128,6 +127,8 @@ pub const Font = struct {
             break :blk try self.gpa.dupe(u8, bmp[0..n]);
         } else &[_]u8{};
         if (bmp != null) c.stbtt_FreeBitmap(bmp, null);
+        // If the cache insert below fails, the duped bitmap would leak.
+        errdefer if (owned.len > 0) self.gpa.free(owned);
 
         var adv: c_int = 0;
         var lsb: c_int = 0;
@@ -141,8 +142,11 @@ pub const Font = struct {
             .advance = @intFromFloat(@round(@as(f32, @floatFromInt(adv)) * scale)),
             .bitmap = owned,
         };
-        try self.cache.put(self.gpa, key, g);
-        return self.cache.getPtr(key).?;
+        // getOrPut instead of put+getPtr: one hash lookup instead of two (the entry is
+        // always new — the miss was checked above and the font is single-threaded).
+        const gop = try self.cache.getOrPut(self.gpa, key);
+        gop.value_ptr.* = g;
+        return gop.value_ptr;
     }
 
     /// Vertical metrics in pixels at a given size/style.

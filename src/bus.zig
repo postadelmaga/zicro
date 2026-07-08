@@ -183,10 +183,14 @@ pub const LocalBus = struct {
     pub fn retain(bus: *LocalBus, channel: Channel) Allocator.Error!void {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        const gop = try bus.stateful.getOrPut(bus.gpa, channel);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try bus.gpa.dupe(u8, channel);
-        }
+        // Dupe the key *before* inserting: a getOrPut-then-dupe would leave the map
+        // holding the caller's slice (soon dangling) if the dupe failed.
+        const key = try bus.gpa.dupe(u8, channel);
+        const gop = bus.stateful.getOrPut(bus.gpa, key) catch |e| {
+            bus.gpa.free(key);
+            return e;
+        };
+        if (gop.found_existing) bus.gpa.free(key);
     }
 
     /// Choose what publishing does when a subscriber of `channel` has a full inbox.
@@ -194,10 +198,13 @@ pub const LocalBus = struct {
     pub fn setOverflow(bus: *LocalBus, channel: Channel, policy: Overflow) Allocator.Error!void {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        const gop = try bus.overflow.getOrPut(bus.gpa, channel);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try bus.gpa.dupe(u8, channel);
-        }
+        // Dupe-before-insert, same rationale as [`retain`](LocalBus.retain).
+        const key = try bus.gpa.dupe(u8, channel);
+        const gop = bus.overflow.getOrPut(bus.gpa, key) catch |e| {
+            bus.gpa.free(key);
+            return e;
+        };
+        if (gop.found_existing) bus.gpa.free(key);
         gop.value_ptr.* = policy;
     }
 
@@ -261,21 +268,33 @@ pub const LocalBus = struct {
             sync.lock(&bus.mutex, bus.io);
             defer sync.unlock(&bus.mutex, bus.io);
 
-            const counter = bus.counters.getOrPut(bus.gpa, channel) catch |e| return e;
-            if (!counter.found_existing) {
-                counter.key_ptr.* = bus.gpa.dupe(u8, channel) catch |e| return e;
-                counter.value_ptr.* = .{ .published = 0, .dropped = 0 };
-            }
-            counter.value_ptr.published += 1;
+            // Hot path: the counter already exists — one lookup, no dupe. On the first
+            // publish, dupe the key *before* inserting so a failed dupe can't leave the
+            // map holding the caller's slice (dangling key, undefined value).
+            const counter = bus.counters.getPtr(channel) orelse blk: {
+                const key = bus.gpa.dupe(u8, channel) catch |e| return e;
+                const gop = bus.counters.getOrPut(bus.gpa, key) catch |e| {
+                    bus.gpa.free(key);
+                    return e;
+                };
+                gop.value_ptr.* = .{ .published = 0, .dropped = 0 };
+                break :blk gop.value_ptr;
+            };
+            counter.published += 1;
 
             if (bus.stateful.contains(channel)) {
-                const gop = bus.retained.getOrPut(bus.gpa, channel) catch |e| return e;
-                if (gop.found_existing) {
-                    gop.value_ptr.*.release();
+                if (bus.retained.getPtr(channel)) |slot| {
+                    slot.*.release();
+                    slot.* = shared.retain();
                 } else {
-                    gop.key_ptr.* = bus.gpa.dupe(u8, channel) catch |e| return e;
+                    // First retained value on the channel: dupe-before-insert, as above.
+                    const key = bus.gpa.dupe(u8, channel) catch |e| return e;
+                    const gop = bus.retained.getOrPut(bus.gpa, key) catch |e| {
+                        bus.gpa.free(key);
+                        return e;
+                    };
+                    gop.value_ptr.* = shared.retain();
                 }
-                gop.value_ptr.* = shared.retain();
             }
 
             const policy = bus.overflow.get(channel) orelse .drop;
@@ -298,13 +317,16 @@ pub const LocalBus = struct {
                         }
                     }
                     bus.dropped_total += drops;
-                    counter.value_ptr.dropped += drops;
+                    counter.dropped += drops;
                 },
                 // Snapshot the live inboxes (with a reference each, so a concurrent
                 // receiver deinit can't free them under us); pushes happen lock-free below.
                 .block => {
+                    // Reserve before retaining: an append failing *after* a retain would
+                    // leak that reference (the cleanup defer only releases listed items).
+                    blocking_targets.ensureUnusedCapacity(scratch, list.items.len) catch |e| return e;
                     for (list.items) |inbox| {
-                        blocking_targets.append(scratch, inbox.retain()) catch |e| return e;
+                        blocking_targets.appendAssumeCapacity(inbox.retain());
                     }
                     space = bus.space; // non-null: subscribers exist, so an inbox was created
                 },
@@ -316,13 +338,19 @@ pub const LocalBus = struct {
         // simply skipped (not a drop). The snapshot is taken *before* each sweep, so a
         // pop that lands mid-sweep moves the epoch and the wait returns immediately —
         // no missed wakeup.
+        var saw_gone = false;
         while (blocking_targets.items.len > 0) {
             const snapshot = space.?.signal.prepare();
             var progressed = false;
             var i: usize = 0;
             while (i < blocking_targets.items.len) {
                 switch (blocking_targets.items[i].tryPush(bus.io, shared)) {
-                    .ok, .gone => {
+                    .ok => {
+                        blocking_targets.swapRemove(i).release(bus.io);
+                        progressed = true;
+                    },
+                    .gone => {
+                        saw_gone = true;
                         blocking_targets.swapRemove(i).release(bus.io);
                         progressed = true;
                     },
@@ -334,15 +362,18 @@ pub const LocalBus = struct {
             }
         }
 
-        // Prune any .gone inboxes from the original subs lists that accumulated during the
-        // lock-free sweep; they were removed from the snapshot but linger in bus.subs.
+        // Prune the .gone inboxes from the original subs lists: they were removed from the
+        // snapshot but linger in bus.subs. Only when the sweep actually saw one — the
+        // common publish must not pay a lock + full-map walk for nothing (the `.drop`
+        // path already prunes inline, under the broker lock).
+        if (!saw_gone) return;
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
         var subs_it = bus.subs.iterator();
         while (subs_it.next()) |entry| {
             var i: usize = 0;
             while (i < entry.value_ptr.items.len) {
-                if (entry.value_ptr.items[i].receiver_gone) {
+                if (entry.value_ptr.items[i].isReceiverGone(bus.io)) {
                     entry.value_ptr.swapRemove(i).release(bus.io);
                 } else {
                     i += 1;
@@ -406,12 +437,19 @@ pub const LocalBus = struct {
             if (bus.retained.get(channel)) |shared| {
                 _ = inbox.tryPush(bus.io, shared);
             }
-            const gop = try bus.subs.getOrPut(bus.gpa, channel);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try bus.gpa.dupe(u8, channel);
+            // Dupe-before-insert (see [`retain`](LocalBus.retain)): a failed dupe after
+            // getOrPut would leave a dangling key in the map. If the later append fails,
+            // an entry with an empty list is left behind — owned key, valid state.
+            const list = bus.subs.getPtr(channel) orelse blk: {
+                const key = try bus.gpa.dupe(u8, channel);
+                const gop = bus.subs.getOrPut(bus.gpa, key) catch |e| {
+                    bus.gpa.free(key);
+                    return e;
+                };
                 gop.value_ptr.* = .empty;
-            }
-            try gop.value_ptr.append(bus.gpa, inbox);
+                break :blk gop.value_ptr;
+            };
+            try list.append(bus.gpa, inbox);
             _ = inbox.retain();
             appended += 1;
         }

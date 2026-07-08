@@ -189,8 +189,14 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
             class_name,
             std.unicode.utf8ToUtf16LeStringLiteral("zicro"),
             WS_POPUP | WS_SYSMENU,
-            100, 100, @intCast(opts.width), @intCast(opts.height),
-            null, null, hinst, self,
+            100,
+            100,
+            @intCast(opts.width),
+            @intCast(opts.height),
+            null,
+            null,
+            hinst,
+            self,
         ) orelse return error.WindowCreationFailed;
 
         self.hwnd = hwnd;
@@ -239,12 +245,15 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     }
 
     pub fn presentRgba(self: *Window, w: u32, h: u32, rgba: []const u8) void {
+        // Same guard as the Wayland/Cocoa backends: a short buffer must not be indexed.
+        const need = @as(usize, w) * @as(usize, h) * 4;
+        if (rgba.len < need) return;
         sync.lock(&self.mutex, self.io);
-        defer self.mutex.unlock();
+        defer sync.unlock(&self.mutex, self.io);
 
         const copy_w = @min(w, self.width);
         const copy_h = @min(h, self.height);
-        
+
         var y: u32 = 0;
         while (y < copy_h) : (y += 1) {
             const src_row = rgba[y * w * 4 ..][0 .. copy_w * 4];
@@ -342,11 +351,31 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
                     var evdev_key: u32 = 0;
                     if (vk >= 'A' and vk <= 'Z') {
                         evdev_key = switch (vk) {
-                            'A' => 30, 'B' => 48, 'C' => 46, 'D' => 32, 'E' => 18,
-                            'F' => 33, 'G' => 34, 'H' => 35, 'I' => 23, 'J' => 36,
-                            'K' => 37, 'L' => 38, 'M' => 50, 'N' => 49, 'O' => 24,
-                            'P' => 25, 'Q' => 16, 'R' => 19, 'S' => 31, 'T' => 20,
-                            'U' => 22, 'V' => 47, 'W' => 17, 'X' => 45, 'Y' => 21,
+                            'A' => 30,
+                            'B' => 48,
+                            'C' => 46,
+                            'D' => 32,
+                            'E' => 18,
+                            'F' => 33,
+                            'G' => 34,
+                            'H' => 35,
+                            'I' => 23,
+                            'J' => 36,
+                            'K' => 37,
+                            'L' => 38,
+                            'M' => 50,
+                            'N' => 49,
+                            'O' => 24,
+                            'P' => 25,
+                            'Q' => 16,
+                            'R' => 19,
+                            'S' => 31,
+                            'T' => 20,
+                            'U' => 22,
+                            'V' => 47,
+                            'W' => 17,
+                            'X' => 45,
+                            'Y' => 21,
                             'Z' => 44,
                             else => 0,
                         };

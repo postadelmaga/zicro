@@ -137,7 +137,10 @@ pub const Bridge = struct {
     /// The loop wakes every [`poll_ns`] to observe [`Bridge.stop`], so it shuts down
     /// promptly even when the channels are idle. `writer` must stay valid until `stop`.
     pub fn egress(gpa: Allocator, bus: *LocalBus, channels: []const []const u8, writer: *Io.Writer) !Bridge {
-        const rx = try bus.subscribeMany(channels);
+        var rx = try bus.subscribeMany(channels);
+        // Once spawned, the thread owns rx (its loop deinits it); until then a failed
+        // create/spawn would leak the subscription (inbox + bus references).
+        errdefer rx.deinit();
         const stop_flag = try gpa.create(std.atomic.Value(bool));
         errdefer gpa.destroy(stop_flag);
         stop_flag.* = .init(false);

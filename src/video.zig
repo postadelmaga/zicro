@@ -250,7 +250,11 @@ test "GpuFrameSink wraps presentGpu, forwards the frame, and reports fallback" {
     var be = Backend{};
     const sink = GpuFrameSink.of(Backend, &be);
 
-    const planes = [_]DmabufPlane{.{ .fd = 7, .offset = 0, .stride = 4096 }};
+    // `fd_t` è c_int su Linux ma un HANDLE (*anyopaque) su Windows: fd fittizio
+    // per-OS così il test compila ovunque (i dmabuf sono comunque Linux-only e
+    // l'fd viene solo inoltrato al backend, mai dereferenziato).
+    const fake_fd: std.posix.fd_t = if (@import("builtin").os.tag == .windows) @ptrFromInt(7) else 7;
+    const planes = [_]DmabufPlane{.{ .fd = fake_fd, .offset = 0, .stride = 4096 }};
     const frame = GpuFrame{
         .width = 1024,
         .height = 512,
@@ -266,7 +270,7 @@ test "GpuFrameSink wraps presentGpu, forwards the frame, and reports fallback" {
     try testing.expectEqual(@as(u32, 1024), be.got.?.width);
     try testing.expectEqual(@as(u32, 512), be.got.?.height);
     try testing.expectEqual(@as(u8, 1), be.got.?.slot);
-    try testing.expectEqual(@as(std.posix.fd_t, 7), be.got.?.planes[0].fd);
+    try testing.expectEqual(fake_fd, be.got.?.planes[0].fd);
     try testing.expectEqual(@as(u32, 4096), be.got.?.planes[0].stride);
 
     // Fallback path: a backend that can't take the frame returns false.

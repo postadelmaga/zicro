@@ -119,6 +119,15 @@ pub const Inbox = struct {
         return shared;
     }
 
+    /// Whether the receiver went away. The flag is written under the inbox mutex
+    /// (`Receiver.deinit`), so it is read under the same mutex — the broker holds only
+    /// its own lock when pruning, and a raw read there would race the writer.
+    pub fn isReceiverGone(inbox: *Inbox, io: Io) bool {
+        sync.lock(&inbox.mutex, io);
+        defer sync.unlock(&inbox.mutex, io);
+        return inbox.receiver_gone;
+    }
+
     pub fn markClosed(inbox: *Inbox, io: Io) void {
         sync.lock(&inbox.mutex, io);
         inbox.closed = true;

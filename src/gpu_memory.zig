@@ -18,10 +18,10 @@ const linux = std.os.linux;
 
 /// Autonomous GPU-friendly buffer: CPU-mapped, exportable to Vulkan/CUDA/etc.
 pub const Buffer = struct {
-    fd: i32,                                        // memfd file descriptor
-    ptr: []align(std.heap.page_size_min) u8,       // CPU-accessible mmap
+    fd: i32, // memfd file descriptor
+    ptr: []align(std.heap.page_size_min) u8, // CPU-accessible mmap
     size: usize,
-    name: []const u8,                               // optional debug name
+    name: []const u8, // optional debug name
 
     /// Allocate a GPU-accessible buffer. The buffer is CPU-readable/writable,
     /// and its fd can be exported for GPU import via external memory APIs.
@@ -34,8 +34,10 @@ pub const Buffer = struct {
         if (size == 0) return error.ZeroSize;
 
         // Create a memfd — an anonymous file descriptor backed by RAM, suitable
-        // for sharing across processes and GPU import.
-        const fd = try std.posix.memfd_create(name, 0);
+        // for sharing across processes and GPU import. CLOEXEC: children spawned by
+        // the app must not inherit the fd (it would pin the whole staging buffer);
+        // the fd from exportHandle is consumed same-process, so nothing is lost.
+        const fd = try std.posix.memfd_create(name, std.posix.MFD.CLOEXEC);
         errdefer _ = linux.close(fd);
 
         // Resize to the requested size via ftruncate syscall. `linux.ftruncate` returns a

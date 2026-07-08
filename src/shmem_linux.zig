@@ -40,7 +40,8 @@ pub fn createSlot(id_buf: *[64]u8, total: usize) !CreateResult {
     var path_buf: [96:0]u8 = undefined;
     const path = try shmPath(&path_buf, written);
     // O_EXCL turns any residual name collision into a hard error instead of silent sharing.
-    const open_rc = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o600);
+    // CLOEXEC: a spawned child must not inherit the fd (it would pin the region).
+    const open_rc = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
     if (linux.errno(open_rc) != .SUCCESS) return error.ShmOpenFailed;
     const fd: std.posix.fd_t = @intCast(open_rc);
     errdefer _ = linux.close(fd);
@@ -57,10 +58,16 @@ pub fn createSlot(id_buf: *[64]u8, total: usize) !CreateResult {
 pub fn openSlot(id: []const u8, total: usize) !Mapping {
     var path_buf: [96:0]u8 = undefined;
     const path = try shmPath(&path_buf, id);
-    const open_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    const open_rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(open_rc) != .SUCCESS) return error.ShmOpenFailed;
     const fd: std.posix.fd_t = @intCast(open_rc);
     errdefer _ = linux.close(fd);
+    // Reject a slot smaller than what we are about to map: mmap would succeed anyway
+    // (it maps *pages*), but touching bytes past the file's end raises SIGBUS.
+    var stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &stx)) != .SUCCESS)
+        return error.ShmOpenFailed;
+    if (!stx.mask.SIZE or stx.size < total) return error.SlotTooSmall;
     const map = try std.posix.mmap(null, total, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
     return .{ .bytes = map, .fd = fd };
 }

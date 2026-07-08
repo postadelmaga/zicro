@@ -105,7 +105,6 @@ pub const App = struct {
     io: Io,
     bus_ptr: *bus_mod.LocalBus,
     rt: core.Runtime,
-    joined: bool = false,
 
     /// New app with a fresh bus and runtime.
     pub fn init(gpa: Allocator, io: Io) !App {
@@ -198,7 +197,6 @@ pub const App = struct {
 
     /// Wait for every module to finish, reporting which ones failed.
     pub fn join(app: *App) core.JoinReport {
-        app.joined = true;
         return app.rt.join();
     }
 
