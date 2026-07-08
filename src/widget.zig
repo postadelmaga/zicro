@@ -48,7 +48,13 @@ pub const BTN_MIDDLE: u32 = 274;
 /// timestamps instead and stay pure).
 pub fn nowMs() i64 {
     switch (@import("builtin").os.tag) {
-        .windows => return @intCast(std.os.windows.kernel32.GetTickCount64()),
+        .windows => {
+            // Hand-declared: this std fork's kernel32 has no GetTickCount64.
+            const k32 = struct {
+                extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+            };
+            return @intCast(k32.GetTickCount64());
+        },
         else => {
             var ts: std.os.linux.timespec = undefined;
             _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
@@ -89,6 +95,10 @@ pub const InputEvent = union(enum) {
     /// (zrame's `on_scroll` delivers 1/256 units: divide before pushing).
     scroll: struct { axis: u32, px: f32 },
     key: struct { code: u32, pressed: bool },
+    /// Layout-aware text input (e.g. the window layer's xkbcommon `on_text`):
+    /// 1..4 UTF-8 bytes for one keystroke. When any `.text` event has been seen,
+    /// the US-layout fallback (`keymap.toChar` on `.key`) stops synthesizing chars.
+    text: struct { bytes: [4]u8, len: u8 },
 };
 
 /// Bridges window callbacks (any thread-confined event source) to the per-frame event
@@ -201,6 +211,15 @@ pub const TextOp = union(enum) { char: u8, key: Key };
 
 pub const Nav = enum { none, next, prev };
 
+/// Optional OS-clipboard bridge, wired by the window layer (e.g. wl_data_device).
+/// `set` publishes a copy; `get` returns freshly allocated text (caller frees) or
+/// null when the OS has nothing new (then the internal clipboard is used).
+pub const OsClipboard = struct {
+    ctx: ?*anyopaque = null,
+    set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    get: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 = null,
+};
+
 /// Everything that must survive between frames. One per UI surface (window/panel).
 pub const Store = struct {
     gpa: std.mem.Allocator,
@@ -242,9 +261,18 @@ pub const Store = struct {
     /// Set when Tab moved the focus here — the field selects-all on arrival.
     focus_via_nav: Id = 0,
 
-    /// App-wide clipboard for ctrl+C/X/V between text fields. (OS clipboard
-    /// integration is the window layer's job — a later slice.)
+    /// App-wide clipboard for ctrl+C/X/V between text fields. When `os_clipboard`
+    /// hooks are wired (window layer), copies are pushed to the OS and pastes pull
+    /// from it first; this list stays the working copy either way.
     clipboard: std.ArrayList(u8) = .empty,
+    os_clipboard: OsClipboard = .{},
+
+    /// True (sticky) once a `.text` event arrived — the window layer does real
+    /// layout translation, so the US-layout `.key`→char fallback is disabled.
+    saw_text_events: bool = false,
+    /// Whether the focused widget is a text editor (fields/areas) as opposed to a
+    /// Tab-focused control (button, slider, …).
+    focus_is_text: bool = false,
 
     // dropdown overlay (geometry persists so next-frame clicks are claimed in begin())
     dd_open: Id = 0,
@@ -282,10 +310,10 @@ pub const Store = struct {
         s.arena.deinit();
     }
 
-    /// True while a text field owns the keyboard — apps should skip their own
-    /// shortcut handling then.
+    /// True while a text field/area owns the keyboard — apps should skip their
+    /// own shortcut handling then. (A Tab-focused control does not claim it.)
     pub fn wantsKeyboard(s: *const Store) bool {
-        return s.focus != 0;
+        return s.focus != 0 and s.focus_is_text;
     }
 };
 
@@ -341,6 +369,9 @@ pub const Ui = struct {
     focus_first: Id = 0,
     focus_last: Id = 0,
     focus_prev: Id = 0,
+    focus_first_is_text: bool = false,
+    focus_last_is_text: bool = false,
+    focus_prev_is_text: bool = false,
     focus_take_next: bool = false,
     focus_seen: bool = false,
 
@@ -406,10 +437,14 @@ pub const Ui = struct {
                     .ctrl => store.ctrl_down = k.pressed,
                     else => if (k.pressed) {
                         if (sym == .other) {
-                            if (keymap.toChar(k.code, store.shift_down)) |c| {
-                                if (store.text_ops_len < store.text_ops.len) {
-                                    store.text_ops[store.text_ops_len] = .{ .char = c };
-                                    store.text_ops_len += 1;
+                            // US-layout fallback — silenced once real `.text`
+                            // events (xkb) have been seen.
+                            if (!store.saw_text_events) {
+                                if (keymap.toChar(k.code, store.shift_down)) |c| {
+                                    if (store.text_ops_len < store.text_ops.len) {
+                                        store.text_ops[store.text_ops_len] = .{ .char = c };
+                                        store.text_ops_len += 1;
+                                    }
                                 }
                             }
                         } else {
@@ -419,7 +454,7 @@ pub const Ui = struct {
                             }
                             // Editing keys also join the ordered text stream.
                             switch (sym) {
-                                .backspace, .delete, .left, .right, .home, .end, .enter, .escape => {
+                                .backspace, .delete, .left, .right, .up, .down, .home, .end, .page_up, .page_down, .enter, .escape => {
                                     if (store.text_ops_len < store.text_ops.len) {
                                         store.text_ops[store.text_ops_len] = .{ .key = sym };
                                         store.text_ops_len += 1;
@@ -429,6 +464,15 @@ pub const Ui = struct {
                             }
                         }
                     },
+                }
+            },
+            .text => |tx| {
+                store.saw_text_events = true;
+                for (tx.bytes[0..@min(tx.len, 4)]) |b| {
+                    if (store.text_ops_len < store.text_ops.len) {
+                        store.text_ops[store.text_ops_len] = .{ .char = b };
+                        store.text_ops_len += 1;
+                    }
                 }
             },
         };
@@ -512,6 +556,21 @@ pub const Ui = struct {
             }
         }
 
+        // A Tab-focused control drops the focus on any click; Esc releases it too
+        // (consumed, so a dialog underneath doesn't also close). Text editors
+        // manage their own focus.
+        if (store.focus != 0 and !store.focus_is_text) {
+            if (store.left_pressed) store.focus = 0;
+            var ki: usize = 0;
+            while (ki < store.keys_len) {
+                if (store.keys[ki] == .escape and store.focus != 0) {
+                    store.focus = 0;
+                    std.mem.copyForwards(Key, store.keys[ki .. store.keys_len - 1], store.keys[ki + 1 .. store.keys_len]);
+                    store.keys_len -= 1;
+                } else ki += 1;
+            }
+        }
+
         var ui = Ui{
             .store = store,
             .canvas = canvas,
@@ -555,6 +614,11 @@ pub const Ui = struct {
                     (s.nav == .prev and s.focus == ui.focus_first))
                 {
                     s.focus = wrap;
+                    s.focus_is_text = switch (s.nav) {
+                        .next => ui.focus_first_is_text,
+                        .prev => ui.focus_last_is_text,
+                        .none => unreachable,
+                    };
                     s.focus_via_nav = wrap;
                 }
             }
@@ -689,14 +753,19 @@ pub const Ui = struct {
 
     /// Every keyboard-focusable widget calls this once per frame, in layout order:
     /// it satisfies a pending Tab request by handing the focus to the widget after
-    /// (or before) the currently focused one.
-    fn navFocusHook(ui: *Ui, id: Id) void {
+    /// (or before) the currently focused one. `is_text` marks text editors (they
+    /// claim the keyboard, see [`Store.wantsKeyboard`]).
+    fn navFocusHook(ui: *Ui, id: Id, is_text: bool) void {
         const s = ui.store;
         if (s.nav == .none or !ui.inputEnabled()) return;
-        if (ui.focus_first == 0) ui.focus_first = id;
+        if (ui.focus_first == 0) {
+            ui.focus_first = id;
+            ui.focus_first_is_text = is_text;
+        }
         if (ui.focus_take_next) {
             ui.focus_take_next = false;
             s.focus = id;
+            s.focus_is_text = is_text;
             s.focus_via_nav = id;
             s.nav = .none;
         } else if (s.focus != 0 and id == s.focus) {
@@ -705,6 +774,7 @@ pub const Ui = struct {
                 .next => ui.focus_take_next = true,
                 .prev => if (ui.focus_prev != 0) {
                     s.focus = ui.focus_prev;
+                    s.focus_is_text = ui.focus_prev_is_text;
                     s.focus_via_nav = ui.focus_prev;
                     s.nav = .none;
                 }, // focused is the first: wrap to the last, resolved in end()
@@ -712,7 +782,28 @@ pub const Ui = struct {
             }
         }
         ui.focus_prev = id;
+        ui.focus_prev_is_text = is_text;
         ui.focus_last = id;
+        ui.focus_last_is_text = is_text;
+    }
+
+    /// Keyboard activation of the focused control: Enter, or a Space char (space
+    /// has no `Key`, it arrives as text).
+    fn activated(ui: *Ui, id: Id) bool {
+        const s = ui.store;
+        if (s.focus != id or s.focus_is_text) return false;
+        for (s.keys[0..s.keys_len]) |k| if (k == .enter) return true;
+        for (s.text_ops[0..s.text_ops_len]) |op| switch (op) {
+            .char => |c| if (c == ' ') return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// Focus ring around a Tab-focused control.
+    fn focusRing(ui: *Ui, id: Id, r: Rect, radius: f32) void {
+        if (ui.store.focus == id and !ui.store.focus_is_text)
+            ui.canvas.strokeRoundedRect(r.x - 1.5, r.y - 1.5, r.w + 3, r.h + 3, radius + 1.5, 1.5, ui.theme.focus_ring);
     }
 
     pub fn interact(ui: *Ui, id: Id, rect: Rect) Sig {
@@ -819,7 +910,9 @@ pub const Ui = struct {
         const id = ui.makeId(label_);
         const w = ui.measureText(label_, t.font_size, .regular) + 2 * t.pad_x;
         const r = ui.allocRect(w, t.ctl_h);
-        const sig = ui.interact(id, r);
+        ui.navFocusHook(id, false);
+        var sig = ui.interact(id, r);
+        if (ui.activated(id)) sig.clicked = true;
         const ht = ui.hoverT(id, sig.hovered);
 
         var bg = if (primary) t.accent else lerpColor(t.bg_widget, t.bg_widget_hot, ht);
@@ -827,6 +920,7 @@ pub const Ui = struct {
         if (primary and !sig.held) bg = lerpColor(bg, Color.rgba(255, 255, 255, bg.a), 0.12 * ht);
         ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, bg);
         if (!primary) ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, 1, t.border);
+        ui.focusRing(id, r, t.radius);
         ui.drawTextIn(r, label_, .center, t.font_size, .regular, if (primary) t.accent_text else t.text);
         return sig.clicked;
     }
@@ -860,7 +954,9 @@ pub const Ui = struct {
         const box = t.check_size;
         const w = box + 8 + ui.measureText(label_, t.font_size, .regular);
         const r = ui.allocRect(w, t.ctl_h);
-        const sig = ui.interact(id, r);
+        ui.navFocusHook(id, false);
+        var sig = ui.interact(id, r);
+        if (ui.activated(id)) sig.clicked = true;
         if (sig.clicked) value.* = !value.*;
         const ht = ui.hoverT(id, sig.hovered);
 
@@ -868,6 +964,7 @@ pub const Ui = struct {
         const bg = if (value.*) t.accent else lerpColor(t.bg_widget, t.bg_widget_hot, ht);
         ui.canvas.fillRoundedRect(r.x, by, box, box, 5, bg);
         if (!value.*) ui.canvas.strokeRoundedRect(r.x, by, box, box, 5, 1, t.border);
+        ui.focusRing(id, .{ .x = r.x, .y = by, .w = box, .h = box }, 5);
         if (value.*) {
             const cx = r.x;
             const cy = by;
@@ -888,7 +985,9 @@ pub const Ui = struct {
         const pill_h: f32 = 22;
         const w = pill_w + 8 + ui.measureText(label_, t.font_size, .regular);
         const r = ui.allocRect(w, t.ctl_h);
-        const sig = ui.interact(id, r);
+        ui.navFocusHook(id, false);
+        var sig = ui.interact(id, r);
+        if (ui.activated(id)) sig.clicked = true;
         if (sig.clicked) value.* = !value.*;
         const on_t = ui.hoverT(id ^ 0x70676c, value.*); // animate by state, not hover
 
@@ -896,6 +995,7 @@ pub const Ui = struct {
         const bg = lerpColor(ui.theme.bg_widget, t.accent, anim.cubicOut(on_t));
         ui.canvas.fillRoundedRect(r.x, py, pill_w, pill_h, pill_h / 2, bg);
         ui.canvas.strokeRoundedRect(r.x, py, pill_w, pill_h, pill_h / 2, 1, t.border);
+        ui.focusRing(id, .{ .x = r.x, .y = py, .w = pill_w, .h = pill_h }, pill_h / 2);
         const knob_r = pill_h - 6;
         const kx = r.x + 3 + anim.cubicOut(on_t) * (pill_w - knob_r - 6);
         ui.canvas.fillRoundedRect(kx, py + 3, knob_r, knob_r, knob_r / 2, Color.rgba(255, 255, 255, 0.95));
@@ -914,7 +1014,9 @@ pub const Ui = struct {
         const d = t.check_size;
         const w = d + 8 + ui.measureText(label_, t.font_size, .regular);
         const r = ui.allocRect(w, t.ctl_h);
-        const sig = ui.interact(id, r);
+        ui.navFocusHook(id, false);
+        var sig = ui.interact(id, r);
+        if (ui.activated(id)) sig.clicked = true;
         var changed = false;
         if (sig.clicked and selected.* != index) {
             selected.* = index;
@@ -927,6 +1029,7 @@ pub const Ui = struct {
         const bg = if (on) t.accent else lerpColor(t.bg_widget, t.bg_widget_hot, ht);
         ui.canvas.fillRoundedRect(r.x, cy, d, d, d / 2, bg);
         if (!on) ui.canvas.strokeRoundedRect(r.x, cy, d, d, d / 2, 1, t.border);
+        ui.focusRing(id, .{ .x = r.x, .y = cy, .w = d, .h = d }, d / 2);
         if (on) {
             const dot = d * 0.4;
             ui.canvas.fillRoundedRect(r.x + (d - dot) / 2, cy + (d - dot) / 2, dot, dot, dot / 2, t.accent_text);
@@ -979,6 +1082,7 @@ pub const Ui = struct {
             ui.drawTextIn(lr, label_, .left, t.font_size, .regular, t.text);
         }
         const track = Rect{ .x = r.x + label_w, .y = r.y, .w = @max(20, r.w - label_w), .h = r.h };
+        ui.navFocusHook(id, false);
         const sig = ui.interact(id, track);
         var changed = false;
         if (sig.held or sig.pressed) {
@@ -989,6 +1093,21 @@ pub const Ui = struct {
                 changed = true;
             }
         }
+        // Focused: arrows nudge by 2% of the range.
+        if (ui.store.focus == id and !ui.store.focus_is_text) {
+            const step = (max - min) * 0.02;
+            for (ui.store.keys[0..ui.store.keys_len]) |k| {
+                const nv = switch (k) {
+                    .left => @max(min, value.* - step),
+                    .right => @min(max, value.* + step),
+                    else => continue,
+                };
+                if (nv != value.*) {
+                    value.* = nv;
+                    changed = true;
+                }
+            }
+        }
         const ht = ui.hoverT(id, sig.hovered or sig.held);
         const vt = if (max > min) std.math.clamp((value.* - min) / (max - min), 0, 1) else 0;
         const ty = r.y + r.h / 2 - 3;
@@ -997,6 +1116,7 @@ pub const Ui = struct {
         const knob: f32 = 14 + 2 * ht;
         const kx = track.x + track.w * vt - knob / 2;
         ui.canvas.fillRoundedRect(kx, r.y + (r.h - knob) / 2, knob, knob, knob / 2, Color.rgba(255, 255, 255, 0.95));
+        ui.focusRing(id, .{ .x = kx, .y = r.y + (r.h - knob) / 2, .w = knob, .h = knob }, knob / 2);
         return changed;
     }
 
@@ -1056,13 +1176,14 @@ pub const Ui = struct {
         const s = ui.store;
         const id = ui.makeId(id_str);
         const r = ui.allocRect(ui.availW(), t.ctl_h);
-        ui.navFocusHook(id);
+        ui.navFocusHook(id, true);
         const sig = ui.interact(id, r);
         const focused = s.focus == id;
 
         if (sig.pressed) {
             if (!focused) {
                 s.focus = id;
+                s.focus_is_text = true;
                 s.text_anchor = null;
             }
             const p = ui.caretFromX(buf.items, s.mouse_x - (r.x + t.pad_x));
@@ -1092,103 +1213,7 @@ pub const Ui = struct {
         }
 
         var result: TextEdit = .idle;
-        if (s.focus == id) {
-            if (s.text_cursor > buf.items.len) s.text_cursor = buf.items.len;
-            if (s.text_anchor) |a| {
-                if (a > buf.items.len) s.text_anchor = buf.items.len;
-            }
-            // Ordered stream: chars and editing keys interleave exactly as they arrived.
-            for (s.text_ops[0..s.text_ops_len]) |op| switch (op) {
-                .char => |c| if (s.ctrl_down) switch (c) {
-                    'a' => {
-                        s.text_anchor = 0;
-                        s.text_cursor = buf.items.len;
-                    },
-                    'c' => _ = ui.copySelection(buf.items),
-                    'x' => if (ui.copySelection(buf.items)) {
-                        _ = ui.deleteSelection(buf);
-                        result = .changed;
-                    },
-                    'v' => if (s.clipboard.items.len > 0 or selRange(s) != null) {
-                        _ = ui.deleteSelection(buf);
-                        buf.insertSlice(s.gpa, s.text_cursor, s.clipboard.items) catch break;
-                        s.text_cursor += s.clipboard.items.len;
-                        result = .changed;
-                    },
-                    else => {},
-                } else {
-                    _ = ui.deleteSelection(buf);
-                    buf.insert(s.gpa, s.text_cursor, c) catch break;
-                    s.text_cursor += 1;
-                    result = .changed;
-                },
-                .key => |k| switch (k) {
-                    .backspace => if (ui.deleteSelection(buf)) {
-                        result = .changed;
-                    } else if (s.text_cursor > 0) {
-                        const prev = prevBoundary(buf.items, s.text_cursor);
-                        buf.replaceRange(s.gpa, prev, s.text_cursor - prev, &.{}) catch {};
-                        s.text_cursor = prev;
-                        result = .changed;
-                    },
-                    .delete => if (ui.deleteSelection(buf)) {
-                        result = .changed;
-                    } else if (s.text_cursor < buf.items.len) {
-                        const next = nextBoundary(buf.items, s.text_cursor);
-                        buf.replaceRange(s.gpa, s.text_cursor, next - s.text_cursor, &.{}) catch {};
-                        result = .changed;
-                    },
-                    .left => {
-                        if (s.shift_down) {
-                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
-                            s.text_cursor = if (s.ctrl_down) prevWord(buf.items, s.text_cursor) else prevBoundary(buf.items, s.text_cursor);
-                        } else if (selRange(s)) |sel| {
-                            s.text_cursor = sel[0]; // collapse to the left edge
-                            s.text_anchor = null;
-                        } else {
-                            s.text_cursor = if (s.ctrl_down) prevWord(buf.items, s.text_cursor) else prevBoundary(buf.items, s.text_cursor);
-                        }
-                    },
-                    .right => {
-                        if (s.shift_down) {
-                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
-                            s.text_cursor = if (s.ctrl_down) nextWord(buf.items, s.text_cursor) else nextBoundary(buf.items, s.text_cursor);
-                        } else if (selRange(s)) |sel| {
-                            s.text_cursor = sel[1]; // collapse to the right edge
-                            s.text_anchor = null;
-                        } else {
-                            s.text_cursor = if (s.ctrl_down) nextWord(buf.items, s.text_cursor) else nextBoundary(buf.items, s.text_cursor);
-                        }
-                    },
-                    .home => {
-                        if (s.shift_down) {
-                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
-                        } else s.text_anchor = null;
-                        s.text_cursor = 0;
-                    },
-                    .end => {
-                        if (s.shift_down) {
-                            if (s.text_anchor == null) s.text_anchor = s.text_cursor;
-                        } else s.text_anchor = null;
-                        s.text_cursor = buf.items.len;
-                    },
-                    .enter => {
-                        s.focus = 0;
-                        s.text_anchor = null;
-                        result = .submitted;
-                    },
-                    .escape => {
-                        s.focus = 0;
-                        s.text_anchor = null;
-                    },
-                    else => {},
-                },
-            };
-            // An empty selection is no selection.
-            if (s.text_anchor) |a| {
-                if (a == s.text_cursor) s.text_anchor = null;
-            }
-        }
+        if (s.focus == id) result = ui.editText(buf, false);
 
         // draw
         const ht = ui.hoverT(id, sig.hovered);
@@ -1230,6 +1255,158 @@ pub const Ui = struct {
         return result;
     }
 
+    /// Multi-line editable text of fixed pixel height `h`. Enter inserts a
+    /// newline (no `.submitted`), Esc unfocuses; Up/Down move by line keeping the
+    /// column, Home/End are line-wise; selection, drag and the clipboard behave
+    /// like [`textField`]. Scrolls vertically (wheel when hovered, and the caret
+    /// is kept in view while editing).
+    pub fn textArea(ui: *Ui, id_str: []const u8, buf: *std.ArrayList(u8), h: f32) TextEdit {
+        const t = ui.theme;
+        const s = ui.store;
+        const id = ui.makeId(id_str);
+        const r = ui.allocRect(ui.availW(), h);
+        ui.navFocusHook(id, true);
+        const sig = ui.interact(id, r);
+        const focused = s.focus == id;
+        const line_h: f32 = @floatFromInt(ui.font.lineHeight(t.font_size, .regular));
+        const pad_y: f32 = 6;
+
+        var off = s.scrolls.get(id) orelse 0;
+
+        if (sig.pressed) {
+            if (!focused) {
+                s.focus = id;
+                s.focus_is_text = true;
+                s.text_anchor = null;
+            }
+            const p = ui.caretFromPoint(buf.items, s.mouse_x - (r.x + t.pad_x), s.mouse_y - (r.y + pad_y) + off, line_h);
+            if (s.shift_down and focused) {
+                if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+            } else {
+                s.text_anchor = null;
+            }
+            s.text_cursor = p;
+        } else if (s.left_pressed and !sig.hovered and focused) {
+            s.focus = 0;
+            s.text_anchor = null;
+        } else if (s.active == id and s.left_down and s.focus == id) {
+            const p = ui.caretFromPoint(buf.items, s.mouse_x - (r.x + t.pad_x), s.mouse_y - (r.y + pad_y) + off, line_h);
+            if (p != s.text_cursor) {
+                if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                s.text_cursor = p;
+            }
+        }
+
+        if (s.focus == id and s.focus_via_nav == id) {
+            s.focus_via_nav = 0;
+            s.text_anchor = 0;
+            s.text_cursor = buf.items.len;
+        }
+
+        var result: TextEdit = .idle;
+        const had_keys = s.keys_len > 0 or s.text_ops_len > 0;
+        if (s.focus == id) result = ui.editText(buf, true);
+
+        // Scroll: wheel when hovered; editing keeps the caret line in view.
+        var n_lines: f32 = 1;
+        for (buf.items) |c| {
+            if (c == '\n') n_lines += 1;
+        }
+        const max_off = @max(0, n_lines * line_h + 2 * pad_y - h);
+        if (sig.hovered and s.wheel != 0) {
+            off += s.wheel;
+            s.wheel = 0; // consumed
+        }
+        if (s.focus == id and had_keys) {
+            var caret_line: f32 = 0;
+            for (buf.items[0..s.text_cursor]) |c| {
+                if (c == '\n') caret_line += 1;
+            }
+            const cy = pad_y + caret_line * line_h;
+            if (cy - off < pad_y) off = cy - pad_y;
+            if (cy + line_h - off > h - pad_y) off = cy + line_h - (h - pad_y);
+        }
+        off = std.math.clamp(off, 0, max_off);
+        s.scrolls.put(s.gpa, id, off) catch {};
+
+        // draw
+        const ht = ui.hoverT(id, sig.hovered);
+        ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, lerpColor(t.bg_widget, t.bg_widget_hot, ht * 0.6));
+        const ring = if (s.focus == id) t.focus_ring else t.border;
+        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, if (s.focus == id) 1.5 else 1, ring);
+
+        const saved = ui.canvas.setClip(
+            @intFromFloat(@max(0, r.x + 2)),
+            @intFromFloat(@max(0, r.y + 2)),
+            @intFromFloat(@max(0, r.w - 4)),
+            @intFromFloat(@max(0, r.h - 4)),
+        );
+        defer ui.canvas.clip = saved;
+
+        const v = ui.font.vmetrics(t.font_size, .regular);
+        const text_h: f32 = @floatFromInt(v.ascent - v.descent);
+        const sel = if (s.focus == id) selRange(s) else null;
+        const blink = s.focus == id and @rem(@divTrunc(ui.now_ms, 530), 2) == 0;
+        var ls: usize = 0;
+        var li: f32 = 0;
+        while (true) {
+            const le = lineEnd(buf.items, ls);
+            const y = r.y + pad_y + li * line_h - off;
+            if (y > r.y + r.h) break;
+            if (y + line_h >= r.y) {
+                const lx = r.x + t.pad_x;
+                const lrect = Rect{ .x = lx, .y = y, .w = r.w - 2 * t.pad_x, .h = line_h };
+                if (sel) |se| {
+                    // Selection band clamped to this line; a selected newline
+                    // shows as a small stub past the line end.
+                    const lo = std.math.clamp(se[0], ls, le);
+                    const hi = std.math.clamp(se[1], ls, le);
+                    if (hi > lo or (se[0] <= le and se[1] > le)) {
+                        const x0 = lx + ui.measureText(buf.items[ls..lo], t.font_size, .regular);
+                        var x1 = lx + ui.measureText(buf.items[ls..hi], t.font_size, .regular);
+                        if (se[1] > le) x1 += 5;
+                        var sc = t.accent;
+                        sc.a *= 0.35;
+                        ui.canvas.fillRoundedRect(x0, y + (line_h - text_h) / 2, x1 - x0, text_h, 2, sc);
+                    }
+                }
+                ui.drawTextIn(lrect, buf.items[ls..le], .left, t.font_size, .regular, t.text);
+                if (blink and s.text_cursor >= ls and s.text_cursor <= le) {
+                    const cx = lx + ui.measureText(buf.items[ls..s.text_cursor], t.font_size, .regular);
+                    const cy0 = y + (line_h - text_h) / 2;
+                    ui.canvas.strokeSegment(cx, cy0, cx, cy0 + text_h, 1.4, t.text);
+                }
+            }
+            if (le >= buf.items.len) break;
+            ls = le + 1;
+            li += 1;
+        }
+
+        // Thin scrollbar like the scroll area's.
+        if (max_off > 0) {
+            const track_h = r.h - 4;
+            const content_h = n_lines * line_h + 2 * pad_y;
+            const thumb_h = @max(24, track_h * r.h / content_h);
+            const ty = r.y + 2 + (track_h - thumb_h) * (off / max_off);
+            ui.canvas.fillRoundedRect(r.x + r.w - 6, ty, 4, thumb_h, 2, Color.rgba(255, 255, 255, if (sig.hovered) 0.35 else 0.18));
+        }
+        return result;
+    }
+
+    /// Byte offset for a click at content-space `(x, y)` (y includes the scroll).
+    fn caretFromPoint(ui: *Ui, items: []const u8, x: f32, y: f32, line_h: f32) usize {
+        const want: usize = if (y <= 0) 0 else @intFromFloat(y / line_h);
+        var ls: usize = 0;
+        var li: usize = 0;
+        while (li < want) {
+            const le = lineEnd(items, ls);
+            if (le >= items.len) break;
+            ls = le + 1;
+            li += 1;
+        }
+        return ls + ui.caretFromX(items[ls..lineEnd(items, ls)], x);
+    }
+
     fn caretFromX(ui: *Ui, s: []const u8, x: f32) usize {
         if (x <= 0) return 0;
         var i: usize = 0;
@@ -1242,6 +1419,164 @@ pub const Ui = struct {
             i = next;
         }
         return s.len;
+    }
+
+    /// Shared editing core of [`textField`]/[`textArea`]: applies the frame's
+    /// ordered text ops to `buf` around the store's cursor/anchor. `multiline`
+    /// turns Enter into a newline and makes Home/End/Up/Down line-wise.
+    fn editText(ui: *Ui, buf: *std.ArrayList(u8), multiline: bool) TextEdit {
+        const s = ui.store;
+        var result: TextEdit = .idle;
+        if (s.text_cursor > buf.items.len) s.text_cursor = buf.items.len;
+        if (s.text_anchor) |a| {
+            if (a > buf.items.len) s.text_anchor = buf.items.len;
+        }
+        // Ordered stream: chars and editing keys interleave exactly as they arrived.
+        for (s.text_ops[0..s.text_ops_len]) |op| switch (op) {
+            .char => |c| if (s.ctrl_down) switch (c) {
+                'a' => {
+                    s.text_anchor = 0;
+                    s.text_cursor = buf.items.len;
+                },
+                'c' => _ = ui.copySelection(buf.items),
+                'x' => if (ui.copySelection(buf.items)) {
+                    _ = ui.deleteSelection(buf);
+                    result = .changed;
+                },
+                'v' => {
+                    // Pull a fresher OS clipboard first, if the window layer wired one.
+                    if (s.os_clipboard.get) |f| {
+                        if (f(s.os_clipboard.ctx, s.gpa)) |txt| {
+                            s.clipboard.clearRetainingCapacity();
+                            s.clipboard.appendSlice(s.gpa, txt) catch {};
+                            s.gpa.free(txt);
+                        }
+                    }
+                    if (s.clipboard.items.len > 0 or selRange(s) != null) {
+                        _ = ui.deleteSelection(buf);
+                        buf.insertSlice(s.gpa, s.text_cursor, s.clipboard.items) catch break;
+                        if (!multiline) // single line: flatten pasted newlines
+                            for (buf.items[s.text_cursor..][0..s.clipboard.items.len]) |*b| {
+                                if (b.* == '\n') b.* = ' ';
+                            };
+                        s.text_cursor += s.clipboard.items.len;
+                        result = .changed;
+                    }
+                },
+                else => {},
+            } else {
+                _ = ui.deleteSelection(buf);
+                buf.insert(s.gpa, s.text_cursor, c) catch break;
+                s.text_cursor += 1;
+                result = .changed;
+            },
+            .key => |k| switch (k) {
+                .backspace => if (ui.deleteSelection(buf)) {
+                    result = .changed;
+                } else if (s.text_cursor > 0) {
+                    const prev = prevBoundary(buf.items, s.text_cursor);
+                    buf.replaceRange(s.gpa, prev, s.text_cursor - prev, &.{}) catch {};
+                    s.text_cursor = prev;
+                    result = .changed;
+                },
+                .delete => if (ui.deleteSelection(buf)) {
+                    result = .changed;
+                } else if (s.text_cursor < buf.items.len) {
+                    const next = nextBoundary(buf.items, s.text_cursor);
+                    buf.replaceRange(s.gpa, s.text_cursor, next - s.text_cursor, &.{}) catch {};
+                    result = .changed;
+                },
+                .left => {
+                    if (s.shift_down) {
+                        if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                        s.text_cursor = if (s.ctrl_down) prevWord(buf.items, s.text_cursor) else prevBoundary(buf.items, s.text_cursor);
+                    } else if (selRange(s)) |sel| {
+                        s.text_cursor = sel[0]; // collapse to the left edge
+                        s.text_anchor = null;
+                    } else {
+                        s.text_cursor = if (s.ctrl_down) prevWord(buf.items, s.text_cursor) else prevBoundary(buf.items, s.text_cursor);
+                    }
+                },
+                .right => {
+                    if (s.shift_down) {
+                        if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                        s.text_cursor = if (s.ctrl_down) nextWord(buf.items, s.text_cursor) else nextBoundary(buf.items, s.text_cursor);
+                    } else if (selRange(s)) |sel| {
+                        s.text_cursor = sel[1]; // collapse to the right edge
+                        s.text_anchor = null;
+                    } else {
+                        s.text_cursor = if (s.ctrl_down) nextWord(buf.items, s.text_cursor) else nextBoundary(buf.items, s.text_cursor);
+                    }
+                },
+                .up, .down => if (multiline) {
+                    if (s.shift_down) {
+                        if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                    } else s.text_anchor = null;
+                    s.text_cursor = ui.moveVertical(buf.items, k == .up);
+                },
+                .home => {
+                    if (s.shift_down) {
+                        if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                    } else s.text_anchor = null;
+                    s.text_cursor = if (multiline) lineStart(buf.items, s.text_cursor) else 0;
+                },
+                .end => {
+                    if (s.shift_down) {
+                        if (s.text_anchor == null) s.text_anchor = s.text_cursor;
+                    } else s.text_anchor = null;
+                    s.text_cursor = if (multiline) lineEnd(buf.items, s.text_cursor) else buf.items.len;
+                },
+                .enter => if (multiline) {
+                    _ = ui.deleteSelection(buf);
+                    buf.insert(s.gpa, s.text_cursor, '\n') catch break;
+                    s.text_cursor += 1;
+                    result = .changed;
+                } else {
+                    s.focus = 0;
+                    s.text_anchor = null;
+                    result = .submitted;
+                },
+                .escape => {
+                    s.focus = 0;
+                    s.text_anchor = null;
+                },
+                else => {},
+            },
+        };
+        // An empty selection is no selection.
+        if (s.text_anchor) |a| {
+            if (a == s.text_cursor) s.text_anchor = null;
+        }
+        return result;
+    }
+
+    /// Cursor moved one line up/down, keeping the horizontal position.
+    fn moveVertical(ui: *Ui, items: []const u8, up: bool) usize {
+        const s = ui.store;
+        const ls = lineStart(items, s.text_cursor);
+        const x = ui.measureText(items[ls..s.text_cursor], ui.theme.font_size, .regular);
+        if (up) {
+            if (ls == 0) return 0;
+            const pls = lineStart(items, ls - 1);
+            return pls + ui.caretFromX(items[pls .. ls - 1], x);
+        } else {
+            const le = lineEnd(items, s.text_cursor);
+            if (le >= items.len) return items.len;
+            const nls = le + 1;
+            return nls + ui.caretFromX(items[nls..lineEnd(items, nls)], x);
+        }
+    }
+
+    fn lineStart(s: []const u8, i: usize) usize {
+        var j = i;
+        while (j > 0 and s[j - 1] != '\n') j -= 1;
+        return j;
+    }
+
+    fn lineEnd(s: []const u8, i: usize) usize {
+        var j = i;
+        while (j < s.len and s[j] != '\n') j += 1;
+        return j;
     }
 
     /// Selection of the focused field as an ordered `[lo, hi]`, or null when empty.
@@ -1260,11 +1595,13 @@ pub const Ui = struct {
         return true;
     }
 
-    /// Copy the selection into the store clipboard. False if none.
+    /// Copy the selection into the store clipboard (and the OS one, when wired).
+    /// False if none.
     fn copySelection(ui: *Ui, chars: []const u8) bool {
         const sel = selRange(ui.store) orelse return false;
         ui.store.clipboard.clearRetainingCapacity();
         ui.store.clipboard.appendSlice(ui.store.gpa, chars[sel[0]..sel[1]]) catch return false;
+        if (ui.store.os_clipboard.set) |f| f(ui.store.os_clipboard.ctx, ui.store.clipboard.items);
         return true;
     }
 
@@ -1323,7 +1660,9 @@ pub const Ui = struct {
         }
 
         const r = ui.allocRect(ui.availW(), t.ctl_h);
-        const sig = ui.interact(id, r);
+        ui.navFocusHook(id, false);
+        var sig = ui.interact(id, r);
+        if (ui.activated(id)) sig.clicked = true;
         if (sig.clicked) {
             if (s.dd_open == id) {
                 s.dd_open = 0;
@@ -1340,6 +1679,7 @@ pub const Ui = struct {
         const ht = ui.hoverT(id, sig.hovered);
         ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, lerpColor(t.bg_widget, t.bg_widget_hot, ht));
         ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, 1, if (s.dd_open == id) t.focus_ring else t.border);
+        ui.focusRing(id, r, t.radius);
         var inner = r;
         inner.x += t.pad_x;
         inner.w -= 2 * t.pad_x + 16;
@@ -2212,6 +2552,89 @@ test "textField: Tab traversal tra i campi, con wrap e Shift+Tab" {
     build(&ui, &b1, &b2);
     _ = ui.end();
     try testing.expectEqual(ids[0], h.store.focus);
+}
+
+test "keyboard: Tab raggiunge un bottone, Enter lo attiva, click toglie il focus" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+
+    // Tab → the button takes (control) focus; wantsKeyboard stays false.
+    var ui = h.frame(10, &.{.{ .key = .{ .code = 15, .pressed = true } }});
+    try testing.expect(!ui.button("Ok"));
+    _ = ui.end();
+    try testing.expect(h.store.focus != 0);
+    try testing.expect(!h.store.wantsKeyboard());
+
+    // Enter activates it.
+    ui = h.frame(20, &.{.{ .key = .{ .code = 28, .pressed = true } }});
+    try testing.expect(ui.button("Ok"));
+    _ = ui.end();
+
+    // A click anywhere drops the control focus.
+    ui = h.frame(30, &.{ .{ .motion = .{ .x = 300, .y = 200 } }, .{ .button = .{ .button = BTN_LEFT, .pressed = true } } });
+    _ = ui.button("Ok");
+    _ = ui.end();
+    try testing.expectEqual(@as(Id, 0), h.store.focus);
+}
+
+test "textArea: Enter = newline, frecce verticali e Home/End per riga" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+
+    // Click into the area (first widget, tall).
+    var ui = h.frame(10, &.{ .{ .motion = .{ .x = 100, .y = 40 } }, .{ .button = .{ .button = BTN_LEFT, .pressed = true } } });
+    _ = ui.textArea("ta", &buf, 120);
+    _ = ui.end();
+    try testing.expect(h.store.focus != 0);
+    try testing.expect(h.store.wantsKeyboard());
+
+    // "ab" ⏎ "c" — Enter inserts, never submits.
+    ui = h.frame(20, &.{ .{ .button = .{ .button = BTN_LEFT, .pressed = false } }, .{ .key = .{ .code = 30, .pressed = true } }, .{ .key = .{ .code = 48, .pressed = true } }, .{ .key = .{ .code = 28, .pressed = true } }, .{ .key = .{ .code = 46, .pressed = true } } });
+    const res = ui.textArea("ta", &buf, 120);
+    _ = ui.end();
+    try testing.expectEqual(Ui.TextEdit.changed, res);
+    try testing.expectEqualStrings("ab\nc", buf.items);
+    try testing.expectEqual(@as(usize, 4), h.store.text_cursor);
+
+    // Up keeps the column ("c" is 1 glyph → lands after "a"), Home goes to line start.
+    ui = h.frame(30, &.{.{ .key = .{ .code = 103, .pressed = true } }});
+    _ = ui.textArea("ta", &buf, 120);
+    _ = ui.end();
+    try testing.expectEqual(@as(usize, 1), h.store.text_cursor);
+    ui = h.frame(40, &.{.{ .key = .{ .code = 102, .pressed = true } }});
+    _ = ui.textArea("ta", &buf, 120);
+    _ = ui.end();
+    try testing.expectEqual(@as(usize, 0), h.store.text_cursor);
+
+    // Down + End → the end of the second line.
+    ui = h.frame(50, &.{ .{ .key = .{ .code = 108, .pressed = true } }, .{ .key = .{ .code = 107, .pressed = true } } });
+    _ = ui.textArea("ta", &buf, 120);
+    _ = ui.end();
+    try testing.expectEqual(@as(usize, 4), h.store.text_cursor);
+}
+
+test "eventi .text: UTF-8 inserito, fallback toChar disattivato" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+
+    var ui = h.frame(10, &.{ .{ .motion = .{ .x = 100, .y = 25 } }, .{ .button = .{ .button = BTN_LEFT, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+
+    // A 2-byte UTF-8 char ("è") via .text, PLUS the same keystroke as raw .key:
+    // the fallback must stay silent, no double insert.
+    ui = h.frame(20, &.{ .{ .text = .{ .bytes = .{ 0xC3, 0xA8, 0, 0 }, .len = 2 } }, .{ .key = .{ .code = 18, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expectEqualStrings("è", buf.items);
+    try testing.expectEqual(@as(usize, 2), h.store.text_cursor);
 }
 
 test "slider: press on track sets the value" {
