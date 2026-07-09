@@ -856,16 +856,28 @@ pub const Canvas = struct {
     /// over the premultiplied pixels (source-over). Use `font.ascent` to convert
     /// a top edge into a baseline if needed.
     pub fn drawText(self: *Canvas, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts) void {
-        var pen_x: i32 = x;
+        var pen_x: f32 = @floatFromInt(x);
+        var prev_cp: ?u32 = null;
         var i: usize = 0;
         while (i < s.len) {
             const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
             const end = @min(i + seq, s.len);
             const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
             i = end;
-            const g = font.getGlyph(opts.size, opts.style, cp) catch continue;
-            self.blitGlyph(g, pen_x, baseline_y, opts.color);
+
+            if (prev_cp) |prev| {
+                pen_x += font.getKernAdvance(opts.style, opts.size, prev, cp);
+            }
+
+            const frac = pen_x - @floor(pen_x);
+            const sub_x_i = @as(i32, @intFromFloat(@round(frac * 4.0)));
+            const sub_x: u2 = @intCast(sub_x_i & 3);
+            const g = font.getGlyph(opts.size, opts.style, sub_x, cp) catch continue;
+            const ipen_x = @as(i32, @intFromFloat(@floor(pen_x + 0.5)));
+
+            self.blitGlyph(g, ipen_x, baseline_y, opts.color);
             pen_x += g.advance;
+            prev_cp = cp;
         }
     }
 
