@@ -269,6 +269,16 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
+    pub fn setCursorShape(self: *Window, shape: u32) void {
+        if (self.cursor_shape_manager) |mgr| {
+            if (self.pointer) |pointer| {
+                const device = mgr.getPointer(pointer);
+                defer wl.wl_proxy_destroy(@ptrCast(device));
+                device.setShape(self.pointer_serial, shape);
+            }
+        }
+    }
+
     /// Tear down a child window: destroy its proxies and remove it from the
     /// parent. Runs on the loop thread (run() reaps closed children with it).
     fn deinitChild(self: *Window) void {
@@ -786,7 +796,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (self.cursor_shape_manager) |mgr| {
             const device = mgr.getPointer(pointer);
             defer wl.wl_proxy_destroy(@ptrCast(device));
-            device.setShape(serial, 4); // wl.CursorShapeDevice.SHAPE_POINTER = 4
+            device.setShape(serial, 1); // wl.CursorShapeDevice.SHAPE_DEFAULT = 1
         }
     }
     fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}
