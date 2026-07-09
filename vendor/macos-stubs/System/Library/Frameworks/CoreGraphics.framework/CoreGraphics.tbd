@@ -6,5 +6,10 @@ exports:
   - targets: [ x86_64-macos, arm64-macos ]
     symbols: [ _CGColorSpaceCreateDeviceRGB, _CGColorSpaceRelease,
                _CGDataProviderCreateWithData, _CGDataProviderRelease,
-               _CGImageCreate, _CGImageRelease, _CGContextDrawImage ]
+               _CGImageCreate, _CGImageRelease, _CGContextDrawImage,
+               _CGContextSaveGState, _CGContextRestoreGState,
+               _CGContextTranslateCTM, _CGContextScaleCTM,
+               _CGContextSetRGBFillColor, _CGContextFillRect,
+               _CGBitmapContextGetData, _CGBitmapContextGetWidth,
+               _CGBitmapContextGetHeight, _CGBitmapContextGetBytesPerRow ]
 ...

@@ -147,10 +147,10 @@ fn fixupGutter(canvas: *paint.Canvas) void {
         if (a == 255) continue;
         const inv = 255 - a;
         // Premultiplied source-over with an opaque destination.
-        const r = ((p.* >> 16) & 0xff) + (dr * inv + 127) / 255;
-        const g = ((p.* >> 8) & 0xff) + (dg * inv + 127) / 255;
-        const b = (p.* & 0xff) + (db * inv + 127) / 255;
-        p.* = 0xFF00_0000 | (@min(r, 255) << 16) | (@min(g, 255) << 8) | @min(b, 255);
+        const r: u32 = ((p.* >> 16) & 0xff) + (dr * inv + 127) / 255;
+        const g: u32 = ((p.* >> 8) & 0xff) + (dg * inv + 127) / 255;
+        const b: u32 = (p.* & 0xff) + (db * inv + 127) / 255;
+        p.* = 0xFF00_0000 | (@as(u32, @min(r, 255)) << 16) | (@as(u32, @min(g, 255)) << 8) | @min(b, 255);
     }
 }
 

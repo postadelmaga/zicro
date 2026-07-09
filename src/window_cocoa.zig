@@ -69,6 +69,16 @@ extern "c" fn CGImageCreate(
 ) ?*anyopaque;
 extern "c" fn CGImageRelease(image: ?*anyopaque) void;
 extern "c" fn CGContextDrawImage(ctx: ?*anyopaque, rect: CGRect, image: ?*anyopaque) void;
+extern "c" fn CGBitmapContextGetData(ctx: ?*anyopaque) ?[*]u8;
+extern "c" fn CGBitmapContextGetWidth(ctx: ?*anyopaque) usize;
+extern "c" fn CGBitmapContextGetHeight(ctx: ?*anyopaque) usize;
+extern "c" fn CGBitmapContextGetBytesPerRow(ctx: ?*anyopaque) usize;
+extern "c" fn CGContextSetRGBFillColor(ctx: ?*anyopaque, r: f64, g: f64, b: f64, a: f64) void;
+extern "c" fn CGContextFillRect(ctx: ?*anyopaque, rect: CGRect) void;
+extern "c" fn CGContextSaveGState(ctx: ?*anyopaque) void;
+extern "c" fn CGContextRestoreGState(ctx: ?*anyopaque) void;
+extern "c" fn CGContextTranslateCTM(ctx: ?*anyopaque, tx: f64, ty: f64) void;
+extern "c" fn CGContextScaleCTM(ctx: ?*anyopaque, sx: f64, sy: f64) void;
 
 // Interpret each little-endian 32-bit pixel as 0xAARRGGBB, premultiplied — exactly the
 // layout `paint.Canvas` produces (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little).
@@ -191,6 +201,38 @@ fn nsString(s: [*:0]const u8) id {
     return msgStr(class("NSString"), "stringWithUTF8String:", s);
 }
 
+// ZICRO_COCOA_TRACE=1: loop/dispatch diagnostics on stderr (dual-world debugging:
+// under zart the backend log collects them next to the ZartDisplay trace).
+extern "c" fn getenv([*:0]const u8) ?[*:0]const u8;
+var trace_checked: bool = false;
+var trace_on: bool = false;
+fn traceOn() bool {
+    if (!trace_checked) {
+        trace_checked = true;
+        trace_on = if (getenv("ZICRO_COCOA_TRACE")) |v| v[0] != '0' else false;
+    }
+    return trace_on;
+}
+/// Monotonic nanoseconds via raw libc (std.time timestamps live behind std.Io in Zig
+/// 0.16; pacing and trace stamps only need a raw monotonic clock).
+const Timespec = extern struct { sec: i64, nsec: i64 };
+const CLOCK_MONOTONIC_DARWIN: c_int = 6;
+extern "c" fn clock_gettime(clockid: c_int, tp: *Timespec) c_int;
+fn clockNs() u64 {
+    var ts: Timespec = undefined;
+    if (clock_gettime(CLOCK_MONOTONIC_DARWIN, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+var trace_t0: u64 = 0;
+fn traceMs() u64 {
+    const ms = clockNs() / 1_000_000;
+    if (trace_t0 == 0) trace_t0 = ms;
+    return ms - trace_t0;
+}
+fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (traceOn()) std.debug.print("zicro-cocoa[{d}ms]: " ++ fmt ++ "\n", .{traceMs()} ++ args);
+}
+
 // --- the content view subclass (runtime-built, drawRect: presents the framebuffer) -------
 
 /// view instance → Window lookup for `drawRect:` (main-thread only, tiny fixed table).
@@ -246,9 +288,10 @@ fn imp_yes(_: id, _: SEL) callconv(.c) bool {
     return true;
 }
 
-fn imp_drawRect(view: id, _: SEL, _: CGRect) callconv(.c) void {
+fn imp_drawRect(view: id, _: SEL, rect: CGRect) callconv(.c) void {
     const win_ptr = windowForView(view) orelse return;
     if (builtin.os.tag == .macos) {
+        trace("drawRect ({d},{d} {d}x{d})", .{ rect.origin.x, rect.origin.y, rect.size.width, rect.size.height });
         const self: *Window = @ptrCast(@alignCast(win_ptr));
         self.drawIntoCurrentContext();
     }
@@ -387,14 +430,31 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     }
 
     /// Called from `drawRect:` — wrap the framebuffer in a CGImage and draw it over the
-    /// view bounds through the *current* graphics context. The context of a non-flipped
-    /// view is standard y-up CG space, where `CGContextDrawImage` renders the image
-    /// upright (row 0 at the visual top) with no extra transform.
+    /// view bounds through the *current* graphics context. The view is flipped (top-left,
+    /// y down — see `ensureViewClass`), and `CGContextDrawImage` composes in CG's y-up
+    /// space, so the CTM is flipped around the buffer height for the draw: image row 0
+    /// lands at the visual top on real AppKit and Cocotron alike.
     fn drawIntoCurrentContext(self: *Window) void {
         const nsctx = msgId(class("NSGraphicsContext"), "currentContext") orelse return;
         const ctx = msgId(nsctx, "graphicsPort") orelse return;
+        if (traceOn() and getenv("ZICRO_COCOA_FILL") != null) {
+            // Diagnostic lane isolator: a plain vector fill, no CGImage involved. If this
+            // shows up where the image did not, the blit path is the culprit.
+            CGContextSetRGBFillColor(ctx, 1, 0, 0, 1);
+            CGContextFillRect(ctx, .{ .origin = .{ .x = 50, .y = 50 }, .size = .{ .width = 400, .height = 200 } });
+            return;
+        }
         sync.lock(&self.mutex, self.io);
         defer sync.unlock(&self.mutex, self.io);
+
+        // Present through the CG draw pipeline (CGContextDrawImage). We do NOT memcpy into
+        // CGBitmapContextGetData(ctx): under Darling's Onyx2D that returns a scratch/back
+        // buffer that is NOT the surface flushWindow ships, so raw writes there never
+        // reach the presented window (verified: the rows land in `base` but the window
+        // stays blank, while a plain CGContextFillRect on the same ctx DOES show — the
+        // pipeline composites into the real surface, the GetData pointer does not).
+        // On real macOS the window context isn't a bitmap context anyway, so this was
+        // always the effective path there.
         const cs = CGColorSpaceCreateDeviceRGB();
         defer CGColorSpaceRelease(cs);
         const bytes = std.mem.sliceAsBytes(self.pixels);
@@ -408,12 +468,16 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         }, image);
     }
 
-    /// Mark the view dirty and run its display cycle now. We drive our own loop (no
-    /// NSRunLoop), so nothing else would flush the dirty rect.
+    /// Run the view's display cycle now, unconditionally, then flush the window backing
+    /// to the server. We drive our own loop (no NSRunLoop) and Cocotron's needsDisplay
+    /// bookkeeping proved unreliable from outside one (`setNeedsDisplay:` +
+    /// `displayIfNeeded` yielded two draws per session under zart); `display` skips the
+    /// dirty tracking but — on Cocotron — draws only into the backing, so the explicit
+    /// `flushWindow` is what actually ships the frame.
     fn present(self: *Window) void {
         const view = self.view orelse return;
-        msgVoidBool(view, "setNeedsDisplay:", true);
-        if (self.win) |w| msgVoid(w, "displayIfNeeded");
+        msgVoid(view, "display");
+        if (self.win) |w| msgVoid(w, "flushWindow");
     }
 
     /// Track the content view size; on change, reallocate the framebuffer.
@@ -435,13 +499,17 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
 
     pub fn run(self: *Window) !void {
         const app = self.app orelse return;
+        trace("run: finishLaunching", .{});
         msgVoid(app, "finishLaunching");
         const distant_past = msgId(class("NSDate"), "distantPast");
         const default_mode = nsString("kCFRunLoopDefaultMode");
         const nextEvent: *const fn (id, SEL, u64, id, id, bool) callconv(.c) id = @ptrCast(&objc_msgSend);
         const next_sel = sel_registerName("nextEventMatchingMask:untilDate:inMode:dequeue:");
+        var frames: u64 = 0;
 
         while (!self.closed) {
+            const fine = frames < 5; // per-stage trace on the first frames only
+            if (fine) trace("frame {d}: drain", .{frames});
             // Drain all pending events without blocking (untilDate: distantPast).
             while (true) {
                 const ev = nextEvent(app, next_sel, event_mask_any, distant_past, default_mode, true);
@@ -450,6 +518,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
                 const send: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
                 send(app, sel_registerName("sendEvent:"), ev);
             }
+            if (fine) trace("frame {d}: drained", .{frames});
             // The user closed the window (red button) → the window is no longer visible.
             // A miniaturized window also reports !isVisible, so check it too — minimizing
             // must not quit the app.
@@ -459,6 +528,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
             if (self.closed) break;
 
             self.syncSize();
+            if (fine) trace("frame {d}: size synced", .{frames});
 
             if (self.opts.on_tick) |tick| {
                 const interval_ns = @as(u64, @max(self.opts.tick_ms, 1)) * std.time.ns_per_ms;
@@ -475,27 +545,38 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
                 var canvas = paint.Canvas.init(self.pixels, self.width, self.height);
                 const content = window.Rect{ .x = 0, .y = 0, .w = @intCast(self.width), .h = @intCast(self.height) };
                 draw(&canvas, content, self.opts.user);
+                if (traceOn() and getenv("ZICRO_COCOA_PROBE") != null) self.paintProbe();
                 sync.unlock(&self.mutex, self.io);
             }
+            if (fine) trace("frame {d}: drawn", .{frames});
             self.present();
+            frames += 1;
+            if (frames <= 5 or frames % 120 == 0) trace("frame {d} presented ({d}x{d})", .{ frames, self.width, self.height });
 
             msgVoid(app, "updateWindows");
+            if (fine) trace("frame {d}: updateWindows done, sleeping", .{frames});
             sync.sleepNs(self.io, 16 * std.time.ns_per_ms); // ~60 FPS pacing
         }
     }
 
-    /// Monotonic nanoseconds via raw libc (std.time timestamps live behind std.Io in Zig
-    /// 0.16; tick pacing only needs a raw monotonic clock — same idiom as the Wayland
-    /// backend's `nowMs`).
-    const Timespec = extern struct { sec: i64, nsec: i64 };
-    const CLOCK_MONOTONIC_DARWIN: c_int = 6;
-    extern "c" fn clock_gettime(clockid: c_int, tp: *Timespec) c_int;
-
-    fn nowNs() u64 {
-        var ts: Timespec = undefined;
-        if (clock_gettime(CLOCK_MONOTONIC_DARWIN, &ts) != 0) return 0;
-        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    /// ZICRO_COCOA_PROBE=1 (with trace on): overwrite the frame with an orientation
+    /// calibration pattern — red band at the TOP, green band at the BOTTOM, blue band on
+    /// the LEFT, gray elsewhere. One snapshot then reveals the present transform.
+    fn paintProbe(self: *Window) void {
+        const w = self.width;
+        const h = self.height;
+        for (0..h) |y| {
+            for (0..w) |x| {
+                const px: u32 = if (y < 100) 0xFFFF0000 // top → red
+                else if (y >= h - 100) 0xFF00FF00 // bottom → green
+                else if (x < 100) 0xFF0000FF // left → blue
+                else 0xFF808080;
+                self.pixels[y * w + x] = px;
+            }
+        }
     }
+
+    const nowNs = clockNs;
 
     // --- input dispatch -----------------------------------------------------------------
 

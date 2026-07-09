@@ -136,16 +136,43 @@ pub const Theme = struct {
     focus_ring: Color,
     danger: Color,
     dim_overlay: Color,
+    /// Riempimento di pomelli/thumb (slider/toggle/scrollbar): alto contrasto in entrambi i modi.
+    knob: Color,
 
+    // --- geometria: token in px LOGICI @ scale 1; `scaled(f)` li porta a pixel nativi. ---
+    // Tutte le misure dei widget derivano da qui o da `s(px)` → scalabilità 1:1 su HiDPI.
+    /// Fattore display corrente (impostato da `scaled`). `s(px) = px * scale`.
+    scale: f32 = 1,
     window_pad: f32 = 14,
     gap: f32 = 8,
     pad_x: f32 = 12,
     radius: f32 = 7,
+    /// Altezza standard di un controllo (target ergonomico; 30 desktop denso, scala su touch).
     ctl_h: f32 = 30,
     check_size: f32 = 18,
+    /// Spessore di riferimento per bordi/segni (check, spunte).
+    stroke: f32 = 1.5,
+    caret_w: f32 = 1.5,
+    /// Diametro del pomello di slider/toggle.
+    knob_d: f32 = 16,
+    toggle_w: f32 = 42,
+    toggle_h: f32 = 24,
+    /// Spessore della traccia di progress/slider.
+    bar_h: f32 = 8,
+    scrollbar_w: f32 = 6,
+    scrollbar_thumb_min: f32 = 28,
+    dialog_title_h: f32 = 44,
+    /// Dimensione dei glifi/chevron disegnati a mano.
+    icon: f32 = 16,
+    tooltip_pad: f32 = 8,
     font_size: u16 = 15,
     font_small: u16 = 13,
     font_heading: u16 = 19,
+
+    /// Scala una misura in px logici al fattore display corrente (per i letterali residui).
+    pub fn s(t: Theme, px: f32) f32 {
+        return px * t.scale;
+    }
 
     pub fn dark() Theme {
         return .{
@@ -161,6 +188,7 @@ pub const Theme = struct {
             .focus_ring = Color.rgba(112, 156, 255, 0.85),
             .danger = Color.rgba(245, 120, 120, 0.95),
             .dim_overlay = Color.rgba(8, 10, 16, 0.42),
+            .knob = Color.rgba(255, 255, 255, 0.95),
         };
     }
 
@@ -168,17 +196,29 @@ pub const Theme = struct {
     /// fractional scale (`win.scaleFactor()`) so widgets keep their visual size on
     /// HiDPI outputs while rendering at native (crisp) pixels.
     pub fn scaled(t: Theme, f: f32) Theme {
-        var s = t;
-        s.window_pad *= f;
-        s.gap *= f;
-        s.pad_x *= f;
-        s.radius *= f;
-        s.ctl_h *= f;
-        s.check_size *= f;
-        s.font_size = scaleFont(t.font_size, f);
-        s.font_small = scaleFont(t.font_small, f);
-        s.font_heading = scaleFont(t.font_heading, f);
-        return s;
+        var r = t;
+        r.scale = t.scale * f;
+        r.window_pad *= f;
+        r.gap *= f;
+        r.pad_x *= f;
+        r.radius *= f;
+        r.ctl_h *= f;
+        r.check_size *= f;
+        r.stroke *= f;
+        r.caret_w *= f;
+        r.knob_d *= f;
+        r.toggle_w *= f;
+        r.toggle_h *= f;
+        r.bar_h *= f;
+        r.scrollbar_w *= f;
+        r.scrollbar_thumb_min *= f;
+        r.dialog_title_h *= f;
+        r.icon *= f;
+        r.tooltip_pad *= f;
+        r.font_size = scaleFont(t.font_size, f);
+        r.font_small = scaleFont(t.font_small, f);
+        r.font_heading = scaleFont(t.font_heading, f);
+        return r;
     }
 
     fn scaleFont(px: u16, f: f32) u16 {
@@ -200,6 +240,7 @@ pub const Theme = struct {
             .focus_ring = Color.rgba(56, 108, 235, 0.85),
             .danger = Color.rgba(205, 60, 60, 0.95),
             .dim_overlay = Color.rgba(20, 24, 34, 0.30),
+            .knob = Color.rgba(255, 255, 255, 0.98),
         };
     }
 };
@@ -219,6 +260,9 @@ pub const OsClipboard = struct {
     set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     get: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 = null,
 };
+
+/// Valore d'animazione retained con stamp di generazione (per il pruning delle entry stale).
+const AnimEntry = struct { v: f32, gen: u64 };
 
 /// Everything that must survive between frames. One per UI surface (window/panel).
 pub const Store = struct {
@@ -293,8 +337,11 @@ pub const Store = struct {
     /// spinners/bars (stays small, unlike epoch ms, so f32 keeps precision).
     phase_s: f32 = 0,
 
-    anims: std.AutoHashMapUnmanaged(Id, f32) = .empty,
+    /// Valore d'animazione + generazione dell'ultimo frame in cui è stato toccato (per il GC).
+    anims: std.AutoHashMapUnmanaged(Id, AnimEntry) = .empty,
     scrolls: std.AutoHashMapUnmanaged(Id, f32) = .empty,
+    /// Contatore di frame monotono; le entry `anims` con `gen` diverso vengono potate in `end()`.
+    frame_gen: u64 = 0,
 
     last_now_ms: i64 = 0,
 
@@ -394,6 +441,7 @@ pub const Ui = struct {
             std.math.clamp(@as(f32, @floatFromInt(now_ms - store.last_now_ms)) / 1000.0, 0.0, 0.1);
         store.last_now_ms = now_ms;
         store.phase_s += dt;
+        store.frame_gen +%= 1; // stamp del frame per il GC delle animazioni
 
         // Reset frame-scoped input, aggregate the event slice.
         store.mouse_dx = 0;
@@ -630,6 +678,21 @@ pub const Ui = struct {
         if (ui.store.left_pressed and ui.store.active == 0) ui.store.active = ground_id;
         if (ui.store.left_released) ui.store.active = 0;
 
+        // GC: pota le animazioni non toccate in questo frame (id transitori di liste dinamiche non
+        // gonfiano più la mappa). Fino a 64 rimozioni/frame → convergenza graduale, costo O(vive).
+        {
+            var stale: [64]Id = undefined;
+            var n: usize = 0;
+            var it = ui.store.anims.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.gen != ui.store.frame_gen and n < stale.len) {
+                    stale[n] = e.key_ptr.*;
+                    n += 1;
+                }
+            }
+            for (stale[0..n]) |k| _ = ui.store.anims.remove(k);
+        }
+
         _ = ui.store.arena.reset(.retain_capacity);
 
         const busy = ui.animating or ui.store.focus != 0 or (ui.store.active > ground_id) or ui.store.dd_open != 0;
@@ -802,8 +865,10 @@ pub const Ui = struct {
 
     /// Focus ring around a Tab-focused control.
     fn focusRing(ui: *Ui, id: Id, r: Rect, radius: f32) void {
-        if (ui.store.focus == id and !ui.store.focus_is_text)
-            ui.canvas.strokeRoundedRect(r.x - 1.5, r.y - 1.5, r.w + 3, r.h + 3, radius + 1.5, 1.5, ui.theme.focus_ring);
+        if (ui.store.focus == id and !ui.store.focus_is_text) {
+            const o = ui.theme.s(1.5);
+            ui.canvas.strokeRoundedRect(r.x - o, r.y - o, r.w + 2 * o, r.h + 2 * o, radius + o, ui.theme.stroke, ui.theme.focus_ring);
+        }
     }
 
     pub fn interact(ui: *Ui, id: Id, rect: Rect) Sig {
@@ -831,12 +896,12 @@ pub const Ui = struct {
 
     /// Animated 0..1 hover factor for `id` (frame-rate independent).
     fn hoverT(ui: *Ui, id: Id, hovered: bool) f32 {
-        const old = ui.store.anims.get(id) orelse 0;
+        const s = ui.store;
+        const old = if (s.anims.get(id)) |e| e.v else 0;
         const new = anim.approach(old, hovered, ui.dt);
-        if (new != old) {
-            ui.store.anims.put(ui.store.gpa, id, new) catch return new;
-            ui.animating = true;
-        }
+        // Stampa sempre (anche se invariato) così l'entry resta "viva" e non viene potata.
+        s.anims.put(s.gpa, id, .{ .v = new, .gen = s.frame_gen }) catch return new;
+        if (new != old) ui.animating = true;
         return new;
     }
 
@@ -919,7 +984,7 @@ pub const Ui = struct {
         if (sig.held) bg = if (primary) lerpColor(t.accent, t.bg_widget_active, 0.3) else t.bg_widget_active;
         if (primary and !sig.held) bg = lerpColor(bg, Color.rgba(255, 255, 255, bg.a), 0.12 * ht);
         ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, bg);
-        if (!primary) ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, 1, t.border);
+        if (!primary) ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, t.s(1), t.border);
         ui.focusRing(id, r, t.radius);
         ui.drawTextIn(r, label_, .center, t.font_size, .regular, if (primary) t.accent_text else t.text);
         return sig.clicked;
@@ -952,7 +1017,8 @@ pub const Ui = struct {
         const t = ui.theme;
         const id = ui.makeId(label_);
         const box = t.check_size;
-        const w = box + 8 + ui.measureText(label_, t.font_size, .regular);
+        const rad = t.s(5);
+        const w = box + t.gap + ui.measureText(label_, t.font_size, .regular);
         const r = ui.allocRect(w, t.ctl_h);
         ui.navFocusHook(id, false);
         var sig = ui.interact(id, r);
@@ -962,18 +1028,18 @@ pub const Ui = struct {
 
         const by = r.y + (r.h - box) / 2;
         const bg = if (value.*) t.accent else lerpColor(t.bg_widget, t.bg_widget_hot, ht);
-        ui.canvas.fillRoundedRect(r.x, by, box, box, 5, bg);
-        if (!value.*) ui.canvas.strokeRoundedRect(r.x, by, box, box, 5, 1, t.border);
-        ui.focusRing(id, .{ .x = r.x, .y = by, .w = box, .h = box }, 5);
+        ui.canvas.fillRoundedRect(r.x, by, box, box, rad, bg);
+        if (!value.*) ui.canvas.strokeRoundedRect(r.x, by, box, box, rad, t.s(1), t.border);
+        ui.focusRing(id, .{ .x = r.x, .y = by, .w = box, .h = box }, rad);
         if (value.*) {
             const cx = r.x;
             const cy = by;
-            ui.canvas.strokeSegment(cx + box * 0.24, cy + box * 0.52, cx + box * 0.44, cy + box * 0.72, 2, t.accent_text);
-            ui.canvas.strokeSegment(cx + box * 0.44, cy + box * 0.72, cx + box * 0.78, cy + box * 0.30, 2, t.accent_text);
+            ui.canvas.strokeSegment(cx + box * 0.24, cy + box * 0.52, cx + box * 0.44, cy + box * 0.72, t.s(2), t.accent_text);
+            ui.canvas.strokeSegment(cx + box * 0.44, cy + box * 0.72, cx + box * 0.78, cy + box * 0.30, t.s(2), t.accent_text);
         }
         var lr = r;
-        lr.x += box + 8;
-        lr.w -= box + 8;
+        lr.x += box + t.gap;
+        lr.w -= box + t.gap;
         ui.drawTextIn(lr, label_, .left, t.font_size, .regular, t.text);
         return sig.clicked;
     }
@@ -981,9 +1047,9 @@ pub const Ui = struct {
     pub fn toggle(ui: *Ui, label_: []const u8, value: *bool) bool {
         const t = ui.theme;
         const id = ui.makeId(label_);
-        const pill_w: f32 = 40;
-        const pill_h: f32 = 22;
-        const w = pill_w + 8 + ui.measureText(label_, t.font_size, .regular);
+        const pill_w = t.toggle_w;
+        const pill_h = t.toggle_h;
+        const w = pill_w + t.gap + ui.measureText(label_, t.font_size, .regular);
         const r = ui.allocRect(w, t.ctl_h);
         ui.navFocusHook(id, false);
         var sig = ui.interact(id, r);
@@ -994,14 +1060,15 @@ pub const Ui = struct {
         const py = r.y + (r.h - pill_h) / 2;
         const bg = lerpColor(ui.theme.bg_widget, t.accent, anim.cubicOut(on_t));
         ui.canvas.fillRoundedRect(r.x, py, pill_w, pill_h, pill_h / 2, bg);
-        ui.canvas.strokeRoundedRect(r.x, py, pill_w, pill_h, pill_h / 2, 1, t.border);
+        ui.canvas.strokeRoundedRect(r.x, py, pill_w, pill_h, pill_h / 2, t.s(1), t.border);
         ui.focusRing(id, .{ .x = r.x, .y = py, .w = pill_w, .h = pill_h }, pill_h / 2);
-        const knob_r = pill_h - 6;
-        const kx = r.x + 3 + anim.cubicOut(on_t) * (pill_w - knob_r - 6);
-        ui.canvas.fillRoundedRect(kx, py + 3, knob_r, knob_r, knob_r / 2, Color.rgba(255, 255, 255, 0.95));
+        const m = (pill_h - t.knob_d) / 2; // margine ergonomico del pomello dentro la pill
+        const kx = r.x + m + anim.cubicOut(on_t) * (pill_w - t.knob_d - 2 * m);
+        ui.canvas.fillRoundedRect(kx, py + m, t.knob_d, t.knob_d, t.knob_d / 2, t.knob);
+        ui.canvas.strokeRoundedRect(kx, py + m, t.knob_d, t.knob_d, t.knob_d / 2, t.s(1), t.border); // definizione in light mode
         var lr = r;
-        lr.x += pill_w + 8;
-        lr.w -= pill_w + 8;
+        lr.x += pill_w + t.gap;
+        lr.w -= pill_w + t.gap;
         ui.drawTextIn(lr, label_, .left, t.font_size, .regular, t.text);
         return sig.clicked;
     }
@@ -1012,7 +1079,7 @@ pub const Ui = struct {
         const t = ui.theme;
         const id = ui.makeId(label_);
         const d = t.check_size;
-        const w = d + 8 + ui.measureText(label_, t.font_size, .regular);
+        const w = d + t.gap + ui.measureText(label_, t.font_size, .regular);
         const r = ui.allocRect(w, t.ctl_h);
         ui.navFocusHook(id, false);
         var sig = ui.interact(id, r);
@@ -1028,15 +1095,15 @@ pub const Ui = struct {
         const cy = r.y + (r.h - d) / 2;
         const bg = if (on) t.accent else lerpColor(t.bg_widget, t.bg_widget_hot, ht);
         ui.canvas.fillRoundedRect(r.x, cy, d, d, d / 2, bg);
-        if (!on) ui.canvas.strokeRoundedRect(r.x, cy, d, d, d / 2, 1, t.border);
+        if (!on) ui.canvas.strokeRoundedRect(r.x, cy, d, d, d / 2, t.s(1), t.border);
         ui.focusRing(id, .{ .x = r.x, .y = cy, .w = d, .h = d }, d / 2);
         if (on) {
             const dot = d * 0.4;
             ui.canvas.fillRoundedRect(r.x + (d - dot) / 2, cy + (d - dot) / 2, dot, dot, dot / 2, t.accent_text);
         }
         var lr = r;
-        lr.x += d + 8;
-        lr.w -= d + 8;
+        lr.x += d + t.gap;
+        lr.w -= d + t.gap;
         ui.drawTextIn(lr, label_, .left, t.font_size, .regular, t.text);
         return changed;
     }
@@ -1046,7 +1113,7 @@ pub const Ui = struct {
     /// Determinate progress bar across the available width; `frac` clamped 0..1.
     pub fn progressBar(ui: *Ui, frac: f32) void {
         const t = ui.theme;
-        const h: f32 = 8;
+        const h = t.bar_h;
         const r = ui.allocRect(ui.availW(), h);
         ui.canvas.fillProgressBar(r.x, r.y, r.w, r.h, h / 2, frac, t.bg_widget, t.accent);
     }
@@ -1054,7 +1121,7 @@ pub const Ui = struct {
     /// Indeterminate sweep; keeps the frame loop alive while visible.
     pub fn progressIndeterminate(ui: *Ui) void {
         const t = ui.theme;
-        const h: f32 = 8;
+        const h = t.bar_h;
         const r = ui.allocRect(ui.availW(), h);
         ui.canvas.fillProgressBarIndeterminate(r.x, r.y, r.w, r.h, h / 2, ui.store.phase_s, t.bg_widget, t.accent);
         ui.animating = true;
@@ -1065,7 +1132,7 @@ pub const Ui = struct {
         const t = ui.theme;
         const d = t.ctl_h;
         const r = ui.allocRect(d, d);
-        ui.canvas.drawSpinner(r.x + d / 2, r.y + d / 2, d / 2 - 3, 2.5, ui.store.phase_s, t.accent);
+        ui.canvas.drawSpinner(r.x + d / 2, r.y + d / 2, d / 2 - t.s(3), t.s(2.5), ui.store.phase_s, t.accent);
         ui.animating = true;
     }
 
@@ -1074,7 +1141,7 @@ pub const Ui = struct {
     pub fn slider(ui: *Ui, label_: []const u8, value: *f32, min: f32, max: f32) bool {
         const t = ui.theme;
         const id = ui.makeId(label_);
-        const label_w = if (label_.len > 0) ui.measureText(label_, t.font_size, .regular) + 10 else 0;
+        const label_w = if (label_.len > 0) ui.measureText(label_, t.font_size, .regular) + t.s(10) else 0;
         const r = ui.allocRect(ui.availW(), t.ctl_h);
         if (label_.len > 0) {
             var lr = r;
@@ -1110,13 +1177,16 @@ pub const Ui = struct {
         }
         const ht = ui.hoverT(id, sig.hovered or sig.held);
         const vt = if (max > min) std.math.clamp((value.* - min) / (max - min), 0, 1) else 0;
-        const ty = r.y + r.h / 2 - 3;
-        ui.canvas.fillRoundedRect(track.x, ty, track.w, 6, 3, t.bg_widget);
-        ui.canvas.fillRoundedRect(track.x, ty, track.w * vt, 6, 3, t.accent);
-        const knob: f32 = 14 + 2 * ht;
+        const bh = t.bar_h;
+        const ty = r.y + r.h / 2 - bh / 2;
+        ui.canvas.fillRoundedRect(track.x, ty, track.w, bh, bh / 2, t.bg_widget);
+        ui.canvas.fillRoundedRect(track.x, ty, track.w * vt, bh, bh / 2, t.accent);
+        const knob: f32 = t.knob_d + t.s(2) * ht; // cresce leggermente all'hover/drag
         const kx = track.x + track.w * vt - knob / 2;
-        ui.canvas.fillRoundedRect(kx, r.y + (r.h - knob) / 2, knob, knob, knob / 2, Color.rgba(255, 255, 255, 0.95));
-        ui.focusRing(id, .{ .x = kx, .y = r.y + (r.h - knob) / 2, .w = knob, .h = knob }, knob / 2);
+        const ky = r.y + (r.h - knob) / 2;
+        ui.canvas.fillRoundedRect(kx, ky, knob, knob, knob / 2, t.knob);
+        ui.canvas.strokeRoundedRect(kx, ky, knob, knob, knob / 2, t.s(1), t.border);
+        ui.focusRing(id, .{ .x = kx, .y = ky, .w = knob, .h = knob }, knob / 2);
         return changed;
     }
 
@@ -1126,14 +1196,15 @@ pub const Ui = struct {
         ui.pushIdScope(label_);
         defer ui.popIdScope();
 
+        const val_w = t.s(64); // larghezza colonna valore
         const r = ui.allocRect(ui.availW(), t.ctl_h);
         var lr = r;
-        lr.w = r.w - (2 * t.ctl_h + 64 + 2 * ui.theme.gap);
+        lr.w = r.w - (2 * t.ctl_h + val_w + 2 * ui.theme.gap);
         ui.drawTextIn(lr, label_, .left, t.font_size, .regular, t.text);
 
         var changed = false;
         const minus = Rect{ .x = r.x + lr.w, .y = r.y, .w = t.ctl_h, .h = t.ctl_h };
-        const valr = Rect{ .x = minus.x + t.ctl_h + ui.theme.gap, .y = r.y, .w = 64 - 2 * ui.theme.gap, .h = t.ctl_h };
+        const valr = Rect{ .x = minus.x + t.ctl_h + ui.theme.gap, .y = r.y, .w = val_w - 2 * ui.theme.gap, .h = t.ctl_h };
         const plus = Rect{ .x = valr.x + valr.w + ui.theme.gap, .y = r.y, .w = t.ctl_h, .h = t.ctl_h };
 
         if (ui.squareButton(minus, "-") and value.* > min) {
@@ -1158,7 +1229,7 @@ pub const Ui = struct {
         var bg = lerpColor(t.bg_widget, t.bg_widget_hot, ht);
         if (sig.held) bg = t.bg_widget_active;
         ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, bg);
-        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, 1, t.border);
+        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, t.s(1), t.border);
         ui.drawTextIn(r, glyph, .center, t.font_size, .bold, t.text);
         return sig.clicked;
     }
@@ -1219,12 +1290,12 @@ pub const Ui = struct {
         const ht = ui.hoverT(id, sig.hovered);
         ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, lerpColor(t.bg_widget, t.bg_widget_hot, ht * 0.6));
         const ring = if (s.focus == id) t.focus_ring else t.border;
-        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, if (s.focus == id) 1.5 else 1, ring);
+        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, if (s.focus == id) t.stroke else t.s(1), ring);
 
         const saved = ui.canvas.setClip(
-            @intFromFloat(@max(0, r.x + 2)),
+            @intFromFloat(@max(0, r.x + t.s(2))),
             @intFromFloat(@max(0, r.y)),
-            @intFromFloat(@max(0, r.w - 4)),
+            @intFromFloat(@max(0, r.w - t.s(4))),
             @intFromFloat(@max(0, r.h)),
         );
         defer ui.canvas.clip = saved;
@@ -1240,7 +1311,7 @@ pub const Ui = struct {
             const sel_h: f32 = @floatFromInt(v.ascent - v.descent);
             var sc = t.accent;
             sc.a *= 0.35;
-            ui.canvas.fillRoundedRect(x0, r.y + (r.h - sel_h) / 2, x1 - x0, sel_h, 2, sc);
+            ui.canvas.fillRoundedRect(x0, r.y + (r.h - sel_h) / 2, x1 - x0, sel_h, t.s(2), sc);
         };
 
         ui.drawTextIn(inner, buf.items, .left, t.font_size, .regular, t.text);
@@ -1250,7 +1321,7 @@ pub const Ui = struct {
             const v = ui.font.vmetrics(t.font_size, .regular);
             const text_h: f32 = @floatFromInt(v.ascent - v.descent);
             const cy0 = r.y + (r.h - text_h) / 2;
-            ui.canvas.strokeSegment(cx, cy0, cx, cy0 + text_h, 1.4, t.text);
+            ui.canvas.strokeSegment(cx, cy0, cx, cy0 + text_h, t.caret_w, t.text);
         }
         return result;
     }
@@ -1269,7 +1340,7 @@ pub const Ui = struct {
         const sig = ui.interact(id, r);
         const focused = s.focus == id;
         const line_h: f32 = @floatFromInt(ui.font.lineHeight(t.font_size, .regular));
-        const pad_y: f32 = 6;
+        const pad_y: f32 = t.s(6);
 
         var off = s.scrolls.get(id) orelse 0;
 
@@ -1333,13 +1404,13 @@ pub const Ui = struct {
         const ht = ui.hoverT(id, sig.hovered);
         ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, lerpColor(t.bg_widget, t.bg_widget_hot, ht * 0.6));
         const ring = if (s.focus == id) t.focus_ring else t.border;
-        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, if (s.focus == id) 1.5 else 1, ring);
+        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius, if (s.focus == id) t.stroke else t.s(1), ring);
 
         const saved = ui.canvas.setClip(
-            @intFromFloat(@max(0, r.x + 2)),
-            @intFromFloat(@max(0, r.y + 2)),
-            @intFromFloat(@max(0, r.w - 4)),
-            @intFromFloat(@max(0, r.h - 4)),
+            @intFromFloat(@max(0, r.x + t.s(2))),
+            @intFromFloat(@max(0, r.y + t.s(2))),
+            @intFromFloat(@max(0, r.w - t.s(4))),
+            @intFromFloat(@max(0, r.h - t.s(4))),
         );
         defer ui.canvas.clip = saved;
 
@@ -1364,17 +1435,17 @@ pub const Ui = struct {
                     if (hi > lo or (se[0] <= le and se[1] > le)) {
                         const x0 = lx + ui.measureText(buf.items[ls..lo], t.font_size, .regular);
                         var x1 = lx + ui.measureText(buf.items[ls..hi], t.font_size, .regular);
-                        if (se[1] > le) x1 += 5;
+                        if (se[1] > le) x1 += t.s(5);
                         var sc = t.accent;
                         sc.a *= 0.35;
-                        ui.canvas.fillRoundedRect(x0, y + (line_h - text_h) / 2, x1 - x0, text_h, 2, sc);
+                        ui.canvas.fillRoundedRect(x0, y + (line_h - text_h) / 2, x1 - x0, text_h, t.s(2), sc);
                     }
                 }
                 ui.drawTextIn(lrect, buf.items[ls..le], .left, t.font_size, .regular, t.text);
                 if (blink and s.text_cursor >= ls and s.text_cursor <= le) {
                     const cx = lx + ui.measureText(buf.items[ls..s.text_cursor], t.font_size, .regular);
                     const cy0 = y + (line_h - text_h) / 2;
-                    ui.canvas.strokeSegment(cx, cy0, cx, cy0 + text_h, 1.4, t.text);
+                    ui.canvas.strokeSegment(cx, cy0, cx, cy0 + text_h, t.caret_w, t.text);
                 }
             }
             if (le >= buf.items.len) break;
@@ -1384,11 +1455,11 @@ pub const Ui = struct {
 
         // Thin scrollbar like the scroll area's.
         if (max_off > 0) {
-            const track_h = r.h - 4;
+            const track_h = r.h - t.s(4);
             const content_h = n_lines * line_h + 2 * pad_y;
-            const thumb_h = @max(24, track_h * r.h / content_h);
-            const ty = r.y + 2 + (track_h - thumb_h) * (off / max_off);
-            ui.canvas.fillRoundedRect(r.x + r.w - 6, ty, 4, thumb_h, 2, Color.rgba(255, 255, 255, if (sig.hovered) 0.35 else 0.18));
+            const thumb_h = @max(t.scrollbar_thumb_min, track_h * r.h / content_h);
+            const ty = r.y + t.s(2) + (track_h - thumb_h) * (off / max_off);
+            ui.canvas.fillRoundedRect(r.x + r.w - t.scrollbar_w, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, if (sig.hovered) 0.35 else 0.18));
         }
         return result;
     }
@@ -1433,7 +1504,7 @@ pub const Ui = struct {
         }
         // Ordered stream: chars and editing keys interleave exactly as they arrived.
         for (s.text_ops[0..s.text_ops_len]) |op| switch (op) {
-            .char => |c| if (s.ctrl_down) switch (c) {
+            .char => |c| if (s.ctrl_down) switch (std.ascii.toLower(c)) {
                 'a' => {
                     s.text_anchor = 0;
                     s.text_cursor = buf.items.len;
@@ -1682,45 +1753,47 @@ pub const Ui = struct {
         ui.focusRing(id, r, t.radius);
         var inner = r;
         inner.x += t.pad_x;
-        inner.w -= 2 * t.pad_x + 16;
+        inner.w -= 2 * t.pad_x + t.icon;
         const current = if (options.len > 0) options[selected.*] else "";
         ui.drawTextIn(inner, current, .left, t.font_size, .regular, t.text);
-        // chevron
-        const cxm = r.x + r.w - t.pad_x - 5;
-        const cym = r.y + r.h / 2 - 2;
-        ui.canvas.strokeSegment(cxm - 4, cym, cxm, cym + 4, 1.6, t.text_dim);
-        ui.canvas.strokeSegment(cxm, cym + 4, cxm + 4, cym, 1.6, t.text_dim);
+        // chevron ▾
+        const cxm = r.x + r.w - t.pad_x - t.s(5);
+        const cym = r.y + r.h / 2 - t.s(2);
+        const ca = t.s(4);
+        ui.canvas.strokeSegment(cxm - ca, cym, cxm, cym + ca, t.s(1.6), t.text_dim);
+        ui.canvas.strokeSegment(cxm, cym + ca, cxm + ca, cym, t.s(1.6), t.text_dim);
 
         if (s.dd_open == id) {
             // Register the overlay: geometry now (for end()'s pixels AND next frame's
             // input pre-pass), pixels later.
-            const content_h = @as(f32, @floatFromInt(options.len)) * t.ctl_h + 8;
-            const oh = @min(content_h, @max(t.ctl_h + 8, @min(320, ui.bounds.h - 8)));
-            var oy = r.y + r.h + 4;
-            if (oy + oh > ui.bounds.y + ui.bounds.h) oy = @max(ui.bounds.y, r.y - oh - 4);
+            const pad = t.s(4);
+            const content_h = @as(f32, @floatFromInt(options.len)) * t.ctl_h + 2 * pad;
+            const oh = @min(content_h, @max(t.ctl_h + 2 * pad, @min(t.s(320), ui.bounds.h - t.s(8))));
+            var oy = r.y + r.h + pad;
+            if (oy + oh > ui.bounds.y + ui.bounds.h) oy = @max(ui.bounds.y, r.y - oh - pad);
             const orect = Rect{ .x = r.x, .y = oy, .w = r.w, .h = oh };
 
             // Long lists scroll inside the panel; keep the keyboard highlight in view.
             const max_scroll = @max(0, content_h - oh);
             if (s.dd_ensure_visible) {
                 if (s.dd_hover) |hi| {
-                    const iy = 4 + @as(f32, @floatFromInt(hi)) * t.ctl_h; // content-space top
-                    if (iy - s.dd_scroll < 4) s.dd_scroll = iy - 4;
-                    if (iy + t.ctl_h - s.dd_scroll > oh - 4) s.dd_scroll = iy + t.ctl_h - (oh - 4);
+                    const iy = pad + @as(f32, @floatFromInt(hi)) * t.ctl_h; // content-space top
+                    if (iy - s.dd_scroll < pad) s.dd_scroll = iy - pad;
+                    if (iy + t.ctl_h - s.dd_scroll > oh - pad) s.dd_scroll = iy + t.ctl_h - (oh - pad);
                 }
                 s.dd_ensure_visible = false;
             }
             s.dd_scroll = std.math.clamp(s.dd_scroll, 0, max_scroll);
-            const gutter: f32 = if (max_scroll > 0) 6 else 0;
+            const gutter: f32 = if (max_scroll > 0) t.scrollbar_w else 0;
 
             s.dd_owner = r;
             s.dd_panel = orect;
             s.dd_rects.clearRetainingCapacity();
             for (options, 0..) |_, i| {
                 s.dd_rects.append(s.gpa, .{
-                    .x = orect.x + 4,
-                    .y = orect.y + 4 + @as(f32, @floatFromInt(i)) * t.ctl_h - s.dd_scroll,
-                    .w = orect.w - 8 - gutter,
+                    .x = orect.x + pad,
+                    .y = orect.y + pad + @as(f32, @floatFromInt(i)) * t.ctl_h - s.dd_scroll,
+                    .w = orect.w - 2 * pad - gutter,
                     .h = t.ctl_h,
                 }) catch break;
             }
@@ -1736,14 +1809,14 @@ pub const Ui = struct {
         bg.a = @max(bg.a, 0.92);
         bg = lerpColor(Color.rgba(24, 27, 38, 0.96), bg, 0.15);
         ui.canvas.fillRoundedRect(dd.rect.x, dd.rect.y, dd.rect.w, dd.rect.h, t.radius, bg);
-        ui.canvas.strokeRoundedRect(dd.rect.x, dd.rect.y, dd.rect.w, dd.rect.h, t.radius, 1, t.border);
+        ui.canvas.strokeRoundedRect(dd.rect.x, dd.rect.y, dd.rect.w, dd.rect.h, t.radius, t.s(1), t.border);
 
         // Scrolled items stay inside the panel.
         const saved = ui.canvas.setClip(
-            @intFromFloat(@max(0, dd.rect.x + 1)),
-            @intFromFloat(@max(0, dd.rect.y + 1)),
-            @intFromFloat(@max(0, dd.rect.w - 2)),
-            @intFromFloat(@max(0, dd.rect.h - 2)),
+            @intFromFloat(@max(0, dd.rect.x + t.s(1))),
+            @intFromFloat(@max(0, dd.rect.y + t.s(1))),
+            @intFromFloat(@max(0, dd.rect.w - t.s(2))),
+            @intFromFloat(@max(0, dd.rect.h - t.s(2))),
         );
         defer ui.canvas.clip = saved;
 
@@ -1754,9 +1827,9 @@ pub const Ui = struct {
             const hovered = in_panel and r.contains(ui.store.mouse_x, ui.store.mouse_y);
             const kb_hover = if (ui.store.dd_hover) |hi| hi == i else false;
             if (i == dd.selected) {
-                ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius - 2, lerpColor(t.accent, t.bg_widget_active, 0.55));
+                ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius - t.s(2), lerpColor(t.accent, t.bg_widget_active, 0.55));
             } else if (hovered or kb_hover) {
-                ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius - 2, t.bg_widget_hot);
+                ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius - t.s(2), t.bg_widget_hot);
             }
             var inner = r;
             inner.x += t.pad_x;
@@ -1767,10 +1840,10 @@ pub const Ui = struct {
         // Thin scrollbar, same look as endScroll's.
         if (dd.content_h > dd.rect.h) {
             const max_off = dd.content_h - dd.rect.h;
-            const track_h = dd.rect.h - 4;
-            const thumb_h = @max(24, track_h * dd.rect.h / dd.content_h);
-            const ty = dd.rect.y + 2 + (track_h - thumb_h) * (ui.store.dd_scroll / max_off);
-            ui.canvas.fillRoundedRect(dd.rect.x + dd.rect.w - 6, ty, 4, thumb_h, 2, Color.rgba(255, 255, 255, 0.25));
+            const track_h = dd.rect.h - t.s(4);
+            const thumb_h = @max(t.scrollbar_thumb_min, track_h * dd.rect.h / dd.content_h);
+            const ty = dd.rect.y + t.s(2) + (track_h - thumb_h) * (ui.store.dd_scroll / max_off);
+            ui.canvas.fillRoundedRect(dd.rect.x + dd.rect.w - t.scrollbar_w, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, 0.25));
         }
     }
 
@@ -1802,20 +1875,20 @@ pub const Ui = struct {
 
     fn drawTooltip(ui: *Ui, s: []const u8) void {
         const t = ui.theme;
-        const pad: f32 = 8;
+        const pad = t.tooltip_pad;
         const tw = ui.measureText(s, t.font_size, .regular);
         const th: f32 = @floatFromInt(ui.font.lineHeight(t.font_size, .regular));
         const w = tw + 2 * pad;
-        const h = th + 10;
-        var x = ui.store.mouse_x + 12;
-        var y = ui.store.mouse_y + 18;
-        if (x + w > ui.bounds.x + ui.bounds.w) x = ui.bounds.x + ui.bounds.w - w - 2;
-        if (y + h > ui.bounds.y + ui.bounds.h) y = ui.store.mouse_y - h - 6;
+        const h = th + t.s(10);
+        var x = ui.store.mouse_x + t.s(12);
+        var y = ui.store.mouse_y + t.s(18);
+        if (x + w > ui.bounds.x + ui.bounds.w) x = ui.bounds.x + ui.bounds.w - w - t.s(2);
+        if (y + h > ui.bounds.y + ui.bounds.h) y = ui.store.mouse_y - h - t.s(6);
         var bg = lerpColor(Color.rgba(20, 22, 30, 0.97), t.bg_card, 0.1);
         bg.a = 0.97;
         ui.canvas.fillRoundedRect(x, y, w, h, t.radius, bg);
-        ui.canvas.strokeRoundedRect(x, y, w, h, t.radius, 1, t.border);
-        ui.drawTextIn(.{ .x = x + pad, .y = y + 5, .w = tw, .h = th }, s, .left, t.font_size, .regular, t.text);
+        ui.canvas.strokeRoundedRect(x, y, w, h, t.radius, t.s(1), t.border);
+        ui.drawTextIn(.{ .x = x + pad, .y = y + t.s(5), .w = tw, .h = th }, s, .left, t.font_size, .regular, t.text);
     }
 
     // --- tab bar -----------------------------------------------------------------------------------------
@@ -1840,12 +1913,13 @@ pub const Ui = struct {
                 changed = true;
             }
             const ht = ui.hoverT(id, sig.hovered);
+            const in = t.s(2); // inset del segmento attivo/hover
             if (i == active.*) {
-                ui.canvas.fillRoundedRect(tr.x + 2, tr.y + 2, tr.w - 4, tr.h - 4, t.radius - 2, t.accent);
+                ui.canvas.fillRoundedRect(tr.x + in, tr.y + in, tr.w - 2 * in, tr.h - 2 * in, t.radius - in, t.accent);
             } else if (ht > 0.01) {
                 var bg = t.bg_widget_hot;
                 bg.a *= ht;
-                ui.canvas.fillRoundedRect(tr.x + 2, tr.y + 2, tr.w - 4, tr.h - 4, t.radius - 2, bg);
+                ui.canvas.fillRoundedRect(tr.x + in, tr.y + in, tr.w - 2 * in, tr.h - 2 * in, t.radius - in, bg);
             }
             ui.drawTextIn(tr, lb, .center, t.font_size, .regular, if (i == active.*) t.accent_text else t.text);
         }
@@ -1881,7 +1955,7 @@ pub const Ui = struct {
             .y = vp.y - off,
             .start_x = vp.x,
             .start_y = vp.y - off,
-            .avail_w = vp.w - 10, // leave a scrollbar gutter
+            .avail_w = vp.w - ui.theme.s(10), // leave a scrollbar gutter
         };
         ui.depth += 1;
     }
@@ -1914,11 +1988,11 @@ pub const Ui = struct {
 
         // thin scrollbar
         if (max_off > 0) {
-            const track_h = viewport_h - 4;
-            const thumb_h = @max(24, track_h * viewport_h / content_h);
-            const ty = vp_top + 2 + (track_h - thumb_h) * (off / max_off);
-            const tx = vp.x + vp.w - 6;
-            ui.canvas.fillRoundedRect(tx, ty, 4, thumb_h, 2, Color.rgba(255, 255, 255, if (hovered) 0.35 else 0.18));
+            const track_h = viewport_h - t.s(4);
+            const thumb_h = @max(t.scrollbar_thumb_min, track_h * viewport_h / content_h);
+            const ty = vp_top + t.s(2) + (track_h - thumb_h) * (off / max_off);
+            const tx = vp.x + vp.w - t.scrollbar_w;
+            ui.canvas.fillRoundedRect(tx, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, if (hovered) 0.35 else 0.18));
         }
 
         // restore clip and advance the parent cursor past the viewport
@@ -1937,8 +2011,8 @@ pub const Ui = struct {
         const t = ui.theme;
         const c = ui.cur();
         const r = Rect{ .x = c.x, .y = c.y, .w = ui.availW(), .h = h };
-        ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius + 2, t.bg_card);
-        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius + 2, 1, t.border);
+        ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius + t.s(2), t.bg_card);
+        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius + t.s(2), t.s(1), t.border);
         std.debug.assert(ui.depth < ui.cursors.len);
         ui.cursors[ui.depth] = .{
             .dir = .v,
@@ -2004,17 +2078,18 @@ pub const Ui = struct {
         ui.dialog_rect = r;
         var bg = lerpColor(Color.rgba(26, 29, 40, 0.97), t.bg_card, 0.2);
         bg.a = 0.97;
-        ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius + 4, bg);
-        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius + 4, 1, t.border);
+        ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius + t.s(4), bg);
+        ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, t.radius + t.s(4), t.s(1), t.border);
 
         // Title row + close button.
-        const title_h: f32 = 40;
+        const title_h: f32 = t.dialog_title_h;
         var tr = r;
-        tr.x += t.pad_x + 2;
+        tr.x += t.pad_x + t.s(2);
         tr.h = title_h;
         tr.w -= 2 * t.pad_x;
         ui.drawTextIn(tr, title, .left, t.font_heading, .bold, t.text);
-        const xr = Rect{ .x = r.x + r.w - 34, .y = r.y + 8, .w = 26, .h = 26 };
+        const xsz = t.s(26);
+        const xr = Rect{ .x = r.x + r.w - t.s(34), .y = r.y + t.s(8), .w = xsz, .h = xsz };
         if (ui.squareButton(xr, "x")) {
             ui.closeDialog();
             return false;
@@ -2030,11 +2105,11 @@ pub const Ui = struct {
         ui.dialog_saved_cursor = ui.cursors[ui.depth - 1];
         ui.cursors[ui.depth] = .{
             .dir = .v,
-            .x = r.x + t.pad_x + 2,
-            .y = r.y + title_h + 4,
-            .start_x = r.x + t.pad_x + 2,
-            .start_y = r.y + title_h + 4,
-            .avail_w = r.w - 2 * (t.pad_x + 2),
+            .x = r.x + t.pad_x + t.s(2),
+            .y = r.y + title_h + t.s(4),
+            .start_x = r.x + t.pad_x + t.s(2),
+            .start_y = r.y + title_h + t.s(4),
+            .avail_w = r.w - 2 * (t.pad_x + t.s(2)),
         };
         ui.depth += 1;
         return true;

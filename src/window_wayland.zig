@@ -30,6 +30,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     pointer: ?*wl.Pointer = null,
     decoration_manager: ?*wl.ZxdgDecorationManager = null,
     decoration: ?*wl.ZxdgToplevelDecoration = null,
+    cursor_shape_manager: ?*wl.CursorShapeManager = null,
 
     width: u32,
     height: u32,
@@ -326,6 +327,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (self.pointer) |p| wl.wl_proxy_destroy(@ptrCast(p));
         if (self.decoration) |d| wl.wl_proxy_destroy(@ptrCast(d));
         if (self.decoration_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
+        if (self.cursor_shape_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
         if (self.toplevel) |t| wl.wl_proxy_destroy(@ptrCast(t));
         if (self.xdg_surface) |x| wl.wl_proxy_destroy(@ptrCast(x));
         if (self.surface) |s| s.destroy();
@@ -594,6 +596,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             self.wm_base = @ptrCast(registry.bind(name, &wl.xdg_wm_base_interface, @min(ver, 6)).?);
         } else if (std.mem.eql(u8, iface, "zxdg_decoration_manager_v1")) {
             self.decoration_manager = @ptrCast(registry.bind(name, &wl.zxdg_decoration_manager_v1_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, "wp_cursor_shape_manager_v1")) {
+            self.cursor_shape_manager = @ptrCast(registry.bind(name, &wl.wp_cursor_shape_manager_v1_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "wl_seat")) {
             const seat: *wl.Seat = @ptrCast(registry.bind(name, &wl.wl_seat_interface, @min(ver, 5)).?);
             seat.setListener(&seat_listener, self);
@@ -773,12 +777,17 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         .axis_relative_direction = onPointerAxisRelativeDirection,
     };
 
-    fn onPointerEnter(data: ?*anyopaque, _: *wl.Pointer, serial: u32, surface: ?*wl.Surface, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {
+    fn onPointerEnter(data: ?*anyopaque, pointer: *wl.Pointer, serial: u32, surface: ?*wl.Surface, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_serial = serial;
         self.pointer_x = wl.fixedToF32(sx);
         self.pointer_y = wl.fixedToF32(sy);
         self.pointer_target = self.targetFor(surface);
+        if (self.cursor_shape_manager) |mgr| {
+            const device = mgr.getPointer(pointer);
+            defer wl.wl_proxy_destroy(@ptrCast(device));
+            device.setShape(serial, 1); // wl.CursorShapeDevice.SHAPE_DEFAULT = 1
+        }
     }
     fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}
     fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, sx: wl.Fixed, sy: wl.Fixed) callconv(.c) void {

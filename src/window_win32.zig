@@ -99,6 +99,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
     extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.winapi) void;
     extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: i32) callconv(.winapi) i32;
+    extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: ?[*:0]const u16) callconv(.winapi) HCURSOR;
     extern "user32" fn UpdateLayeredWindow(
         hWnd: HWND,
         hdcDst: HDC,
@@ -175,10 +176,12 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         const hinst = GetModuleHandleW(null);
         const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZicroWindowClass");
 
+        const arrow_cursor = LoadCursorW(null, @ptrFromInt(32512)); // 32512 = IDC_ARROW
         const wc = WNDCLASSEXW{
             .style = 3, // CS_HREDRAW | CS_VREDRAW
             .lpfnWndProc = wndProc,
             .hInstance = hinst,
+            .hCursor = arrow_cursor,
             .lpszClassName = class_name,
         };
         _ = RegisterClassExW(&wc);

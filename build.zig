@@ -43,6 +43,20 @@ pub fn build(b: *std.Build) void {
         deco_scan.addFileArg(.{ .cwd_relative = deco_xml });
         const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
         zicro.addCSourceFile(.{ .file = deco_c });
+        // cursor-shape-v1: server-driven cursor themes (wl.zig/window_wayland.zig).
+        // Its get_tablet_tool_v2 request pulls in zwp_tablet_tool_v2_interface, so
+        // tablet-v2's private-code must be linked too even though we only drive the
+        // wl_pointer path — otherwise that interface symbol stays undefined.
+        const cursor_xml = "/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml";
+        const cursor_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        cursor_scan.addFileArg(.{ .cwd_relative = cursor_xml });
+        const cursor_c = cursor_scan.addOutputFileArg("cursor-shape-v1.c");
+        zicro.addCSourceFile(.{ .file = cursor_c });
+        const tablet_xml = "/usr/share/wayland-protocols/stable/tablet/tablet-v2.xml";
+        const tablet_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        tablet_scan.addFileArg(.{ .cwd_relative = tablet_xml });
+        const tablet_c = tablet_scan.addOutputFileArg("tablet-v2.c");
+        zicro.addCSourceFile(.{ .file = tablet_c });
     }
     // winmm: backend audio waveOut (audio_device.zig) su Windows.
     if (target.result.os.tag == .windows) zicro.linkSystemLibrary("winmm", .{});
@@ -85,6 +99,18 @@ pub fn build(b: *std.Build) void {
         deco_scan.addFileArg(.{ .cwd_relative = deco_xml });
         const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
         zicro_fast.addCSourceFile(.{ .file = deco_c });
+        // cursor-shape-v1 (+ tablet-v2 for zwp_tablet_tool_v2_interface); see the
+        // Debug block above for why both are needed.
+        const cursor_xml = "/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml";
+        const cursor_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        cursor_scan.addFileArg(.{ .cwd_relative = cursor_xml });
+        const cursor_c = cursor_scan.addOutputFileArg("cursor-shape-v1.c");
+        zicro_fast.addCSourceFile(.{ .file = cursor_c });
+        const tablet_xml = "/usr/share/wayland-protocols/stable/tablet/tablet-v2.xml";
+        const tablet_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        tablet_scan.addFileArg(.{ .cwd_relative = tablet_xml });
+        const tablet_c = tablet_scan.addOutputFileArg("tablet-v2.c");
+        zicro_fast.addCSourceFile(.{ .file = tablet_c });
     }
     if (target.result.os.tag == .windows) zicro_fast.linkSystemLibrary("winmm", .{});
     if (target.result.os.tag == .macos) addMacosLinks(b, zicro_fast, macos_sysroot);
@@ -106,7 +132,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_bench.step);
 
     // Examples: `zig build run-counter`, `zig build run-world_counter`, `zig build run-shell`.
-    inline for (.{ "counter", "world_counter", "shell" }) |name| {
+    inline for (.{ "counter", "world_counter", "shell", "demo" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
