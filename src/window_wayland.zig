@@ -54,6 +54,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     pointer_serial: u32 = 0,
+    cursor_shape: u32 = 1,
 
     // Multi-window on ONE connection (window-server shape): children share
     // the root's display/registry/globals and are driven by the root's run()
@@ -270,6 +271,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     }
 
     pub fn setCursorShape(self: *Window, shape: u32) void {
+        self.cursor_shape = shape;
+        self.setCursorShapeDevice(shape);
+    }
+
+    fn setCursorShapeDevice(self: *Window, shape: u32) void {
         if (self.cursor_shape_manager) |mgr| {
             if (self.pointer) |pointer| {
                 const device = mgr.getPointer(pointer);
@@ -812,7 +818,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (self.cursor_shape_manager) |mgr| {
             const device = mgr.getPointer(pointer);
             defer wl.wl_proxy_destroy(@ptrCast(device));
-            device.setShape(serial, 1); // wl.CursorShapeDevice.SHAPE_DEFAULT = 1
+            device.setShape(serial, self.cursor_shape);
         }
     }
     fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}
@@ -821,6 +827,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.pointer_x = wl.fixedToF32(sx);
         self.pointer_y = wl.fixedToF32(sy);
         const target = self.pointer_target orelse self;
+        if (!target.opts.decorations) {
+            const edge = target.resizeEdgeAt(self.pointer_x, self.pointer_y);
+            if (edge != wl.RESIZE_EDGE_NONE) {
+                self.setCursorShapeDevice(edgeCursor(edge));
+            } else {
+                self.setCursorShapeDevice(self.cursor_shape);
+            }
+        }
         if (target.opts.on_mouse) |cb| cb(target, .{ .kind = .motion, .x = self.pointer_x, .y = self.pointer_y }, target.opts.user);
     }
     fn resizeEdgeAt(self: *Window, x: f32, y: f32) u32 {
@@ -843,6 +857,15 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (right) return wl.RESIZE_EDGE_RIGHT;
 
         return wl.RESIZE_EDGE_NONE;
+    }
+    fn edgeCursor(edge: u32) u32 {
+        return switch (edge) {
+            wl.RESIZE_EDGE_TOP, wl.RESIZE_EDGE_BOTTOM => wl.CursorShapeDevice.SHAPE_NS_RESIZE,
+            wl.RESIZE_EDGE_LEFT, wl.RESIZE_EDGE_RIGHT => wl.CursorShapeDevice.SHAPE_EW_RESIZE,
+            wl.RESIZE_EDGE_TOP_LEFT, wl.RESIZE_EDGE_BOTTOM_RIGHT => wl.CursorShapeDevice.SHAPE_NWSE_RESIZE,
+            wl.RESIZE_EDGE_TOP_RIGHT, wl.RESIZE_EDGE_BOTTOM_LEFT => wl.CursorShapeDevice.SHAPE_NESW_RESIZE,
+            else => wl.CursorShapeDevice.SHAPE_DEFAULT,
+        };
     }
 
     fn onPointerButton(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
