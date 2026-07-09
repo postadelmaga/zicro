@@ -515,6 +515,14 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         self.height = h;
     }
 
+    pub fn beginMove(self: *Window) void {
+        msgVoid(self.win orelse return, "zartBeginMove");
+    }
+
+    pub fn beginResize(self: *Window, edge: u32) void {
+        msgVoidInt(self.win orelse return, "zartBeginResize:", edge);
+    }
+
     pub fn run(self: *Window) !void {
         const app = self.app orelse return;
         trace("run: finishLaunching", .{});

@@ -279,6 +279,22 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         }
     }
 
+    pub fn beginMove(self: *Window) void {
+        if (self.seat) |seat| {
+            if (self.toplevel) |toplevel| {
+                toplevel.move(seat, self.pointer_serial);
+            }
+        }
+    }
+
+    pub fn beginResize(self: *Window, edge: u32) void {
+        if (self.seat) |seat| {
+            if (self.toplevel) |toplevel| {
+                toplevel.resize(seat, self.pointer_serial, edge);
+            }
+        }
+    }
+
     /// Tear down a child window: destroy its proxies and remove it from the
     /// parent. Runs on the loop thread (run() reaps closed children with it).
     fn deinitChild(self: *Window) void {
@@ -833,40 +849,43 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_serial = serial;
         const target = self.pointer_target orelse self;
+
+        var handled = false;
         if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and !target.fullscreen) {
-            if (!target.opts.decorations) {
-                const edge = target.resizeEdgeAt(self.pointer_x, self.pointer_y);
-                if (edge != wl.RESIZE_EDGE_NONE) {
-                    if (self.seat) |seat| {
-                        if (target.toplevel) |toplevel| {
-                            toplevel.resize(seat, serial, edge);
-                            return;
-                        }
-                    }
-                }
-                const w = @as(f32, @floatFromInt(target.width));
-                const h = @as(f32, @floatFromInt(target.height));
-                const grab: f32 = 30.0;
-                if (self.pointer_x < grab or self.pointer_y < grab or self.pointer_x > w - grab or self.pointer_y > h - grab) {
-                    if (self.seat) |seat| {
-                        if (target.toplevel) |toplevel| {
-                            toplevel.move(seat, serial);
-                            return;
-                        }
-                    }
-                }
+            const w = @as(f32, @floatFromInt(target.width));
+            const h = @as(f32, @floatFromInt(target.height));
+            const border: f32 = 8.0;
+            const top_grab: f32 = 40.0;
+            
+            const px = self.pointer_x;
+            const py = self.pointer_y;
+            
+            var edge: u32 = wl.RESIZE_EDGE_NONE;
+            if (px < border) {
+                if (py < border) { edge = wl.RESIZE_EDGE_TOP_LEFT; }
+                else if (py > h - border) { edge = wl.RESIZE_EDGE_BOTTOM_LEFT; }
+                else { edge = wl.RESIZE_EDGE_LEFT; }
+            } else if (px > w - border) {
+                if (py < border) { edge = wl.RESIZE_EDGE_TOP_RIGHT; }
+                else if (py > h - border) { edge = wl.RESIZE_EDGE_BOTTOM_RIGHT; }
+                else { edge = wl.RESIZE_EDGE_RIGHT; }
+            } else if (py < border) {
+                edge = wl.RESIZE_EDGE_TOP;
+            } else if (py > h - border) {
+                edge = wl.RESIZE_EDGE_BOTTOM;
+            }
+            
+            if (edge != wl.RESIZE_EDGE_NONE) {
+                if (self.seat) |seat| { target.toplevel.?.resize(seat, serial, edge); }
+                handled = true;
             }
         }
+
+        if (handled) return;
+
         if (target.opts.on_mouse) |cb| {
             const kind: window.MouseEvent.Kind = if (state == wl.KEYBOARD_KEY_STATE_PRESSED) .press else .release;
             cb(target, .{ .kind = kind, .x = self.pointer_x, .y = self.pointer_y, .button = button }, target.opts.user);
-            return;
-        }
-        // BTN_LEFT is 272. Drag window anywhere to move if borderless (no on_mouse)
-        if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and !target.fullscreen) {
-            if (self.seat) |seat| {
-                if (target.toplevel) |toplevel| toplevel.move(seat, serial);
-            }
         }
     }
     fn onPointerAxis(data: ?*anyopaque, _: *wl.Pointer, _: u32, axis: u32, value: wl.Fixed) callconv(.c) void {
