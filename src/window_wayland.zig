@@ -855,8 +855,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             const w = @as(f32, @floatFromInt(target.width));
             const h = @as(f32, @floatFromInt(target.height));
             const border: f32 = 8.0;
-            const top_grab: f32 = 40.0;
-            
+
             const px = self.pointer_x;
             const py = self.pointer_y;
             
