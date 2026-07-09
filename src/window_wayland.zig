@@ -807,18 +807,66 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const target = self.pointer_target orelse self;
         if (target.opts.on_mouse) |cb| cb(target, .{ .kind = .motion, .x = self.pointer_x, .y = self.pointer_y }, target.opts.user);
     }
+    fn resizeEdgeAt(self: *Window, x: f32, y: f32) u32 {
+        const border: f32 = 8.0;
+        const w = @as(f32, @floatFromInt(self.width));
+        const h = @as(f32, @floatFromInt(self.height));
+
+        const top = y < border;
+        const bottom = y > h - border;
+        const left = x < border;
+        const right = x > w - border;
+
+        if (top and left) return wl.RESIZE_EDGE_TOP_LEFT;
+        if (top and right) return wl.RESIZE_EDGE_TOP_RIGHT;
+        if (bottom and left) return wl.RESIZE_EDGE_BOTTOM_LEFT;
+        if (bottom and right) return wl.RESIZE_EDGE_BOTTOM_RIGHT;
+        if (top) return wl.RESIZE_EDGE_TOP;
+        if (bottom) return wl.RESIZE_EDGE_BOTTOM;
+        if (left) return wl.RESIZE_EDGE_LEFT;
+        if (right) return wl.RESIZE_EDGE_RIGHT;
+
+        return wl.RESIZE_EDGE_NONE;
+    }
+
     fn onPointerButton(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_serial = serial;
         const target = self.pointer_target orelse self;
+        if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and !target.fullscreen) {
+            if (!target.opts.decorations) {
+                const edge = target.resizeEdgeAt(self.pointer_x, self.pointer_y);
+                if (edge != wl.RESIZE_EDGE_NONE) {
+                    if (self.seat) |seat| {
+                        if (target.toplevel) |toplevel| {
+                            toplevel.resize(seat, serial, edge);
+                            return;
+                        }
+                    }
+                }
+                const w = @as(f32, @floatFromInt(target.width));
+                const h = @as(f32, @floatFromInt(target.height));
+                const grab: f32 = 30.0;
+                if (self.pointer_x < grab or self.pointer_y < grab or self.pointer_x > w - grab or self.pointer_y > h - grab) {
+                    if (self.seat) |seat| {
+                        if (target.toplevel) |toplevel| {
+                            toplevel.move(seat, serial);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if (target.opts.on_mouse) |cb| {
             const kind: window.MouseEvent.Kind = if (state == wl.KEYBOARD_KEY_STATE_PRESSED) .press else .release;
             cb(target, .{ .kind = kind, .x = self.pointer_x, .y = self.pointer_y, .button = button }, target.opts.user);
             return;
         }
-        // BTN_LEFT is 272. Drag window anywhere to move if borderless
+        // BTN_LEFT is 272. Drag window anywhere to move if borderless (no on_mouse)
         if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and !target.fullscreen) {
-            if (self.seat) |seat| target.toplevel.?.move(seat, serial);
+            if (self.seat) |seat| {
+                if (target.toplevel) |toplevel| toplevel.move(seat, serial);
+            }
         }
     }
     fn onPointerAxis(data: ?*anyopaque, _: *wl.Pointer, _: u32, axis: u32, value: wl.Fixed) callconv(.c) void {

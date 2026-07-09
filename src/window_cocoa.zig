@@ -278,7 +278,7 @@ fn ensureViewClass() Class {
     };
     _ = class_addMethod(cls, sel_registerName("drawRect:"), @ptrCast(&imp_drawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     _ = class_addMethod(cls, sel_registerName("acceptsFirstResponder"), @ptrCast(&imp_yes), "c@:");
-    _ = class_addMethod(cls, sel_registerName("isOpaque"), @ptrCast(&imp_yes), "c@:");
+    _ = class_addMethod(cls, sel_registerName("isOpaque"), @ptrCast(&imp_no), "c@:");
     objc_registerClassPair(cls);
     g_view_class = cls;
     return cls;
@@ -286,6 +286,10 @@ fn ensureViewClass() Class {
 
 fn imp_yes(_: id, _: SEL) callconv(.c) bool {
     return true;
+}
+
+fn imp_no(_: id, _: SEL) callconv(.c) bool {
+    return false;
 }
 
 fn imp_drawRect(view: id, _: SEL, rect: CGRect) callconv(.c) void {
@@ -362,6 +366,10 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
             false,
         ) orelse return error.WindowCreationFailed;
         self.win = win;
+        if (!opts.decorations) {
+            msgVoidBool(win, "setOpaque:", false);
+            msgVoidId(win, "setBackgroundColor:", msgId(class("NSColor"), "clearColor"));
+        }
 
         msgVoidId(win, "setTitle:", nsString(opts.title.ptr));
         msgVoidBool(win, "setAcceptsMouseMovedEvents:", true);
