@@ -516,11 +516,13 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     }
 
     pub fn beginMove(self: *Window) void {
-        msgVoid(self.win orelse return, "zartBeginMove");
+        const pw = msgId(self.win orelse return, "platformWindow");
+        if (pw) |p| msgVoid(p, "zartBeginMove");
     }
 
     pub fn beginResize(self: *Window, edge: u32) void {
-        msgVoidInt(self.win orelse return, "zartBeginResize:", edge);
+        const pw = msgId(self.win orelse return, "platformWindow");
+        if (pw) |p| msgVoidInt(p, "zartBeginResize:", edge);
     }
 
     pub fn run(self: *Window) !void {
