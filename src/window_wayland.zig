@@ -786,7 +786,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (self.cursor_shape_manager) |mgr| {
             const device = mgr.getPointer(pointer);
             defer wl.wl_proxy_destroy(@ptrCast(device));
-            device.setShape(serial, 1); // wl.CursorShapeDevice.SHAPE_DEFAULT = 1
+            device.setShape(serial, 4); // wl.CursorShapeDevice.SHAPE_POINTER = 4
         }
     }
     fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}

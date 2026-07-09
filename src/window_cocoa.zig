@@ -323,8 +323,6 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     mods_alt: bool = false,
     last_tick_ns: u64 = 0,
 
-    // NSWindowStyleMask: Titled(1) | Closable(2) | Miniaturizable(4) | Resizable(8).
-    const style_mask: u64 = 1 | 2 | 4 | 8;
     const backing_buffered: u64 = 2; // NSBackingStoreBuffered
     const event_mask_any: u64 = std.math.maxInt(u64); // NSEventMaskAny
 
@@ -354,6 +352,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         };
         const win_alloc = msgId(class("NSWindow"), "alloc");
         const initFrame: *const fn (id, SEL, CGRect, u64, u64, bool) callconv(.c) id = @ptrCast(&objc_msgSend);
+        const style_mask: u64 = if (opts.decorations) 1 | 2 | 4 | 8 else 0;
         const win = initFrame(
             win_alloc,
             sel_registerName("initWithContentRect:styleMask:backing:defer:"),
@@ -434,27 +433,11 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     /// y down — see `ensureViewClass`), and `CGContextDrawImage` composes in CG's y-up
     /// space, so the CTM is flipped around the buffer height for the draw: image row 0
     /// lands at the visual top on real AppKit and Cocotron alike.
-    fn drawIntoCurrentContext(self: *Window) void {
-        const nsctx = msgId(class("NSGraphicsContext"), "currentContext") orelse return;
-        const ctx = msgId(nsctx, "graphicsPort") orelse return;
-        if (traceOn() and getenv("ZICRO_COCOA_FILL") != null) {
-            // Diagnostic lane isolator: a plain vector fill, no CGImage involved. If this
-            // shows up where the image did not, the blit path is the culprit.
-            CGContextSetRGBFillColor(ctx, 1, 0, 0, 1);
-            CGContextFillRect(ctx, .{ .origin = .{ .x = 50, .y = 50 }, .size = .{ .width = 400, .height = 200 } });
-            return;
-        }
+    /// Blit the framebuffer into `ctx` (a clean O2Surface context) via CGContextDrawImage.
+    fn blitFramebuffer(self: *Window, ctx: ?*anyopaque) void {
+        if (ctx == null) return;
         sync.lock(&self.mutex, self.io);
         defer sync.unlock(&self.mutex, self.io);
-
-        // Present through the CG draw pipeline (CGContextDrawImage). We do NOT memcpy into
-        // CGBitmapContextGetData(ctx): under Darling's Onyx2D that returns a scratch/back
-        // buffer that is NOT the surface flushWindow ships, so raw writes there never
-        // reach the presented window (verified: the rows land in `base` but the window
-        // stays blank, while a plain CGContextFillRect on the same ctx DOES show — the
-        // pipeline composites into the real surface, the GetData pointer does not).
-        // On real macOS the window context isn't a bitmap context anyway, so this was
-        // always the effective path there.
         const cs = CGColorSpaceCreateDeviceRGB();
         defer CGColorSpaceRelease(cs);
         const bytes = std.mem.sliceAsBytes(self.pixels);
@@ -468,16 +451,43 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         }, image);
     }
 
-    /// Run the view's display cycle now, unconditionally, then flush the window backing
-    /// to the server. We drive our own loop (no NSRunLoop) and Cocotron's needsDisplay
-    /// bookkeeping proved unreliable from outside one (`setNeedsDisplay:` +
-    /// `displayIfNeeded` yielded two draws per session under zart); `display` skips the
-    /// dirty tracking but — on Cocotron — draws only into the backing, so the explicit
-    /// `flushWindow` is what actually ships the frame.
+    /// drawRect: path (real macOS fallback): the view's own context is not poisoned there.
+    fn drawIntoCurrentContext(self: *Window) void {
+        const nsctx = msgId(class("NSGraphicsContext"), "currentContext") orelse return;
+        self.blitFramebuffer(msgId(nsctx, "graphicsPort"));
+    }
+
+    /// Present the framebuffer. On the Cocotron/Zart backend we do NOT present through the
+    /// view's drawRect:: with no NSScreen the content view's visibleRect is 0x0, so the
+    /// window's shared backing context gets an empty clip AND an empty rasterizer viewport
+    /// and every draw is clipped away (the window stays black). Instead we take the
+    /// O2Surface out of that context ([ctx surface]) and make a FRESH O2Context over it —
+    /// a fresh context has the full-surface viewport and no clip, so CGContextDrawImage
+    /// renders (verified with a standalone O2Surface probe). Both contexts write the same
+    /// shared surface bytes, so [platformWindow flushBuffer] ships the frame. This whole
+    /// path is macOS-only; the Z backend (window_z.zig) presents into its Scenic VMO.
     fn present(self: *Window) void {
-        const view = self.view orelse return;
-        msgVoid(view, "display");
-        if (self.win) |w| msgVoid(w, "flushWindow");
+        const win = self.win orelse return;
+        if (msgId(win, "platformWindow")) |pw| {
+            const poisoned = msgId(pw, "cgContext");
+            const surface = if (poisoned) |c| msgId(c, "surface") else null;
+            if (surface) |s| {
+                const alloc = msgId(class("O2Context_builtin_FT"), "alloc");
+                const initFn: *const fn (id, SEL, id, c_int) callconv(.c) id = @ptrCast(&objc_msgSend);
+                const fresh = initFn(alloc, sel_registerName("initWithSurface:flipped:"), s, 0);
+                if (traceOn() and getenv("ZICRO_COCOA_BLIT") != null)
+                    trace("present: pw={x} surface={x} fresh={x}", .{ @intFromPtr(pw), @intFromPtr(s), @intFromPtr(fresh) });
+                if (fresh != null) {
+                    self.blitFramebuffer(fresh);
+                    msgVoid(fresh, "release");
+                    msgVoid(pw, "flushBuffer");
+                    return;
+                }
+            }
+        }
+        // Fallback (real macOS, or no platform cgContext): the view display path.
+        if (self.view) |view| msgVoid(view, "display");
+        msgVoid(win, "flushWindow");
     }
 
     /// Track the content view size; on change, reallocate the framebuffer.

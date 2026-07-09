@@ -201,6 +201,11 @@ pub const Style = struct {
     border_alpha: f32 = 0.22,
     /// Progressive fade-out width of the glass color near the edges (0 to disable).
     glass_fade_width: f32 = 0,
+    /// Sheen metallico: gradiente verticale del vetro (schiarisce in alto, scurisce in basso).
+    /// 0 = piatto. ~0.3 = metallizzato/bagnato.
+    sheen: f32 = 0,
+    /// Highlight speculare vicino al bordo superiore (riflesso vetroso/bagnato). 0 = off.
+    specular: f32 = 0,
     /// Corner radius of the content frames.
     content_radius: f32 = 14,
     /// Progressive fade-out width of the content near its edges (0 to disable).
@@ -245,6 +250,21 @@ pub const Style = struct {
         };
     }
 
+    /// Preset: Carbon Glass — vetro scuro metallizzato/bagnato, angoli arrotondati e fine
+    /// cornice vetrosa. Pensato per titlebar/chrome sopra il blur del compositor.
+    pub fn carbon() Style {
+        return .{
+            .corner_radius = 20,
+            .glass = Color.rgba(24, 26, 32, 0.62),
+            .border_alpha = 0.30,
+            .sheen = 0.38,
+            .specular = 0.14,
+            .shadow_alpha = 0.45,
+            .shadow_blur = 28,
+            .shadow_offset_y = 12,
+            .blur_inset = 12,
+        };
+    }
     /// Preset: Aurora Glass (inset blur with wide color fade)
     pub fn aurora() Style {
         return .{
@@ -411,15 +431,21 @@ pub const Canvas = struct {
         const cy0: u32 = if (has_core) @intFromFloat(@ceil(cy0f)) else 0;
         const cy1: u32 = if (has_core) @intFromFloat(@floor(cy1f)) else 0;
 
+        const dynamic_core = style.sheen != 0.0 or style.specular != 0.0;
         var y: u32 = 0;
         while (y < self.height) : (y += 1) {
             const fy = @as(f32, @floatFromInt(y)) + 0.5;
             const row = self.pixels[@as(usize, y) * self.width ..][0..self.width];
             const core_row = has_core and y >= cy0 and y < cy1;
+            // Core piatto (memset veloce): colore per-riga se il vetro ha un gradiente verticale.
+            const row_core_px = if (dynamic_core) blk: {
+                const gc = glassColorAt(style, g, m, ph, fy);
+                break :blk packPremul(gc[0] * ga_full, gc[1] * ga_full, gc[2] * ga_full, ga_full);
+            } else core_px;
             var x: u32 = 0;
             while (x < self.width) : (x += 1) {
                 if (core_row and x == cx0 and cx1 > cx0) {
-                    @memset(row[cx0..cx1], core_px);
+                    @memset(row[cx0..cx1], row_core_px);
                     x = cx1 - 1; // the loop's ++ resumes the band at cx1
                     continue;
                 }
@@ -432,6 +458,22 @@ pub const Canvas = struct {
     /// One chrome pixel at sub-pixel `(fx,fy)`: drop shadow, rounded glass and the 1px
     /// highlight ring, composited back-to-front in premultiplied space. The hot inner body
     /// of `drawChrome`, kept separate so the flat-core fast path can skip it.
+    /// Colore del vetro (straight RGB) alla riga `fy`: applica sheen (gradiente verticale) e
+    /// speculare superiore. Base per lo shader del pannello e per il fill del core.
+    fn glassColorAt(style: Style, g: Color, m: f32, ph: f32, fy: f32) [3]f32 {
+        const ty = std.math.clamp((fy - m) / @max(1.0, ph), 0.0, 1.0);
+        const sheen_mul = 1.0 + style.sheen * (0.5 - ty);
+        var cr = std.math.clamp(g.r * sheen_mul, 0.0, 1.0);
+        var cg = std.math.clamp(g.g * sheen_mul, 0.0, 1.0);
+        var cb = std.math.clamp(g.b * sheen_mul, 0.0, 1.0);
+        if (style.specular > 0.0) {
+            const spec = style.specular * (1.0 - smoothstep(0.0, 0.12, ty));
+            cr = cr + (1.0 - cr) * spec;
+            cg = cg + (1.0 - cg) * spec;
+            cb = cb + (1.0 - cb) * spec;
+        }
+        return .{ cr, cg, cb };
+    }
     fn chromePixel(fx: f32, fy: f32, style: Style, g: Color, m: f32, pw: f32, ph: f32) u32 {
         const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
         const panel_cov = coverage(d_panel);
@@ -450,10 +492,11 @@ pub const Canvas = struct {
         if (style.glass_fade_width > 0.0) {
             glass_cov *= smoothstep(0.0, style.glass_fade_width, -d_panel);
         }
+        const gc = glassColorAt(style, g, m, ph, fy);
         const ga = g.a * glass_cov;
-        var pr: f32 = g.r * ga;
-        var pg: f32 = g.g * ga;
-        var pb: f32 = g.b * ga;
+        var pr: f32 = gc[0] * ga;
+        var pg: f32 = gc[1] * ga;
+        var pb: f32 = gc[2] * ga;
         var pa: f32 = ga + shadow * (1.0 - ga);
         pr = ring + pr * (1.0 - ring);
         pg = ring + pg * (1.0 - ring);
@@ -656,6 +699,31 @@ pub const Canvas = struct {
 
     /// Fill a rounded rect with a straight-alpha color (source-over). For decorative
     /// content drawn by apps that don't push zicro frames.
+    /// Riempie un raccordo CONCAVO (flare stile Chrome-tab): un quadrato `size`×`size` a (x,y)
+    /// dove i pixel a distanza >= `size` dal centro (cx,cy) sono riempiti → arco concavo con AA.
+    /// Con cx,cy sull'angolo esterno-alto del quadrato ottieni l'ala che allarga la tab in basso.
+    pub fn fillConcaveCorner(self: *Canvas, x: f32, y: f32, size: f32, cx: f32, cy: f32, color: Color) void {
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(x)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(y)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + size)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + size)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const dx = fx - cx;
+                const dy = fy - cy;
+                const dist = @sqrt(dx * dx + dy * dy);
+                const cov = coverage(size - dist);
+                if (cov <= 0.0) continue;
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * cov);
+            }
+        }
+    }
     pub fn fillRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) void {
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
