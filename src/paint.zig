@@ -117,12 +117,15 @@ fn coverage(d: f32) f32 {
 /// sRGB (0..1) → linear light (0..1). Needed to blend glyph antialiasing in
 /// linear space (typographic rendering): blending coverage directly in sRGB
 /// thins and dirties text edges, especially on a dark background.
-fn srgbToLinear(u: f32) f32 {
+/// Pub: le app con raster di testo propri (es. il layout documento di zuer)
+/// riusano ESATTAMENTE queste curve, così la resa tipografica è identica per
+/// costruzione ovunque.
+pub fn srgbToLinear(u: f32) f32 {
     return if (u <= 0.04045) u / 12.92 else std.math.pow(f32, (u + 0.055) / 1.055, 2.4);
 }
 
 /// Linear light (0..1) → sRGB (0..1).
-fn linearToSrgb(u: f32) f32 {
+pub fn linearToSrgb(u: f32) f32 {
     const x = std.math.clamp(u, 0.0, 1.0);
     return if (x <= 0.0031308) x * 12.92 else 1.055 * std.math.pow(f32, x, 1.0 / 2.4) - 0.055;
 }
@@ -130,19 +133,51 @@ fn linearToSrgb(u: f32) f32 {
 /// macOS-style "font smoothing": lifts mid coverage to slightly fatten the
 /// strokes (macOS renders text fuller and softer than raw grayscale). Exponent
 /// < 1 → fuller.
-fn smoothCoverage(a: f32) f32 {
+pub fn smoothCoverage(a: f32) f32 {
     return std.math.pow(f32, std.math.clamp(a, 0.0, 1.0), 0.72);
 }
 
 /// [`smoothCoverage`] tabulated over every u8 coverage value: glyph blitting reads
 /// coverage as a byte, so the table is exact (no interpolation) and replaces a `pow`
 /// per pixel with a load.
-const smooth_coverage_lut: [256]f32 = blk: {
+pub const smooth_coverage_lut: [256]f32 = blk: {
     @setEvalBranchQuota(2_000_000);
     var t: [256]f32 = undefined;
     for (&t, 0..) |*v, i| v.* = smoothCoverage(@as(f32, @floatFromInt(i)) / 255.0);
     break :blk t;
 };
+
+/// LUT sRGB byte (0..255) → luce lineare (0..1), per i loop di blending
+/// byte-oriented delle app (un load al posto di un `pow` per canale).
+pub const srgb_byte_to_linear: [256]f32 = blk: {
+    @setEvalBranchQuota(20_000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, i| {
+        const u = @as(f64, @floatFromInt(i)) / 255.0;
+        v.* = @floatCast(if (u <= 0.04045) u / 12.92 else std.math.pow(f64, (u + 0.055) / 1.055, 2.4));
+    }
+    break :blk t;
+};
+
+/// LUT lineare (0..1) → sRGB byte, indicizzata con `round(x*4095)`. Con 4096
+/// campioni l'errore di quantizzazione resta entro ~mezzo LSB anche nel tratto
+/// più ripido della curva (quello lineare vicino allo zero).
+pub const linear_to_srgb_byte: [4096]u8 = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var t: [4096]u8 = undefined;
+    for (&t, 0..) |*v, i| {
+        const u = @as(f64, @floatFromInt(i)) / 4095.0;
+        const s = if (u <= 0.0031308) u * 12.92 else 1.055 * std.math.pow(f64, u, 1.0 / 2.4) - 0.055;
+        v.* = @intFromFloat(@round(std.math.clamp(s, 0.0, 1.0) * 255.0));
+    }
+    break :blk t;
+};
+
+/// Luce lineare (0..1) → sRGB byte via [`linear_to_srgb_byte`].
+pub fn linearToSrgbByte(x: f32) u8 {
+    const q: u32 = @intFromFloat(@round(std.math.clamp(x, 0.0, 1.0) * 4095.0));
+    return linear_to_srgb_byte[q];
+}
 
 /// Pack already-premultiplied channels (each in [0,1]) into an ARGB8888 pixel.
 fn packPremul(r: f32, g: f32, b: f32, a: f32) u32 {
@@ -552,15 +587,28 @@ pub const Canvas = struct {
         const flat_cy0 = dy_f + guard;
         const flat_cy1 = dy_f + sh_f - guard;
 
-        var sy: u32 = 0;
-        while (sy < src_h) : (sy += 1) {
+        // Rispetta il clip attivo del canvas (usato dal present parziale di zrame:
+        // la regione damage limita quali pixel del frame vengono ricompositi).
+        var sy_start: u32 = 0;
+        var sy_end: u32 = src_h;
+        var sx_start: u32 = 0;
+        var sx_end: u32 = src_w;
+        if (self.clip) |c| {
+            sx_start = @min(src_w, c.x0 -| dst_x);
+            sy_start = @min(src_h, c.y0 -| dst_y);
+            sx_end = @min(src_w, c.x1 -| dst_x);
+            sy_end = @min(src_h, c.y1 -| dst_y);
+            if (sx_start >= sx_end or sy_start >= sy_end) return;
+        }
+        var sy: u32 = sy_start;
+        while (sy < sy_end) : (sy += 1) {
             const y = dst_y + sy;
             if (y >= self.height) break;
             const fy = @as(f32, @floatFromInt(y)) + 0.5;
             const row = self.pixels[@as(usize, y) * self.width ..][0..self.width];
             const src_row = src[@as(usize, sy) * src_w * 4 ..][0 .. @as(usize, src_w) * 4];
-            var sx: u32 = 0;
-            while (sx < src_w) : (sx += 1) {
+            var sx: u32 = sx_start;
+            while (sx < sx_end) : (sx += 1) {
                 const x = dst_x + sx;
                 if (x >= self.width) break;
                 const sp = src_row[@as(usize, sx) * 4 ..][0..4];
@@ -584,6 +632,16 @@ pub const Canvas = struct {
                     if (flat) {
                         // Deep interior: with a border band the content faded to zero here.
                         if (style.border_anim_width > 0.0) continue;
+                        // Both masks are saturated at 1 here, so an opaque source pixel is a
+                        // plain overwrite and a transparent one a no-op: skip the float
+                        // unpack/blend/pack round-trip. This is the full-frame hot path for
+                        // opaque content (images, video, mesh) under glass styles, where the
+                        // `trivial` shortcut above never applies.
+                        if (sp[3] == 255) {
+                            row[x] = 0xFF000000 | (@as(u32, sp[0]) << 16) | (@as(u32, sp[1]) << 8) | @as(u32, sp[2]);
+                            continue;
+                        }
+                        if (sp[3] == 0) continue;
                         // Otherwise mask and content_cov stay saturated at 1 — no SDF.
                     } else {
                         const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
