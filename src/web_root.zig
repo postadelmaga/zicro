@@ -9,8 +9,13 @@
 
 pub const paint = @import("paint.zig");
 pub const text = @import("text.zig");
+/// Wayland client bindings — pulled in only for the keycode/cursor CONSTANTS the panels
+/// reference (`wl.KEYBOARD_KEY_STATE_*`, cursor shapes); the extern libwayland functions
+/// are never called on wasm, so they stay unresolved-but-harmless (lazy analysis).
+pub const wl = @import("wl.zig");
 pub const anim = @import("anim.zig");
 pub const keymap = @import("keymap.zig");
+pub const scroll = @import("scroll.zig");
 /// The immediate-mode widget toolkit — the whole point of the web port: the same
 /// button/checkbox/toggle/slider/dropdown/textField that run natively, in a canvas.
 pub const widget = @import("widget.zig");
