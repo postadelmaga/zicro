@@ -826,6 +826,69 @@ pub const Canvas = struct {
         }
     }
 
+    /// Fill a rounded rect with a **vertical gradient** from `top` (at `y`) to `bottom`
+    /// (at `y+h`), the two straight colors lerped per scanline. Same AA/SDF coverage and
+    /// [`Format`] handling as [`fillRoundedRect`]; the depth cue widgets use for a subtle
+    /// top-sheen (macOS) or a tonal accent (the signature theme). Pass equal colors for a
+    /// flat fill (a no-op gradient).
+    pub fn fillRoundedRectVGradient(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, top: Color, bottom: Color) void {
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        const inv_h = if (h > 0.0) 1.0 / h else 0.0;
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            // Gradient parameter is constant across the scanline: lerp the color once.
+            const g = std.math.clamp((fy - y) * inv_h, 0.0, 1.0);
+            const cr = top.r + (bottom.r - top.r) * g;
+            const cg = top.g + (bottom.g - top.g) * g;
+            const cb = top.b + (bottom.b - top.b) * g;
+            const ca = top.a + (bottom.a - top.a) * g;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const cov = coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
+                if (cov <= 0.0) continue;
+                row[px] = self.overColor(row[px], cr, cg, cb, ca * cov);
+            }
+        }
+    }
+
+    /// Paint a **soft drop shadow** for the rounded rect `(x,y,w,h,radius)`: solid under
+    /// the shape (the widget's own fill, drawn on top afterward, hides it) and a smooth
+    /// `blur`-wide penumbra fading outward, offset down by `offset_y`. This is the
+    /// elevation lever — the analytic falloff of the same SDF the fill uses, so shadow and
+    /// shape share one silhouette. `color.a` is the peak opacity. Honors [`Format`].
+    pub fn dropShadowRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, blur: f32, offset_y: f32, color: Color) void {
+        if (color.a <= 0.0) return;
+        const b = @max(blur, 0.5);
+        const sy = y + offset_y;
+        const pad = b + 1.0;
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - pad)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(sy - pad)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + pad)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(sy + h + pad)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const d = roundedRectSdf(fx, fy, x, sy, w, h, radius);
+                // Solid at/inside the edge, smooth falloff to zero over `blur` outside.
+                const shade = 1.0 - smoothstep(0.0, b, @max(d, 0.0));
+                if (shade <= 0.0) continue;
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * shade);
+            }
+        }
+    }
+
     /// Stroke a circular arc from angle `a0` to `a1` (radians, 0 = +x, growing clockwise
     /// in screen space) at radius `radius` around `(cx,cy)`, as a rounded stroke of the
     /// given `width`. The arc is flattened into short capsule segments and the whole span
@@ -1157,6 +1220,66 @@ test "spinner and progress primitives leave ink" {
     const r_lo = unpackStraight(pixels[30 * W + 20]); // ~10% across → filled
     const r_hi = unpackStraight(pixels[30 * W + 100]); // ~90% across → track
     try std.testing.expect(r_lo[2] > r_hi[2]); // fill is bluer (higher B) than the track
+}
+
+test "vertical gradient interpolates top→bottom and matches flat fill when colors are equal" {
+    const gpa = std.testing.allocator;
+    const W: u32 = 60;
+    const H: u32 = 60;
+    const px = try gpa.alloc(u32, W * H);
+    defer gpa.free(px);
+    const bg = packStraight(0.0, 0.0, 0.0, 1.0);
+    var canvas = Canvas.initRgba8(px, W, H);
+
+    // A gradient from red at the top to blue at the bottom: top row is redder, bottom bluer.
+    @memset(px, bg);
+    const top = Color.rgba(255, 0, 0, 1.0);
+    const bot = Color.rgba(0, 0, 255, 1.0);
+    canvas.fillRoundedRectVGradient(6, 6, 48, 48, 6, top, bot);
+    const near_top = unpackStraight(px[12 * W + 30]);
+    const near_bot = unpackStraight(px[48 * W + 30]);
+    try std.testing.expect(near_top[0] > near_bot[0]); // more red up top
+    try std.testing.expect(near_bot[2] > near_top[2]); // more blue at the bottom
+
+    // Equal endpoints must be byte-identical to the flat rounded-rect fill.
+    const flat = Color.rgba(90, 140, 210, 0.8);
+    const a = try gpa.alloc(u32, W * H);
+    defer gpa.free(a);
+    const b = try gpa.alloc(u32, W * H);
+    defer gpa.free(b);
+    @memset(a, bg);
+    @memset(b, bg);
+    var ca = Canvas.initRgba8(a, W, H);
+    var cb = Canvas.initRgba8(b, W, H);
+    ca.fillRoundedRectVGradient(6, 6, 48, 48, 10, flat, flat);
+    cb.fillRoundedRect(6, 6, 48, 48, 10, flat);
+    try std.testing.expectEqualSlices(u32, b, a);
+}
+
+test "drop shadow is solid under the shape and fades outward to nothing" {
+    const gpa = std.testing.allocator;
+    const W: u32 = 100;
+    const H: u32 = 100;
+    const px = try gpa.alloc(u32, W * H);
+    defer gpa.free(px);
+    // Opaque white background: a black shadow shows as darkened RGB (alpha stays 1).
+    const bg = packStraight(1.0, 1.0, 1.0, 1.0);
+    var canvas = Canvas.initRgba8(px, W, H);
+    @memset(px, bg);
+
+    // Shadow of a centered box, no offset, wide blur.
+    canvas.dropShadowRoundedRect(30, 30, 40, 40, 8, 12, 0, Color.rgba(0, 0, 0, 0.6));
+    const center = unpackStraight(px[50 * W + 50]);
+    const just_out = unpackStraight(px[50 * W + 74]); // ~4px past the right edge
+    const far_out = unpackStraight(px[50 * W + 92]); // well beyond the blur
+    // Under the shape the shadow is at peak (darkest); it decays with distance; far away it is gone.
+    try std.testing.expect(center[0] < just_out[0]);
+    try std.testing.expect(just_out[0] < far_out[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), far_out[0], 0.02); // untouched white background
+    // Zero-alpha shadow is a no-op.
+    const before = px[10 * W + 10];
+    canvas.dropShadowRoundedRect(30, 30, 40, 40, 8, 12, 0, Color.rgba(0, 0, 0, 0.0));
+    try std.testing.expectEqual(before, px[10 * W + 10]);
 }
 
 test "chrome paints premultiplied" {

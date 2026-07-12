@@ -14,6 +14,20 @@ const BTN_LEFT: u32 = widget.BTN_LEFT;
 const BTN_RIGHT: u32 = widget.BTN_RIGHT;
 const BTN_MIDDLE: u32 = widget.BTN_MIDDLE;
 
+/// The theme presets the header button cycles through — neutral tokens dressed as macOS,
+/// Material 3, or the signature look, in dark and light. Click the header button to advance.
+const Preset = struct { name: []const u8, dark_bg: bool, make: *const fn () widget.Theme };
+const presets = [_]Preset{
+    .{ .name = "dark (base)", .dark_bg = true, .make = &widget.Theme.dark },
+    .{ .name = "light (base)", .dark_bg = false, .make = &widget.Theme.light },
+    .{ .name = "macOS", .dark_bg = true, .make = &widget.Theme.macos },
+    .{ .name = "macOS · light", .dark_bg = false, .make = &widget.Theme.macosLight },
+    .{ .name = "Material 3", .dark_bg = true, .make = &widget.Theme.material },
+    .{ .name = "Material 3 · light", .dark_bg = false, .make = &widget.Theme.materialLight },
+    .{ .name = "signature", .dark_bg = true, .make = &widget.Theme.signature },
+    .{ .name = "signature · light", .dark_bg = false, .make = &widget.Theme.signatureLight },
+};
+
 const AppState = struct {
     gpa: std.mem.Allocator,
     window: *window.Window = undefined,
@@ -21,8 +35,8 @@ const AppState = struct {
     widget_store: widget.Store,
     queue: widget.InputQueue,
 
-    // Theme state
-    is_dark: bool = true,
+    // Theme state: index into `presets`, advanced by the header button.
+    theme_idx: usize = 6, // start on the signature look
 
     // Widget states
     active_tab: usize = 0,
@@ -69,8 +83,10 @@ const AppState = struct {
 fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const state = @as(*AppState, @ptrCast(@alignCast(user.?)));
 
-    // Choose window background based on active style
-    const bg_color = if (state.is_dark)
+    const preset = presets[state.theme_idx % presets.len];
+
+    // Choose window background based on active preset
+    const bg_color = if (preset.dark_bg)
         paint.Color.rgba(18, 20, 26, 1.0)
     else
         paint.Color.rgba(240, 242, 245, 1.0);
@@ -85,7 +101,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
         bg_color,
     );
 
-    const theme = if (state.is_dark) widget.Theme.dark() else widget.Theme.light();
+    const theme = preset.make();
 
     const bounds = widget.Rect{
         .x = @floatFromInt(content.x),
@@ -103,8 +119,9 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     ui.beginCard(65);
     ui.beginRow();
     ui.heading("Zicro Widget Demo");
-    ui.gap(ui.availW() - 250); // Push controls to the right
-    _ = ui.toggle(if (state.is_dark) "Stile Dark" else "Stile Light", &state.is_dark);
+    ui.gap(ui.availW() - 300); // Push controls to the right
+    ui.labelDim("Tema →");
+    if (ui.buttonPrimary(preset.name)) state.theme_idx +%= 1; // click to cycle presets
     ui.endRow();
     ui.endCard();
 
