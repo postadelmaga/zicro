@@ -764,3 +764,22 @@ pub const FractionalScale = opaque {
         addListener(self, listener, data);
     }
 };
+
+pub extern const org_kde_kwin_appmenu_manager_interface: Interface;
+pub extern const org_kde_kwin_appmenu_interface: Interface;
+
+pub const OrgKdeKwinAppmenuManager = opaque {
+    pub fn create(self: *OrgKdeKwinAppmenuManager, surface: *Surface) *OrgKdeKwinAppmenu {
+        const p = wl_proxy_marshal_flags(proxy(self), 0, &org_kde_kwin_appmenu_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(surface)));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const OrgKdeKwinAppmenu = opaque {
+    pub fn setAddress(self: *OrgKdeKwinAppmenu, service_name: [*:0]const u8, object_path: [*:0]const u8) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), 0, service_name, object_path);
+    }
+    pub fn release(self: *OrgKdeKwinAppmenu) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+};

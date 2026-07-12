@@ -57,6 +57,12 @@ pub fn build(b: *std.Build) void {
         tablet_scan.addFileArg(.{ .cwd_relative = tablet_xml });
         const tablet_c = tablet_scan.addOutputFileArg("tablet-v2.c");
         zicro.addCSourceFile(.{ .file = tablet_c });
+
+        const appmenu_xml = "/usr/share/qt6/wayland/protocols/appmenu/appmenu.xml";
+        const appmenu_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        appmenu_scan.addFileArg(.{ .cwd_relative = appmenu_xml });
+        const appmenu_c = appmenu_scan.addOutputFileArg("appmenu.c");
+        zicro.addCSourceFile(.{ .file = appmenu_c });
     }
     // winmm: backend audio waveOut (audio_device.zig) su Windows.
     if (target.result.os.tag == .windows) zicro.linkSystemLibrary("winmm", .{});
@@ -111,6 +117,12 @@ pub fn build(b: *std.Build) void {
         tablet_scan.addFileArg(.{ .cwd_relative = tablet_xml });
         const tablet_c = tablet_scan.addOutputFileArg("tablet-v2.c");
         zicro_fast.addCSourceFile(.{ .file = tablet_c });
+
+        const appmenu_xml = "/usr/share/qt6/wayland/protocols/appmenu/appmenu.xml";
+        const appmenu_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        appmenu_scan.addFileArg(.{ .cwd_relative = appmenu_xml });
+        const appmenu_c = appmenu_scan.addOutputFileArg("appmenu.c");
+        zicro_fast.addCSourceFile(.{ .file = appmenu_c });
     }
     if (target.result.os.tag == .windows) zicro_fast.linkSystemLibrary("winmm", .{});
     if (target.result.os.tag == .macos) addMacosLinks(b, zicro_fast, macos_sysroot);

@@ -31,7 +31,7 @@ pub const Axis = enum(u1) { horizontal = 0, vertical = 1 };
 const dormant_width: f32 = 2.0;
 const expanded_width: f32 = 10.0;
 const min_thumb: f32 = 12.0;
-const inner_margin: f32 = 3.0;
+const inner_margin: f32 = 1.0;
 const grab_tol: f32 = 8.0; // extra hover/grab reach beyond the bar's visual width (lead-in)
 // Opacity ramps. The track background only shows while the pointer is on the bar
 // (aiming/dragging): on plain area-hover just the thumb fades in, so a translucent

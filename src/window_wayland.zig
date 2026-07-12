@@ -31,6 +31,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     decoration_manager: ?*wl.ZxdgDecorationManager = null,
     decoration: ?*wl.ZxdgToplevelDecoration = null,
     cursor_shape_manager: ?*wl.CursorShapeManager = null,
+    appmenu_manager: ?*wl.OrgKdeKwinAppmenuManager = null,
+    appmenu: ?*wl.OrgKdeKwinAppmenu = null,
 
     width: u32,
     height: u32,
@@ -360,6 +362,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (self.decoration) |d| wl.wl_proxy_destroy(@ptrCast(d));
         if (self.decoration_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
         if (self.cursor_shape_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
+        if (self.appmenu) |am| am.release();
+        if (self.appmenu_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
         if (self.toplevel) |t| wl.wl_proxy_destroy(@ptrCast(t));
         if (self.xdg_surface) |x| wl.wl_proxy_destroy(@ptrCast(x));
         if (self.surface) |s| s.destroy();
@@ -367,6 +371,21 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         _ = linux.close(self.wake_fd);
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    pub fn setAppMenuAddress(self: *Window, service_name: [*:0]const u8, object_path: [*:0]const u8) void {
+        const root = self.parent orelse self;
+        if (root.appmenu_manager) |mgr| {
+            if (self.appmenu) |am| {
+                am.release();
+                self.appmenu = null;
+            }
+            if (self.surface) |surf| {
+                const am = mgr.create(surf);
+                am.setAddress(service_name, object_path);
+                self.appmenu = am;
+            }
+        }
     }
 
     pub fn toggleFullscreen(self: *Window) void {
@@ -634,6 +653,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             const seat: *wl.Seat = @ptrCast(registry.bind(name, &wl.wl_seat_interface, @min(ver, 5)).?);
             seat.setListener(&seat_listener, self);
             self.seat = seat;
+        } else if (std.mem.eql(u8, iface, "org_kde_kwin_appmenu_manager")) {
+            self.appmenu_manager = @ptrCast(registry.bind(name, &wl.org_kde_kwin_appmenu_manager_interface, 1).?);
         }
     }
 
