@@ -41,10 +41,17 @@ const Face = struct {
 
 const CacheKey = struct { px: u16, style: Style, sub_x: u2, cp: u32 };
 
-/// A font: up to 4 faces + a shared glyph cache (key px+style+cp).
+/// A font: up to 4 styled faces + an ordered fallback chain + a shared glyph
+/// cache (key px+style+cp). When the primary face lacks a codepoint, the glyph
+/// is pulled from the first fallback that has it (CJK, emoji-outline, symbols…),
+/// instead of rendering a missing-glyph box.
 pub const Font = struct {
     gpa: std.mem.Allocator,
     faces: [4]?Face = .{ null, null, null, null },
+    /// Consulted in order for codepoints the styled face doesn't cover. Style-less:
+    /// a fallback face serves every style (a CJK fallback rarely ships a bold cut,
+    /// and a tofu box in the right weight helps no one).
+    fallbacks: std.ArrayListUnmanaged(Face) = .empty,
     cache: std.AutoHashMapUnmanaged(CacheKey, Glyph) = .empty,
 
     /// Default font: Hack regular + bold embedded in the binary.
@@ -84,6 +91,32 @@ pub const Font = struct {
         try self.setFace(style, bytes, true);
     }
 
+    /// Appends a fallback face from TTF bytes (ownership follows `own`, as in
+    /// `setFace`). Fallbacks are tried in insertion order for codepoints the
+    /// styled face lacks. Clears the cache (glyph resolution can now change).
+    pub fn addFallback(self: *Font, ttf: []const u8, own: bool) !void {
+        var face: Face = .{ .info = undefined, .owned = if (own) @constCast(ttf) else null };
+        const p: [*c]const u8 = @ptrCast(ttf.ptr);
+        const off = c.stbtt_GetFontOffsetForIndex(p, 0);
+        if (c.stbtt_InitFont(&face.info, p, off) == 0) return error.FontInit;
+        try self.fallbacks.append(self.gpa, face);
+        self.clearCache();
+    }
+
+    /// Whether some face (styled or fallback) can render `cp` with a real glyph
+    /// (not the .notdef box). Codepoint 0 is treated as "coverable" (it maps to
+    /// .notdef by definition).
+    pub fn hasGlyph(self: *Font, style: Style, cp: u32) bool {
+        if (cp == 0) return true;
+        if (self.faceFor(style)) |info| {
+            if (c.stbtt_FindGlyphIndex(info, @intCast(cp)) != 0) return true;
+        }
+        for (self.fallbacks.items) |*f| {
+            if (c.stbtt_FindGlyphIndex(&f.info, @intCast(cp)) != 0) return true;
+        }
+        return false;
+    }
+
     fn clearCache(self: *Font) void {
         var it = self.cache.valueIterator();
         while (it.next()) |g| if (g.bitmap.len > 0) self.gpa.free(g.bitmap);
@@ -109,12 +142,25 @@ pub const Font = struct {
         return c.stbtt_ScaleForPixelHeight(info, @floatFromInt(px));
     }
 
+    /// Face that should rasterize `cp` for `style`: the styled face when it covers
+    /// the codepoint, else the first fallback that does, else the styled face
+    /// (which renders .notdef — a visible box beats a silent drop). Resolution is
+    /// deterministic for a fixed face set, so the cache key needs no face id.
+    fn faceForCp(self: *Font, style: Style, cp: u32) ?*c.stbtt_fontinfo {
+        const primary = self.faceFor(style) orelse return null;
+        if (cp == 0 or c.stbtt_FindGlyphIndex(primary, @intCast(cp)) != 0) return primary;
+        for (self.fallbacks.items) |*f| {
+            if (c.stbtt_FindGlyphIndex(&f.info, @intCast(cp)) != 0) return &f.info;
+        }
+        return primary;
+    }
+
     /// Rasterized glyph for (size, style, subpixel_x, codepoint), from the cache.
     pub fn getGlyph(self: *Font, px: u16, style: Style, sub_x: u2, cp: u32) !*const Glyph {
         const key = CacheKey{ .px = px, .style = style, .sub_x = sub_x, .cp = cp };
         if (self.cache.getPtr(key)) |g| return g;
 
-        const info = self.faceFor(style) orelse return error.NoFace;
+        const info = self.faceForCp(style, cp) orelse return error.NoFace;
         const scale = scaleFor(info, px);
 
         var w: c_int = 0;
@@ -205,6 +251,8 @@ pub const Font = struct {
         for (self.faces) |maybe| {
             if (maybe) |f| if (f.owned) |b| self.gpa.free(b);
         }
+        for (self.fallbacks.items) |f| if (f.owned) |b| self.gpa.free(b);
+        self.fallbacks.deinit(self.gpa);
     }
 };
 
@@ -227,4 +275,37 @@ test "default font rasterizes a glyph" {
     try std.testing.expect(font.measure(24, .regular, "Hi") > font.measure(24, .regular, "H"));
     // Bold falls back to a valid (embedded) face; a no-ink space is fine.
     _ = try font.getGlyph(18, .bold, 0, 'g');
+}
+
+test "fallback chain resolves a codepoint the primary lacks" {
+    const gpa = std.testing.allocator;
+    var font = try Font.initDefault(gpa);
+    defer font.deinit();
+
+    // Hack (a code font) has no SNOWMAN — the primary can't cover it.
+    const snowman: u32 = 0x2603;
+    try std.testing.expect(!font.hasGlyph(.regular, snowman));
+    try std.testing.expect(font.hasGlyph(.regular, 'A')); // but it has Latin
+
+    // DejaVu Sans (glyf TrueType, ubiquitous) does. Read its bytes via the io API
+    // and register as a fallback; skip if this box lacks the font.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const deja = "/usr/share/fonts/TTF/DejaVuSans.ttf";
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, deja, gpa, .limited(64 * 1024 * 1024)) catch return;
+    try font.addFallback(bytes, true); // font owns & frees the bytes
+
+    try std.testing.expect(font.hasGlyph(.regular, snowman)); // now coverable
+    const g = try font.getGlyph(32, .regular, 0, snowman);
+    // The fallback glyph rasterized with real ink (not an empty .notdef).
+    var ink = false;
+    for (g.bitmap) |cov| {
+        if (cov > 0) ink = true;
+    }
+    try std.testing.expect(ink);
+    try std.testing.expect(g.advance > 0);
+
+    // A Latin glyph still comes from the primary (Hack), unaffected by the fallback.
+    try std.testing.expect((try font.getGlyph(32, .regular, 0, 'A')).advance > 0);
 }
