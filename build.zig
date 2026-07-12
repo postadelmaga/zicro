@@ -161,6 +161,42 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step("run-" ++ name, "Run the " ++ name ++ " example");
         run_step.dependOn(&run_cmd.step);
     }
+
+    // `zig build web` — the WebAssembly build: the CPU canvas in a browser tab.
+    // wasm32-freestanding, no libc, no C: a dedicated minimal `zicro` module that
+    // exposes only `paint` (the full root's threads/Io/Wayland don't exist on wasm).
+    // Emits zig-out/web/{zicro.wasm,index.html}; `serve` that dir and open it.
+    {
+        const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+        const web_zicro = b.createModule(.{
+            .root_source_file = b.path("src/web_root.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        });
+        // stb_truetype for wasm: the web C shim predefines the STBTT_* hooks (no libc
+        // headers) and routes malloc/libm to the Zig shims in wasm_shim.zig.
+        web_zicro.addIncludePath(b.path("vendor/stb"));
+        web_zicro.addCSourceFile(.{
+            .file = b.path("vendor/stb/stb_truetype_web.c"),
+            .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+        });
+        const web_mod = b.createModule(.{
+            .root_source_file = b.path("examples/web_demo.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zicro", .module = web_zicro }},
+        });
+        const web_exe = b.addExecutable(.{ .name = "zicro", .root_module = web_mod });
+        web_exe.entry = .disabled; // no _start: JS drives the exported functions
+        web_exe.rdynamic = true; //    keep the exports (zicroFrame, zicroPointer, …)
+        const install_wasm = b.addInstallArtifact(web_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "web" } },
+        });
+        const copy_html = b.addInstallFileWithDir(b.path("web/index.html"), .{ .custom = "web" }, "index.html");
+        const web_step = b.step("web", "Build the WebAssembly canvas demo into zig-out/web");
+        web_step.dependOn(&install_wasm.step);
+        web_step.dependOn(&copy_html.step);
+    }
 }
 
 /// The macOS link set for a module: libobjc + Cocoa (load command) + CoreGraphics.

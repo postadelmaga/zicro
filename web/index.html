@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>zicro · web</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0c12; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #err { position: fixed; inset: 0; display: none; place-content: center; color: #f78; font: 14px monospace; padding: 2rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="err"></div>
+<script type="module">
+// zicro on the web: instantiate the wasm, drive requestAnimationFrame, blit the
+// module's RGBA buffer straight into the canvas with putImageData, forward pointer
+// events. The wasm is pure `zicro.paint` — the same CPU rasterizer as the native app.
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d", { alpha: false });
+const errEl = document.getElementById("err");
+
+function fail(msg) { errEl.style.display = "grid"; errEl.textContent = "zicro web error:\n" + msg; }
+
+let wasm, mem;
+try {
+  const res = await fetch("zicro.wasm");
+  const { instance } = await WebAssembly.instantiateStreaming(res, {
+    // Freestanding Zig traps on panic; give it somewhere to land so we see it.
+    env: { }
+  });
+  wasm = instance.exports;
+  mem = wasm.memory;
+} catch (e) { fail(String(e)); throw e; }
+
+function resize() {
+  // Match the drawable to the CSS pixels (scale 1 for this first milestone).
+  const w = Math.max(1, Math.floor(window.innerWidth));
+  const h = Math.max(1, Math.floor(window.innerHeight));
+  canvas.width = w; canvas.height = h;
+  wasm.zicroResize(w, h);
+}
+window.addEventListener("resize", resize);
+resize();
+
+function pointer(e, down) {
+  const r = canvas.getBoundingClientRect();
+  wasm.zicroPointer(e.clientX - r.left, e.clientY - r.top, down);
+}
+canvas.addEventListener("pointermove", (e) => pointer(e, e.buttons & 1 ? 1 : 0));
+canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); pointer(e, 1); });
+canvas.addEventListener("pointerup",   (e) => pointer(e, 0));
+
+function frame(tMs) {
+  wasm.zicroFrame(tMs / 1000);
+  const w = wasm.zicroWidth(), h = wasm.zicroHeight();
+  const ptr = wasm.zicroPixels();
+  // Zero-copy view of the wasm buffer as RGBA bytes → straight into the canvas.
+  const bytes = new Uint8ClampedArray(mem.buffer, ptr, w * h * 4);
+  ctx.putImageData(new ImageData(bytes, w, h), 0, 0);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

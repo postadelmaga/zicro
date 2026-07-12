@@ -1,0 +1,15 @@
+//! Minimal `zicro` surface for the `wasm32-freestanding` web target: the pure-Zig
+//! software canvas plus the stb_truetype text engine. The full root (bus, threads,
+//! std.Io, the Wayland/Win32 windows) is meaningless — and uncompilable — on a
+//! single-threaded wasm page, so the web build imports THIS as its "zicro" module
+//! instead of `root.zig`.
+//!
+//! `text` pulls stb_truetype (C); the freestanding libc shims it needs live in
+//! `wasm_shim.zig` (referenced below so its `export`s are emitted into the module).
+
+pub const paint = @import("paint.zig");
+pub const text = @import("text.zig");
+
+comptime {
+    _ = @import("wasm_shim.zig"); // keep zig_malloc/zig_free/zig_pow/… in the link
+}
