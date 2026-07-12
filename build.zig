@@ -197,6 +197,21 @@ pub fn build(b: *std.Build) void {
         web_step.dependOn(&install_wasm.step);
         web_step.dependOn(&copy_html.step);
     }
+
+    // `zig build android` — compile-check the NDK NativeActivity backend for
+    // aarch64-linux-android (issue #9). A build-obj: it verifies window_android.zig type-
+    // checks and codegens for the target; the libandroid link + APK packaging is #10.
+    {
+        const android_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android });
+        const and_mod = b.createModule(.{
+            .root_source_file = b.path("src/android_check.zig"),
+            .target = android_target,
+            .optimize = .ReleaseSmall,
+        });
+        const and_obj = b.addObject(.{ .name = "zicro-android", .root_module = and_mod });
+        const android_step = b.step("android", "Compile-check the Android (NDK) backend for aarch64-linux-android");
+        android_step.dependOn(&and_obj.step);
+    }
 }
 
 /// The macOS link set for a module: libobjc + Cocoa (load command) + CoreGraphics.

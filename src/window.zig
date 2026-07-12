@@ -51,7 +51,12 @@ pub const Options = struct {
 };
 
 pub const Window = switch (builtin.os.tag) {
-    .linux => @import("window_wayland.zig").Window,
+    // Android is os.tag = .linux, abi = .android: the NDK NativeActivity backend, not
+    // Wayland. Plain Linux keeps Wayland.
+    .linux => if (builtin.abi == .android or builtin.abi == .androideabi)
+        @import("window_android.zig").Window
+    else
+        @import("window_wayland.zig").Window,
     .windows => @import("window_win32.zig").Window,
     .macos => @import("window_cocoa.zig").Window,
     // Z-Scenic (Z#76 phase 2): Z's freestanding userspace target. Zicro
