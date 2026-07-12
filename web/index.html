@@ -14,9 +14,10 @@
 <canvas id="c" tabindex="0"></canvas>
 <div id="err"></div>
 <script type="module">
-// zicro on the web: instantiate the wasm, drive requestAnimationFrame, blit the module's
-// RGBA buffer into the canvas with putImageData, and forward DOM pointer/wheel/keyboard
-// events into the widget InputQueue. Same immediate-mode toolkit as the native app.
+// zicro on the web: the wasm module is a `zicro.window` app (on_draw/on_key/on_mouse).
+// This harness instantiates it, calls zicroBoot() once to open the window, then drives
+// requestAnimationFrame, blits the RGBA buffer with putImageData, and forwards DOM
+// pointer/wheel/keyboard events into the exported ABI the web Window backend owns.
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d", { alpha: false });
 const errEl = document.getElementById("err");
@@ -26,6 +27,7 @@ let x, mem;
 try {
   const { instance } = await WebAssembly.instantiateStreaming(fetch("zicro.wasm"), { env: {} });
   x = instance.exports; mem = x.memory;
+  x.zicroBoot();
 } catch (e) { fail(String(e)); throw e; }
 
 function resize() {
@@ -40,34 +42,41 @@ canvas.focus();
 // --- pointer ---
 const pos = (e) => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
 canvas.addEventListener("pointermove", (e) => { const [px, py] = pos(e); x.zicroPointerMove(px, py); });
-canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); canvas.focus(); const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(1); });
-canvas.addEventListener("pointerup",   (e) => { const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(0); });
+canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); canvas.focus(); const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 1); });
+canvas.addEventListener("pointerup",   (e) => { const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 0); });
 canvas.addEventListener("wheel", (e) => { e.preventDefault(); x.zicroScroll(-e.deltaY); }, { passive: false });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
-// --- keyboard: printable chars → text events, editing/navigation keys → evdev codes ---
+// --- keyboard: physical key (event.code) → evdev code. The wasm side turns codes into
+// text via the same US-layout keymap the native windows use. ---
 const EVDEV = {
-  Backspace: 14, Tab: 15, Enter: 28, Escape: 1, Delete: 111,
-  ArrowLeft: 105, ArrowRight: 106, ArrowUp: 103, ArrowDown: 108, Home: 102, End: 107,
+  KeyA:30,KeyB:48,KeyC:46,KeyD:32,KeyE:18,KeyF:33,KeyG:34,KeyH:35,KeyI:23,KeyJ:36,KeyK:37,KeyL:38,KeyM:50,
+  KeyN:49,KeyO:24,KeyP:25,KeyQ:16,KeyR:19,KeyS:31,KeyT:20,KeyU:22,KeyV:47,KeyW:17,KeyX:45,KeyY:21,KeyZ:44,
+  Digit1:2,Digit2:3,Digit3:4,Digit4:5,Digit5:6,Digit6:7,Digit7:8,Digit8:9,Digit9:10,Digit0:11,
+  Space:57,Minus:12,Equal:13,Comma:51,Period:52,Slash:53,Semicolon:39,Quote:40,
+  BracketLeft:26,BracketRight:27,Backslash:43,Backquote:41,
+  Backspace:14,Tab:15,Enter:28,Escape:1,Delete:111,Home:102,End:107,
+  ArrowLeft:105,ArrowRight:106,ArrowUp:103,ArrowDown:108,
+  ShiftLeft:42,ShiftRight:54,
 };
 canvas.addEventListener("keydown", (e) => {
-  const code = EVDEV[e.key];
-  if (code !== undefined) { e.preventDefault(); x.zicroKey(code, 1); return; }
-  if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    e.preventDefault();
-    x.zicroText(e.key.codePointAt(0));
-  }
+  const code = EVDEV[e.code];
+  if (code === undefined) return;
+  if (e.code !== "F5" && e.code !== "F12") e.preventDefault();
+  x.zicroKey(code, 1);
 });
 canvas.addEventListener("keyup", (e) => {
-  const code = EVDEV[e.key];
+  const code = EVDEV[e.code];
   if (code !== undefined) x.zicroKey(code, 0);
 });
 
 function frame(tMs) {
   x.zicroFrame(tMs);
   const w = x.zicroWidth(), h = x.zicroHeight();
-  const bytes = new Uint8ClampedArray(mem.buffer, x.zicroPixels(), w * h * 4);
-  ctx.putImageData(new ImageData(bytes, w, h), 0, 0);
+  if (w > 0 && h > 0) {
+    const bytes = new Uint8ClampedArray(mem.buffer, x.zicroPixels(), w * h * 4);
+    ctx.putImageData(new ImageData(bytes, w, h), 0, 0);
+  }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

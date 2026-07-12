@@ -14,6 +14,9 @@ pub const keymap = @import("keymap.zig");
 /// The immediate-mode widget toolkit — the whole point of the web port: the same
 /// button/checkbox/toggle/slider/dropdown/textField that run natively, in a canvas.
 pub const widget = @import("widget.zig");
+/// The web `Window` backend: the same `on_draw`/`on_key`/`on_mouse` contract as the
+/// native windows, with the browser driving the loop. `zicro.window.Window` on the web.
+pub const window = @import("window_web.zig");
 
 comptime {
     _ = @import("wasm_shim.zig"); // keep zig_malloc/zig_free/zig_pow/… in the link
