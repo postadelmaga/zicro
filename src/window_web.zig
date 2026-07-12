@@ -47,8 +47,10 @@ pub const Options = struct {
 };
 
 // One straight-RGBA8888 framebuffer (a browser page is single-window, single-threaded).
-const MAX_W: u32 = 2560;
-const MAX_H: u32 = 1600;
+// Sized for a 4K drawable so a HiDPI (devicePixelRatio 2) window still renders at native
+// physical pixels; JS clamps to whatever `zicroWidth/Height` report if it ever overflows.
+const MAX_W: u32 = 3840;
+const MAX_H: u32 = 2160;
 var backbuf: [MAX_W * MAX_H]u32 = undefined;
 
 /// The window JS is currently driving. Set by `init`/`run`, read by the exported ABI.
@@ -56,9 +58,18 @@ var active: ?*Window = null;
 /// The latest frame timestamp (ms) JS passed to `zicroFrame` — the browser clock the app
 /// reads via `nowMs()` (wasm freestanding has no `std.os` clock).
 var frame_now_ms: i64 = 0;
+/// The compositor/display scale: `window.devicePixelRatio`. The framebuffer is sized in
+/// physical pixels; an app reads this via `scaleFactor()` and passes it to
+/// `Theme.scaled(f)` so widgets keep their visual size while rendering crisp at native res.
+var frame_scale: f32 = 1;
 var last_x: f32 = -1;
 var last_y: f32 = -1;
 var singleton: Window = undefined;
+
+/// Display scale (HiDPI): `devicePixelRatio`, 1 on a standard-density screen.
+pub fn scaleFactor() f32 {
+    return frame_scale;
+}
 
 /// Monotonic milliseconds for the app's UI (caret blink, animation): the last value JS
 /// handed to `zicroFrame` (i.e. `performance.now()`). The web analogue of the native
@@ -140,10 +151,12 @@ export fn zicroWidth() u32 {
 export fn zicroHeight() u32 {
     return if (active) |w| w.height else 0;
 }
-export fn zicroResize(w: u32, h: u32) void {
+/// `w`/`h` are PHYSICAL pixels (CSS size × devicePixelRatio); `scale` is that ratio.
+export fn zicroResize(w: u32, h: u32, scale: f32) void {
     const win = active orelse return;
     win.width = std.math.clamp(w, 1, MAX_W);
     win.height = std.math.clamp(h, 1, MAX_H);
+    frame_scale = if (scale > 0) scale else 1;
 }
 
 /// One frame: tick, then draw into the window's buffer (which JS blits).

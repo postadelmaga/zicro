@@ -30,21 +30,27 @@ try {
   x.zicroBoot();
 } catch (e) { fail(String(e)); throw e; }
 
+// HiDPI: render into a PHYSICAL-pixel buffer (CSS size × devicePixelRatio) and hand the
+// ratio to the wasm side, which scales the widget theme so everything stays the right
+// visual size but crisp at native resolution. Pointer coords (CSS px) are ×dpr to match.
+let dpr = 1;
 function resize() {
-  const w = Math.max(1, window.innerWidth | 0), h = Math.max(1, window.innerHeight | 0);
-  canvas.width = w; canvas.height = h;
-  x.zicroResize(w, h);
+  dpr = window.devicePixelRatio || 1;
+  const cssW = Math.max(1, window.innerWidth | 0), cssH = Math.max(1, window.innerHeight | 0);
+  x.zicroResize(Math.round(cssW * dpr), Math.round(cssH * dpr), dpr);
+  canvas.width = x.zicroWidth();   // what the wasm side actually took (clamped to its buffer)
+  canvas.height = x.zicroHeight(); // CSS 100vw/100vh then displays it at the right size
 }
 window.addEventListener("resize", resize);
 resize();
 canvas.focus();
 
-// --- pointer ---
-const pos = (e) => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+// --- pointer (CSS px → physical px) ---
+const pos = (e) => { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) * dpr, (e.clientY - r.top) * dpr]; };
 canvas.addEventListener("pointermove", (e) => { const [px, py] = pos(e); x.zicroPointerMove(px, py); });
 canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); canvas.focus(); const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 1); });
 canvas.addEventListener("pointerup",   (e) => { const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 0); });
-canvas.addEventListener("wheel", (e) => { e.preventDefault(); x.zicroScroll(-e.deltaY); }, { passive: false });
+canvas.addEventListener("wheel", (e) => { e.preventDefault(); x.zicroScroll(-e.deltaY * dpr); }, { passive: false });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
 // --- keyboard: physical key (event.code) → evdev code. The wasm side turns codes into

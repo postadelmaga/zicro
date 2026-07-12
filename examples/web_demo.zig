@@ -107,47 +107,51 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     canvas.fillRoundedRect(@floatFromInt(content.x), @floatFromInt(content.y), @floatFromInt(content.w), @floatFromInt(content.h), 0, bg);
 
     const bounds = widget.Rect{ .x = @floatFromInt(content.x), .y = @floatFromInt(content.y), .w = @floatFromInt(content.w), .h = @floatFromInt(content.h) };
-    var ui = widget.Ui.begin(&s.store, canvas, &s.font, preset.make(), bounds, window.nowMs(), s.queue.take());
+    // HiDPI: the buffer is physical pixels, so scale the theme (and the layout literals
+    // below, via `ui.theme.s`) by devicePixelRatio — widgets keep their visual size and
+    // render crisp at native resolution.
+    const theme = preset.make().scaled(window.scaleFactor());
+    var ui = widget.Ui.begin(&s.store, canvas, &s.font, theme, bounds, window.nowMs(), s.queue.take());
 
-    ui.beginCard(64);
+    ui.beginCard(ui.theme.s(64));
     ui.beginRow();
     ui.heading("zicro · web");
-    ui.gap(24);
+    ui.gap(ui.theme.s(24));
     ui.labelDim("Tema:");
     if (ui.buttonPrimary(preset.name)) s.theme_idx +%= 1;
-    ui.gap(16);
+    ui.gap(ui.theme.s(16));
     ui.labelDim("(click per ciclare)");
     ui.endRow();
     ui.endCard();
-    ui.gap(10);
+    ui.gap(ui.theme.s(10));
 
     const tabs = &[_][]const u8{ "Widget Base", "Input Avanzati", "Indicatori", "Scorrimento" };
     _ = ui.tabBar("main_tabs", tabs, &s.active_tab);
-    ui.gap(12);
+    ui.gap(ui.theme.s(12));
 
     switch (s.active_tab) {
         0 => {
-            ui.beginCard(300);
+            ui.beginCard(ui.theme.s(300));
             ui.heading("Pulsanti e selezioni");
             ui.separator();
-            ui.gap(5);
+            ui.gap(ui.theme.s(5));
             ui.beginRow();
             if (ui.button("Pulsante")) s.button_clicks += 1;
             if (ui.buttonPrimary("Primario")) s.primary_clicks += 1;
             ui.endRow();
-            ui.gap(5);
+            ui.gap(ui.theme.s(5));
             ui.beginRow();
             ui.labelDim("click:");
             var b: [48]u8 = undefined;
             ui.label(std.fmt.bufPrint(&b, "{d} / {d}", .{ s.button_clicks, s.primary_clicks }) catch "0 / 0");
             ui.endRow();
             ui.separator();
-            ui.gap(5);
+            ui.gap(ui.theme.s(5));
             ui.beginRow();
             _ = ui.checkbox("Abilita", &s.checkbox_val);
             _ = ui.toggle("Notifiche", &s.toggle_val);
             ui.endRow();
-            ui.gap(5);
+            ui.gap(ui.theme.s(5));
             ui.beginRow();
             ui.label("Radio:");
             _ = ui.radio("A", &s.radio_val, 0);
@@ -157,19 +161,19 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             ui.endCard();
         },
         1 => {
-            ui.beginCard(320);
+            ui.beginCard(ui.theme.s(320));
             ui.heading("Controlli avanzati");
             ui.separator();
-            ui.gap(5);
+            ui.gap(ui.theme.s(5));
             _ = ui.stepper("Contatore", &s.stepper_val, 0, 100);
-            ui.gap(8);
+            ui.gap(ui.theme.s(8));
             _ = ui.slider("Volume", &s.slider_val, 0, 1);
-            ui.gap(10);
+            ui.gap(ui.theme.s(10));
             ui.beginRow();
             ui.label("Nome:");
             _ = ui.textField("name_field", &s.name_buf);
             ui.endRow();
-            ui.gap(10);
+            ui.gap(ui.theme.s(10));
             ui.beginRow();
             ui.label("Menu:");
             const opts = &[_][]const u8{ "Opzione 1", "Opzione 2", "Opzione 3", "Opzione 4" };
@@ -178,15 +182,15 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             ui.endCard();
         },
         2 => {
-            ui.beginCard(280);
+            ui.beginCard(ui.theme.s(280));
             ui.heading("Stato");
             ui.separator();
-            ui.gap(10);
+            ui.gap(ui.theme.s(10));
             ui.label("Avanzamento");
             ui.progressBar(s.progress_val);
-            ui.gap(10);
+            ui.gap(ui.theme.s(10));
             ui.progressIndeterminate();
-            ui.gap(10);
+            ui.gap(ui.theme.s(10));
             ui.beginRow();
             ui.label("Spinner:");
             ui.spinner();
@@ -194,11 +198,11 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             ui.endCard();
         },
         else => {
-            ui.beginCard(300);
+            ui.beginCard(ui.theme.s(300));
             ui.heading("Lista scorrevole");
             ui.separator();
-            ui.gap(5);
-            ui.beginScroll("list", 220);
+            ui.gap(ui.theme.s(5));
+            ui.beginScroll("list", ui.theme.s(220));
             var i: usize = 0;
             while (i < 24) : (i += 1) {
                 ui.pushIdScopeIndex(i);
