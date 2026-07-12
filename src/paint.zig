@@ -31,7 +31,60 @@ pub const Color = struct {
             .a = a,
         };
     }
+
+    /// Component-wise linear blend `a→b` (all four channels). The one place color lerping
+    /// lives — the widget toolkit and every demo share it instead of re-rolling their own.
+    pub fn lerp(a: Color, b: Color, t: f32) Color {
+        return .{ .r = a.r + (b.r - a.r) * t, .g = a.g + (b.g - a.g) * t, .b = a.b + (b.b - a.b) * t, .a = a.a + (b.a - a.a) * t };
+    }
+
+    /// Tint toward white (`amt > 0`) or black (`amt < 0`), alpha preserved — the sheen/hover
+    /// lightening the widgets and demos use.
+    pub fn shade(c: Color, amt: f32) Color {
+        if (amt >= 0) return .{ .r = c.r + (1 - c.r) * amt, .g = c.g + (1 - c.g) * amt, .b = c.b + (1 - c.b) * amt, .a = c.a };
+        const k = -amt;
+        return .{ .r = c.r * (1 - k), .g = c.g * (1 - k), .b = c.b * (1 - k), .a = c.a };
+    }
+
+    /// The same color at a different alpha.
+    pub fn withAlpha(c: Color, a: f32) Color {
+        return .{ .r = c.r, .g = c.g, .b = c.b, .a = a };
+    }
 };
+
+/// Reciprocal-alpha table for un-premultiplication: `recip[a] ≈ 255·65536/a` (a=0 → 0), so
+/// `premul·recip[a] >> 16` recovers the straight channel with a multiply+shift instead of a
+/// per-pixel divide. See [`premulToStraightRgba`].
+const unpremul_recip: [256]u32 = blk: {
+    var t: [256]u32 = undefined;
+    t[0] = 0;
+    var a: usize = 1;
+    while (a < 256) : (a += 1) t[a] = @intCast((255 * 65536 + a / 2) / a);
+    break :blk t;
+};
+
+/// Convert a premultiplied-ARGB8888 buffer (`0xAARRGGBB`) to straight RGBA8888 bytes
+/// (`R,G,B,A` in memory — exactly a browser `ImageData`). Un-multiplies via the reciprocal
+/// LUT (no per-pixel divide). The shared present-conversion for any backend that composes
+/// in premultiplied ARGB (the analytic chrome/glyph path) but presents straight RGBA.
+pub fn premulToStraightRgba(src: []const u32, dst: []u32) void {
+    for (src, dst) |p, *o| {
+        const a: u32 = (p >> 24) & 0xff;
+        if (a == 0) {
+            o.* = 0;
+            continue;
+        }
+        if (a == 255) { // opaque: just swap R↔B (premul == straight)
+            o.* = (@as(u32, 255) << 24) | ((p & 0xff) << @as(u5, 16)) | (p & 0x0000ff00) | ((p >> 16) & 0xff);
+            continue;
+        }
+        const m = unpremul_recip[a];
+        const sr: u32 = @min(@as(u32, 255), (((p >> 16) & 0xff) * m) >> 16);
+        const sg: u32 = @min(@as(u32, 255), (((p >> 8) & 0xff) * m) >> 16);
+        const sb: u32 = @min(@as(u32, 255), ((p & 0xff) * m) >> 16);
+        o.* = (a << @as(u5, 24)) | (sb << @as(u5, 16)) | (sg << @as(u5, 8)) | sr;
+    }
+}
 
 /// Per-corner radii for a rounded rectangle, in screen space (y grows downward), so
 /// `nw` is the top-left corner and `sw` the bottom-left. This is the shape the GPU
@@ -1280,6 +1333,23 @@ test "drop shadow is solid under the shape and fades outward to nothing" {
     const before = px[10 * W + 10];
     canvas.dropShadowRoundedRect(30, 30, 40, 40, 8, 12, 0, Color.rgba(0, 0, 0, 0.0));
     try std.testing.expectEqual(before, px[10 * W + 10]);
+}
+
+test "premulToStraightRgba un-multiplies and swaps to RGBA byte order" {
+    // Premul ARGB 0xAARRGGBB: a=128, premul (r,g,b)=(64,32,16). Straight = premul*255/128.
+    var src = [_]u32{ (128 << 24) | (64 << 16) | (32 << 8) | 16, 0, (255 << 24) | (10 << 16) | (20 << 8) | 30 };
+    var dst: [3]u32 = undefined;
+    premulToStraightRgba(&src, &dst);
+    // dst is straight RGBA bytes → u32 = (A<<24)|(B<<16)|(G<<8)|R.
+    const a0 = (dst[0] >> 24) & 0xff;
+    const r0 = dst[0] & 0xff;
+    const b0 = (dst[0] >> 16) & 0xff;
+    try std.testing.expectEqual(@as(u32, 128), a0);
+    try std.testing.expect(r0 >= 126 and r0 <= 128); // 64*255/128 = 127.5
+    try std.testing.expect(b0 >= 31 and b0 <= 32); // 16*255/128 = 31.9
+    try std.testing.expectEqual(@as(u32, 0), dst[1]); // alpha 0 → transparent
+    // Opaque fast path: R↔B swap, alpha 255, channels unchanged.
+    try std.testing.expectEqual(@as(u32, (255 << 24) | (30 << 16) | (20 << 8) | 10), dst[2]);
 }
 
 test "chrome paints premultiplied" {

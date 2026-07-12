@@ -1024,22 +1024,10 @@ pub const Ui = struct {
         return new;
     }
 
-    fn lerpColor(a: Color, b: Color, t: f32) Color {
-        return .{
-            .r = anim.lerp(a.r, b.r, t),
-            .g = anim.lerp(a.g, b.g, t),
-            .b = anim.lerp(a.b, b.b, t),
-            .a = anim.lerp(a.a, b.a, t),
-        };
-    }
-
-    /// Tinge `c` verso il bianco (`amt>0`) o il nero (`amt<0`), preservando l'alpha. Base
-    /// dello sheen: il bordo alto di una superficie è `shade(base, +sheen)`, il basso più cupo.
-    fn shade(c: Color, amt: f32) Color {
-        if (amt >= 0) return .{ .r = c.r + (1 - c.r) * amt, .g = c.g + (1 - c.g) * amt, .b = c.b + (1 - c.b) * amt, .a = c.a };
-        const k = -amt;
-        return .{ .r = c.r * (1 - k), .g = c.g * (1 - k), .b = c.b * (1 - k), .a = c.a };
-    }
+    // Color math lives once, on `paint.Color` (shared with every demo/backend); these are
+    // thin aliases so the many call sites below read the same.
+    const lerpColor = Color.lerp;
+    const shade = Color.shade;
 
     /// Riempie la superficie di un widget onorando lo sheen del tema: gradiente verticale
     /// (chiaro→cupo) quando `surface_sheen != 0`, altrimenti fill piatto identico a prima.
