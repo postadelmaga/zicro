@@ -1,63 +1,78 @@
-//! zicro on the WEB — the software canvas in a browser tab.
+//! zicro on the WEB — the full immediate-mode widget toolkit in a browser tab.
 //!
-//! zicro's whole render path is a CPU rasterizer into an RGBA byte buffer, so the
-//! web "backend" is tiny: this wasm module owns the buffer, draws the design-system
-//! primitives into it each frame, and the JS glue (`web/index.html`) blits it into a
-//! `<canvas>` with one `putImageData` and feeds pointer events back. No WebGL, no
-//! emscripten, no libc — `wasm32-freestanding` + `zicro.paint` (pure Zig).
+//! The whole render + widget stack is platform-independent CPU code, so the web port is
+//! just an event/loop shim: this wasm module owns an RGBA buffer, a `widget.Store`, a
+//! `Font` and an `InputQueue`; the JS glue (`web/index.html`) drives one `zicroFrame`
+//! per requestAnimationFrame, forwards DOM pointer/wheel/keyboard events into the queue,
+//! and blits the buffer into a `<canvas>`. Same `Ui.button/checkbox/toggle/slider/
+//! dropdown/textField` that run natively — no WebGL, no emscripten, no libc.
 //!
-//! Build:  zig build web         (emits zig-out/web/zicro.wasm + copies web/)
-//! Run:    serve zig-out/web and open index.html (the build prints the command).
+//!   zig build web   → zig-out/web/{zicro.wasm,index.html}
 
 const std = @import("std");
 const zicro = @import("zicro");
 const paint = zicro.paint;
 const text = zicro.text;
+const widget = zicro.widget;
 const Color = paint.Color;
-const Corners = paint.Corners;
 
-// The text engine (stb_truetype in wasm). Lazily created on the first frame; the wasm
-// page lives forever, so it is never deinit'd.
-var font: ?text.Font = null;
+const gpa = std.heap.wasm_allocator;
 
-fn ensureFont() ?*text.Font {
-    if (font == null) font = text.Font.initDefault(std.heap.wasm_allocator) catch return null;
-    return &font.?;
-}
-
-/// Draw `s` left-aligned with its TOP at `y` (converts to a baseline via vmetrics).
-fn label(c: *paint.Canvas, f: *text.Font, x: f32, y: f32, s: []const u8, size: u16, style: text.Style, color: Color) void {
-    const v = f.vmetrics(size, style);
-    const baseline = @as(i32, @intFromFloat(y)) + v.ascent;
-    c.drawText(f, @intFromFloat(x), baseline, s, .{ .size = size, .style = style, .color = color });
-}
-
-/// Centered label within [x, x+w] at vertical center `cy`.
-fn labelCentered(c: *paint.Canvas, f: *text.Font, x: f32, w: f32, cy: f32, s: []const u8, size: u16, style: text.Style, color: Color) void {
-    const tw: f32 = @floatFromInt(f.measure(size, style, s));
-    const v = f.vmetrics(size, style);
-    const th: f32 = @floatFromInt(v.ascent - v.descent);
-    const baseline = @as(i32, @intFromFloat(cy - th / 2)) + v.ascent;
-    c.drawText(f, @intFromFloat(x + (w - tw) / 2), baseline, s, .{ .size = size, .style = style, .color = color });
-}
-
-// A fixed backing buffer — no allocator needed on a single-page wasm module. Straight
-// RGBA8888 (bytes R,G,B,A), which is exactly the layout a browser `ImageData` wants, so
-// JS wraps this memory with zero copy.
-const MAX_W: u32 = 1920;
-const MAX_H: u32 = 1200;
+// Straight RGBA8888 backing buffer (exactly a browser `ImageData`), fixed-size so the
+// module needs no allocator for the framebuffer itself.
+const MAX_W: u32 = 2560;
+const MAX_H: u32 = 1600;
 var pixels: [MAX_W * MAX_H]u32 = undefined;
 
 var width: u32 = 1000;
-var height: u32 = 640;
-var mouse_x: f32 = -1;
-var mouse_y: f32 = -1;
-var mouse_down: bool = false;
-var toggle_on: bool = true;
+var height: u32 = 720;
 
-// --- the exported wasm ABI the JS glue drives --------------------------------------
+// --- theme presets (the header button cycles them) ---------------------------------
+const Preset = struct { name: []const u8, dark_bg: bool, make: *const fn () widget.Theme };
+const presets = [_]Preset{
+    .{ .name = "signature", .dark_bg = true, .make = &widget.Theme.signature },
+    .{ .name = "signature · light", .dark_bg = false, .make = &widget.Theme.signatureLight },
+    .{ .name = "macOS", .dark_bg = true, .make = &widget.Theme.macos },
+    .{ .name = "macOS · light", .dark_bg = false, .make = &widget.Theme.macosLight },
+    .{ .name = "Material 3", .dark_bg = true, .make = &widget.Theme.material },
+    .{ .name = "Material 3 · light", .dark_bg = false, .make = &widget.Theme.materialLight },
+    .{ .name = "dark", .dark_bg = true, .make = &widget.Theme.dark },
+    .{ .name = "light", .dark_bg = false, .make = &widget.Theme.light },
+};
 
-/// Pointer to the RGBA buffer (JS reads it straight out of the wasm memory).
+// --- app state ---------------------------------------------------------------------
+var initialized = false;
+var font: text.Font = undefined;
+var store: widget.Store = undefined;
+var queue: widget.InputQueue = .{};
+
+var theme_idx: usize = 0;
+var active_tab: usize = 0;
+var button_clicks: usize = 0;
+var primary_clicks: usize = 0;
+var checkbox_val = false;
+var toggle_val = true;
+var radio_val: usize = 0;
+var slider_val: f32 = 0.5;
+var stepper_val: i64 = 42;
+var dropdown_val: usize = 0;
+var progress_val: f32 = 0;
+var selectable_vals = [_]bool{ false, true, false };
+var name_buf: std.ArrayList(u8) = .empty;
+var notes_buf: std.ArrayList(u8) = .empty;
+
+fn ensureInit() bool {
+    if (initialized) return true;
+    font = text.Font.initDefault(gpa) catch return false;
+    store = widget.Store.init(gpa);
+    name_buf.appendSlice(gpa, "zicro web") catch {};
+    notes_buf.appendSlice(gpa, "Testo multi-riga.\nInvio per andare a capo.") catch {};
+    initialized = true;
+    return true;
+}
+
+// --- exported wasm ABI (JS drives these) -------------------------------------------
+
 export fn zicroPixels() [*]u8 {
     return @ptrCast(&pixels);
 }
@@ -67,135 +82,154 @@ export fn zicroWidth() u32 {
 export fn zicroHeight() u32 {
     return height;
 }
-
-/// The compositor handed us a (new) drawable size. Clamp to the static buffer.
 export fn zicroResize(w: u32, h: u32) void {
     width = std.math.clamp(w, 1, MAX_W);
     height = std.math.clamp(h, 1, MAX_H);
 }
-
-export fn zicroPointer(x: f32, y: f32, down: i32) void {
-    mouse_x = x;
-    mouse_y = y;
-    // Rising edge over the toggle pill flips it (see its rect in `draw`).
-    const was_down = mouse_down;
-    mouse_down = down != 0;
-    if (mouse_down and !was_down and hitToggle(x, y)) toggle_on = !toggle_on;
+export fn zicroPointerMove(x: f32, y: f32) void {
+    queue.push(.{ .motion = .{ .x = x, .y = y } });
+}
+export fn zicroPointerButton(pressed: i32) void {
+    queue.push(.{ .button = .{ .button = widget.BTN_LEFT, .pressed = pressed != 0 } });
+}
+export fn zicroScroll(dy: f32) void {
+    queue.push(.{ .scroll = .{ .axis = 0, .px = dy } });
+}
+/// Special keys, as evdev codes (Backspace/Enter/Tab/arrows/Esc/…). JS sends the code.
+export fn zicroKey(code: u32, pressed: i32) void {
+    queue.push(.{ .key = .{ .code = code, .pressed = pressed != 0 } });
+}
+/// One typed character (a Unicode code point) → a layout-aware `.text` event.
+export fn zicroText(cp: u32) void {
+    var bytes: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(@intCast(cp), &bytes) catch return;
+    queue.push(.{ .text = .{ .bytes = bytes, .len = @intCast(n) } });
 }
 
-/// Draw one frame at time `t` (seconds). Called from requestAnimationFrame.
-export fn zicroFrame(t: f64) void {
+/// One frame at monotonic millis `now_ms` (from JS `performance.now()`).
+export fn zicroFrame(now_ms: f64) void {
+    if (!ensureInit()) return;
     var canvas = paint.Canvas.initRgba8(pixels[0 .. width * height], width, height);
-    draw(&canvas, @floatCast(t));
+    const preset = presets[theme_idx % presets.len];
+
+    // Window background.
+    const bg = if (preset.dark_bg) Color.rgba(18, 20, 26, 1.0) else Color.rgba(240, 242, 245, 1.0);
+    canvas.fillRoundedRect(0, 0, @floatFromInt(width), @floatFromInt(height), 0, bg);
+
+    progress_val += 0.004;
+    if (progress_val > 1) progress_val = 0;
+
+    buildUi(&canvas, preset, @intFromFloat(now_ms));
 }
 
-// --- the picture: the design system, rendered on the CPU, in a browser --------------
+fn buildUi(canvas: *paint.Canvas, preset: Preset, now_ms: i64) void {
+    const bounds = widget.Rect{ .x = 0, .y = 0, .w = @floatFromInt(width), .h = @floatFromInt(height) };
+    var ui = widget.Ui.begin(&store, canvas, &font, preset.make(), bounds, now_ms, queue.take());
 
-const sig = struct {
-    const bg_top = Color.rgba(20, 22, 30, 1.0);
-    const bg_bot = Color.rgba(11, 12, 18, 1.0);
-    const text = Color.rgba(235, 238, 245, 0.95);
-    const card = Color.rgba(255, 255, 255, 0.05);
-    const widget = Color.rgba(255, 255, 255, 0.085);
-    const border = Color.rgba(255, 255, 255, 0.13);
-    const accent = Color.rgba(120, 170, 255, 0.98);
-    const accent2 = Color.rgba(158, 122, 255, 0.98);
-    const knob = Color.rgba(255, 255, 255, 0.96);
-    const shadow = Color.rgba(4, 6, 18, 0.36);
-};
+    // Header: title + theme cycler.
+    ui.beginCard(64);
+    ui.beginRow();
+    ui.heading("zicro · web");
+    ui.gap(24);
+    ui.labelDim("Tema:");
+    if (ui.buttonPrimary(preset.name)) theme_idx +%= 1;
+    ui.gap(16);
+    ui.labelDim("(click per ciclare)");
+    ui.endRow();
+    ui.endCard();
+    ui.gap(10);
 
-const toggle_rect = struct {
-    const x: f32 = 260;
-    const y: f32 = 250;
-    const w: f32 = 48;
-    const h: f32 = 27;
-};
+    const tabs = &[_][]const u8{ "Widget Base", "Input Avanzati", "Indicatori", "Scorrimento" };
+    _ = ui.tabBar("main_tabs", tabs, &active_tab);
+    ui.gap(12);
 
-fn hitToggle(x: f32, y: f32) bool {
-    return x >= toggle_rect.x and x <= toggle_rect.x + toggle_rect.w and
-        y >= toggle_rect.y and y <= toggle_rect.y + toggle_rect.h;
-}
-
-fn lerp(a: f32, b: f32, s: f32) f32 {
-    return a + (b - a) * s;
-}
-
-fn draw(c: *paint.Canvas, t: f32) void {
-    const w: f32 = @floatFromInt(width);
-    const h: f32 = @floatFromInt(height);
-
-    // Backdrop: vertical gradient (the new paint primitive).
-    c.fillRoundedRectVGradient(0, 0, w, h, 0, sig.bg_top, sig.bg_bot);
-
-    // A raised card with a soft elevation shadow + glassy sheen.
-    const card = .{ .x = @as(f32, 40), .y = @as(f32, 40), .w = @min(w - 80, 640), .h = @as(f32, 360) };
-    c.dropShadowRoundedRect(card.x, card.y, card.w, card.h, 16, 22, 8, sig.shadow);
-    c.fillRoundedRectVGradient(card.x, card.y, card.w, card.h, 16, brighten(sig.card, 0.05), brighten(sig.card, -0.03));
-    c.strokeRoundedRect(card.x, card.y, card.w, card.h, 16, 1, sig.border);
-
-    // Primary button: accent gradient (blue→violet), elevated. Lightens on hover.
-    const btn = .{ .x = card.x + 40, .y = card.y + 60, .w = @as(f32, 200), .h = @as(f32, 44) };
-    const over_btn = inside(btn, mouse_x, mouse_y);
-    c.dropShadowRoundedRect(btn.x, btn.y, btn.w, btn.h, 10, 16, 5, sig.shadow);
-    const a1 = if (over_btn) brighten(sig.accent, 0.10) else sig.accent;
-    const a2 = if (over_btn) brighten(sig.accent2, 0.10) else sig.accent2;
-    c.fillRoundedRectVGradient(btn.x, btn.y, btn.w, btn.h, 10, a1, a2);
-
-    // Secondary (ghost) button.
-    const btn2 = .{ .x = btn.x + btn.w + 20, .y = btn.y, .w = @as(f32, 150), .h = @as(f32, 44) };
-    const over2 = inside(btn2, mouse_x, mouse_y);
-    c.fillRoundedRect(btn2.x, btn2.y, btn2.w, btn2.h, 10, if (over2) brighten(sig.widget, 0.06) else sig.widget);
-    c.strokeRoundedRect(btn2.x, btn2.y, btn2.w, btn2.h, 10, 1, sig.border);
-
-    // Toggle pill (click it): animated knob.
-    const tr = toggle_rect;
-    const on: f32 = if (toggle_on) 1 else 0;
-    const pill = mix(sig.widget, sig.accent, on);
-    c.fillRoundedRect(tr.x, tr.y, tr.w, tr.h, tr.h / 2, pill);
-    c.strokeRoundedRect(tr.x, tr.y, tr.w, tr.h, tr.h / 2, 1, sig.border);
-    const knob_d: f32 = 21;
-    const m = (tr.h - knob_d) / 2;
-    const kx = tr.x + m + on * (tr.w - knob_d - 2 * m);
-    c.dropShadowRoundedRect(kx, tr.y + m, knob_d, knob_d, knob_d / 2, 6, 2, sig.shadow);
-    c.fillRoundedRect(kx, tr.y + m, knob_d, knob_d, knob_d / 2, sig.knob);
-
-    // A determinate progress/slider bar with a breathing accent fill.
-    const bar = .{ .x = btn.x, .y = card.y + 200, .w = @as(f32, 370), .h = @as(f32, 8) };
-    const p = 0.5 + 0.35 * @sin(t * 1.2);
-    c.fillRoundedRect(bar.x, bar.y, bar.w, bar.h, 4, sig.widget);
-    c.fillRoundedRectVGradient(bar.x, bar.y, bar.w * p, bar.h, 4, sig.accent, sig.accent2);
-    const kx2 = bar.x + bar.w * p - 8;
-    c.dropShadowRoundedRect(kx2, bar.y - 6, 16, 16, 8, 6, 2, sig.shadow);
-    c.fillRoundedRect(kx2, bar.y - 6, 16, 16, 8, sig.knob);
-
-    // An indeterminate spinner — proof the arc/AA path runs in wasm.
-    c.drawSpinner(card.x + card.w - 40, card.y + card.h - 40, 14, 3.5, t, sig.accent);
-
-    // Text — the whole point of #4: stb_truetype rasterized in wasm.
-    if (ensureFont()) |f| {
-        label(c, f, card.x + 4, 8, "zicro · web", 15, .bold, brighten(sig.text, -0.1));
-        labelCentered(c, f, btn.x, btn.w, btn.y + btn.h / 2, "Primary action", 15, .regular, Color.rgba(10, 14, 28, 0.98));
-        labelCentered(c, f, btn2.x, btn2.w, btn2.y + btn2.h / 2, "Secondary", 15, .regular, sig.text);
-        label(c, f, tr.x + tr.w + 12, tr.y + 4, if (toggle_on) "Notifications  on" else "Notifications  off", 15, .regular, sig.text);
-        label(c, f, bar.x, bar.y - 26, "Volume", 13, .regular, brighten(sig.text, -0.25));
-        label(c, f, card.x + 4, card.y + card.h + 10, "CPU-rasterized in WebAssembly — stb_truetype, no libc", 13, .regular, brighten(sig.text, -0.4));
+    switch (active_tab) {
+        0 => {
+            ui.beginCard(300);
+            ui.heading("Pulsanti e selezioni");
+            ui.separator();
+            ui.gap(5);
+            ui.beginRow();
+            if (ui.button("Pulsante")) button_clicks += 1;
+            if (ui.buttonPrimary("Primario")) primary_clicks += 1;
+            ui.endRow();
+            ui.gap(5);
+            ui.beginRow();
+            ui.labelDim("click:");
+            var b: [48]u8 = undefined;
+            ui.label(std.fmt.bufPrint(&b, "{d} / {d}", .{ button_clicks, primary_clicks }) catch "0 / 0");
+            ui.endRow();
+            ui.separator();
+            ui.gap(5);
+            ui.beginRow();
+            _ = ui.checkbox("Abilita", &checkbox_val);
+            _ = ui.toggle("Notifiche", &toggle_val);
+            ui.endRow();
+            ui.gap(5);
+            ui.beginRow();
+            ui.label("Radio:");
+            _ = ui.radio("A", &radio_val, 0);
+            _ = ui.radio("B", &radio_val, 1);
+            _ = ui.radio("C", &radio_val, 2);
+            ui.endRow();
+            ui.endCard();
+        },
+        1 => {
+            ui.beginCard(320);
+            ui.heading("Controlli avanzati");
+            ui.separator();
+            ui.gap(5);
+            _ = ui.stepper("Contatore", &stepper_val, 0, 100);
+            ui.gap(8);
+            _ = ui.slider("Volume", &slider_val, 0, 1);
+            ui.gap(10);
+            ui.beginRow();
+            ui.label("Nome:");
+            _ = ui.textField("name_field", &name_buf);
+            ui.endRow();
+            ui.gap(10);
+            ui.beginRow();
+            ui.label("Menu:");
+            const opts = &[_][]const u8{ "Opzione 1", "Opzione 2", "Opzione 3", "Opzione 4" };
+            _ = ui.dropdown("opts_dd", opts, &dropdown_val);
+            ui.endRow();
+            ui.endCard();
+        },
+        2 => {
+            ui.beginCard(280);
+            ui.heading("Stato");
+            ui.separator();
+            ui.gap(10);
+            ui.label("Avanzamento");
+            ui.progressBar(progress_val);
+            ui.gap(10);
+            ui.progressIndeterminate();
+            ui.gap(10);
+            ui.beginRow();
+            ui.label("Spinner:");
+            ui.spinner();
+            ui.endRow();
+            ui.endCard();
+        },
+        else => {
+            ui.beginCard(300);
+            ui.heading("Lista scorrevole");
+            ui.separator();
+            ui.gap(5);
+            ui.beginScroll("list", 220);
+            var i: usize = 0;
+            while (i < 24) : (i += 1) {
+                ui.pushIdScopeIndex(i);
+                var ib: [48]u8 = undefined;
+                const s = std.fmt.bufPrint(&ib, "Elemento {d}", .{i}) catch "Elemento";
+                const sel = i % 3;
+                if (ui.selectable(s, selectable_vals[sel])) selectable_vals[sel] = !selectable_vals[sel];
+                ui.popIdScope();
+            }
+            ui.endScroll();
+            ui.endCard();
+        },
     }
 
-    // A soft "cursor" halo so you can see the pointer wiring is live.
-    if (mouse_x >= 0) c.fillRoundedRect(mouse_x - 3, mouse_y - 3, 6, 6, 3, sig.accent);
-}
-
-fn inside(r: anytype, x: f32, y: f32) bool {
-    return x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h;
-}
-
-/// Toward white (amt>0) or black (amt<0), alpha preserved.
-fn brighten(col: Color, amt: f32) Color {
-    if (amt >= 0) return .{ .r = col.r + (1 - col.r) * amt, .g = col.g + (1 - col.g) * amt, .b = col.b + (1 - col.b) * amt, .a = col.a };
-    const k = -amt;
-    return .{ .r = col.r * (1 - k), .g = col.g * (1 - k), .b = col.b * (1 - k), .a = col.a };
-}
-
-fn mix(a: Color, b: Color, s: f32) Color {
-    return .{ .r = lerp(a.r, b.r, s), .g = lerp(a.g, b.g, s), .b = lerp(a.b, b.b, s), .a = lerp(a.a, b.a, s) };
+    _ = ui.end();
 }

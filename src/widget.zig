@@ -1138,7 +1138,11 @@ pub const Ui = struct {
     }
 
     fn emitLine(ui: *Ui, line: []const u8, avail: f32, h: f32, size: u16, style: text.Style, color: Color) void {
-        const r = ui.allocRect(avail, h);
+        // Allocate each line at its MEASURED width (clamped to the wrap width), not the
+        // full available width — so a short label in a row keeps its natural size instead
+        // of consuming the whole row, while a block paragraph still wraps line by line.
+        const lw = @min(ui.measureText(line, size, style), avail);
+        const r = ui.allocRect(lw, h);
         ui.drawTextIn(r, line, .left, size, style, color);
     }
 
