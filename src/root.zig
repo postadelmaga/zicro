@@ -36,6 +36,7 @@ pub const input = @import("input.zig");
 pub const video = @import("video.zig");
 pub const audio = @import("audio.zig");
 pub const audio_device = @import("audio_device.zig");
+pub const audio_pipeline = @import("audio_pipeline.zig");
 pub const bridge = @import("bridge.zig");
 
 // -- graphics and windowing layer (Wayland/Win32)
@@ -92,6 +93,7 @@ test {
     _ = video;
     _ = audio;
     _ = audio_device;
+    _ = audio_pipeline;
     _ = bridge;
     _ = ipc;
     _ = shmem;
