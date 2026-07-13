@@ -23,6 +23,10 @@ pub const widget = @import("widget.zig");
 /// The web `Window` backend: the same `on_draw`/`on_key`/`on_mouse` contract as the
 /// native windows, with the browser driving the loop. `zicro.window.Window` on the web.
 pub const window = @import("window_web.zig");
+/// Golden-ratio design constants — the substrate's default proportion (used by zrame's
+/// responsive metrics). Same surface as the native root so `zicro.phi` resolves on wasm.
+pub const proportion = @import("proportion.zig");
+pub const phi = proportion.phi;
 
 comptime {
     _ = @import("wasm_shim.zig"); // keep zig_malloc/zig_free/zig_pow/… in the link

@@ -48,6 +48,7 @@ pub const scroll = @import("scroll.zig");
 pub const widget = @import("widget.zig");
 pub const keymap = @import("keymap.zig");
 pub const window = @import("window.zig");
+pub const proportion = @import("proportion.zig");
 
 // -- out-of-process transports (the Rust `ipc` feature of micro-bus)
 pub const ipc = @import("ipc.zig");
@@ -69,6 +70,9 @@ pub const ModuleCtx = core.ModuleCtx;
 pub const Runtime = core.Runtime;
 pub const App = app.App;
 pub const WorldModule = app.WorldModule;
+
+/// The golden ratio, φ — the substrate's default proportion (see `proportion`).
+pub const phi = proportion.phi;
 
 const sync = @import("sync.zig");
 
@@ -105,4 +109,5 @@ test {
     _ = widget;
     _ = keymap;
     _ = window;
+    _ = proportion;
 }

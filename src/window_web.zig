@@ -63,6 +63,10 @@ var frame_now_ms: i64 = 0;
 /// physical pixels; an app reads this via `scaleFactor()` and passes it to
 /// `Theme.scaled(f)` so widgets keep their visual size while rendering crisp at native res.
 var frame_scale: f32 = 1;
+/// Whether the browser reports a touch-primary device (`navigator.maxTouchPoints > 0`).
+/// JS sets it via `zicroSetTouch`; the responsive layer reads it to keep touch targets
+/// comfortable. Defaults false (assume pointer) until JS reports.
+var frame_touch: bool = false;
 var last_x: f32 = -1;
 var last_y: f32 = -1;
 var singleton: Window = undefined;
@@ -70,6 +74,11 @@ var singleton: Window = undefined;
 /// Display scale (HiDPI): `devicePixelRatio`, 1 on a standard-density screen.
 pub fn scaleFactor() f32 {
     return frame_scale;
+}
+
+/// True on touch-primary devices (phones/tablets). Read by the responsive layer.
+pub fn isTouch() bool {
+    return frame_touch;
 }
 
 /// Monotonic milliseconds for the app's UI (caret blink, animation): the last value JS
@@ -158,6 +167,11 @@ export fn zicroResize(w: u32, h: u32, scale: f32) void {
     win.width = std.math.clamp(w, 1, MAX_W);
     win.height = std.math.clamp(h, 1, MAX_H);
     frame_scale = if (scale > 0) scale else 1;
+}
+
+/// JS reports whether this is a touch-primary device (`navigator.maxTouchPoints > 0`).
+export fn zicroSetTouch(touch: u32) void {
+    frame_touch = touch != 0;
 }
 
 /// One frame: tick, then draw into the window's buffer (which JS blits).
