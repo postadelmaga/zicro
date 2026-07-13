@@ -82,9 +82,10 @@ pub const DeviceIn = struct {
 
     /// Read one block of interleaved f32 samples into `buf` (device format). Blocks until
     /// the hardware delivers samples, then returns the number of *frames* read (samples =
-    /// frames × channels). Returns 0 on end-of-stream or an unrecoverable device error, so
-    /// the caller (an `AudioSource`) can stop. `buf` should hold whole frames.
-    pub fn capture(self: *DeviceIn, buf: []f32) usize {
+    /// frames × channels). Returns `null` on end-of-stream or an unrecoverable device error
+    /// (the caller stops) and `0` when nothing arrived this round (retry). `buf` should hold
+    /// whole frames.
+    pub fn capture(self: *DeviceIn, buf: []f32) ?usize {
         if (buf.len == 0) return 0;
         return self.backend.read(buf, self.channels);
     }
@@ -115,7 +116,7 @@ const NullIn = struct {
     fn open(_: u32, _: u16) Error!NullIn {
         return .{};
     }
-    fn read(_: *NullIn, buf: []f32, channels: u16) usize {
+    fn read(_: *NullIn, buf: []f32, channels: u16) ?usize {
         @memset(buf, 0);
         return buf.len / @max(channels, 1);
     }
@@ -320,16 +321,17 @@ const WaveIn = struct {
     }
 
     /// Waits for the next header the driver has filled, copies its recorded samples into
-    /// `buf`, re-queues that header, and advances. Returns frames read (0 on failure).
-    fn read(self: *WaveIn, buf: []f32, channels: u16) usize {
+    /// `buf`, re-queues that header, and advances. Returns frames read, or `null` if the
+    /// device can't start or stalls (unrecoverable).
+    fn read(self: *WaveIn, buf: []f32, channels: u16) ?usize {
         const want = std.mem.sliceAsBytes(buf);
-        if (!self.ensureStarted(want.len)) return 0;
+        if (!self.ensureStarted(want.len)) return null;
         const h = &self.hdrs[self.next];
         // Wait until the driver has finished filling this header, but cap the wait (~2s) so
         // the capture thread stays responsive (stop/join) if the device stalls.
         var spins: u32 = 0;
         while ((h.dwFlags & WHDR_DONE) == 0) : (spins += 1) {
-            if (spins > 2000) return 0;
+            if (spins > 2000) return null;
             Sleep(1);
         }
         const recorded = @min(h.dwBytesRecorded, self.bufs[self.next].len);
@@ -431,9 +433,10 @@ const AlsaIn = struct {
         return .{ .pcm = pcm, .channels = channels };
     }
 
-    /// Read up to `buf.len / channels` frames; blocks until at least one arrives. Returns
-    /// the frame count (0 only on an unrecoverable error), recovering from over/underruns.
-    fn read(self: *AlsaIn, buf: []f32, channels: u16) usize {
+    /// Read up to `buf.len / channels` frames; blocks until at least one arrives. Recovers
+    /// from over/underruns internally, so it returns `null` only on an unrecoverable error
+    /// (and `0` only for a zero-length buffer).
+    fn read(self: *AlsaIn, buf: []f32, channels: u16) ?usize {
         const ch: usize = @max(channels, 1);
         const want_frames = buf.len / ch;
         if (want_frames == 0) return 0;
@@ -441,7 +444,7 @@ const AlsaIn = struct {
             const n = snd_pcm_readi(self.pcm, buf.ptr, @intCast(want_frames));
             if (n < 0) {
                 // Overrun/error: recover and retry (silent=1). Give up if unrecoverable.
-                if (Alsa.snd_pcm_recover(self.pcm, @intCast(n), 1) < 0) return 0;
+                if (Alsa.snd_pcm_recover(self.pcm, @intCast(n), 1) < 0) return null;
                 continue;
             }
             return @intCast(n);
@@ -487,9 +490,10 @@ const PipeWireIn = struct {
         const h = zicro_pw_open_capture(rate, channels) orelse return Error.OpenFailed;
         return .{ .handle = h, .channels = channels };
     }
-    fn read(self: *PipeWireIn, buf: []f32, channels: u16) usize {
+    fn read(self: *PipeWireIn, buf: []f32, channels: u16) ?usize {
         const ch: usize = @max(channels, 1);
-        return zicro_pw_read(self.handle, buf.ptr, buf.len / ch);
+        const n = zicro_pw_read(self.handle, buf.ptr, buf.len / ch);
+        return if (n == 0) null else n; // shim returns 0 only when the stream is closing
     }
     fn close(self: *PipeWireIn) void {
         zicro_pw_close(self.handle);
@@ -527,7 +531,7 @@ const LinuxIn = union(enum) {
         if (PipeWireIn.open(rate, channels)) |p| return .{ .pw = p } else |_| {}
         return .{ .alsa = try AlsaIn.open(rate, channels) };
     }
-    fn read(self: *LinuxIn, buf: []f32, channels: u16) usize {
+    fn read(self: *LinuxIn, buf: []f32, channels: u16) ?usize {
         return switch (self.*) {
             .pw => |*p| p.read(buf, channels),
             .alsa => |*a| a.read(buf, channels),
@@ -557,6 +561,5 @@ test "device in compiles and captures from the null/real backend without error" 
     var dev = DeviceIn.open(48_000, 2) catch return;
     defer dev.close();
     var buf: [1024]f32 = undefined; // 512 frames × 2ch
-    const frames = dev.capture(&buf);
-    try std.testing.expect(frames <= 512);
+    if (dev.capture(&buf)) |frames| try std.testing.expect(frames <= 512);
 }

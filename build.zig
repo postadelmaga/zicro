@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_bench.step);
 
     // Examples: `zig build run-counter`, `zig build run-world_counter`, `zig build run-shell`.
-    inline for (.{ "counter", "world_counter", "shell", "demo", "gallery" }) |name| {
+    inline for (.{ "counter", "world_counter", "shell", "demo", "gallery", "monitor" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

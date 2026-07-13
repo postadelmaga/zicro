@@ -3,27 +3,40 @@
 // The rest of zicro's audio backends (ALSA, winmm) expose a *blocking* push/pull contract:
 // DeviceOut.play(samples) blocks until the hardware accepts the block, DeviceIn.capture(buf)
 // blocks until samples arrive. PipeWire is the opposite shape — a realtime callback pulls
-// (or pushes) buffers on its own thread. This shim reconciles the two with one ring buffer
-// per stream, guarded by a mutex + condvars, so the Zig side keeps the same simple contract
-// while getting PipeWire's low-latency graph. SPA format PODs are built here, in C, where the
-// vendor macros live — that's the whole reason this is a C file and not more Zig externs.
+// (or pushes) buffers on its own thread. This shim reconciles the two with one **lock-free
+// SPSC ring** per stream, so the realtime callback never takes a lock and never blocks; the
+// application thread does the waiting (a short adaptive backoff) when the ring is full/empty.
+// SPSC holds because each stream has exactly one producer and one consumer:
+//   * playback — producer = app (`zicro_pw_write`), consumer = the RT callback.
+//   * capture  — producer = the RT callback, consumer = app (`zicro_pw_read`).
 //
-// Realtime note: the process callback briefly takes the ring mutex. At audio block sizes the
-// critical section is a memcpy of a few hundred floats — fine for monitoring latency and far
-// simpler than a lock-free ring. A future pass can swap in an SPSC ring if profiling asks.
+// Free-running counters (`head`, `tail`) index the ring modulo its size; occupancy is
+// `tail - head`. Only the producer writes `tail`, only the consumer writes `head`, each with
+// release/acquire ordering — the classic wait-free Lamport queue. SPA format PODs are built
+// here, in C, where the vendor macros live — the whole reason this is a C file.
+//
+// Overrun/underrun policy:
+//   * playback underrun (ring empty at callback time) → emit silence, never a stale buffer.
+//   * capture  overrun  (app fell behind) → the producer keeps writing (advancing `tail`);
+//     the consumer notices `tail - head > cap` and skips ahead to `tail - cap`, dropping the
+//     *oldest* samples so latency stays bounded (drop-oldest, the right choice for a live
+//     monitor). Only the consumer moves `head`, so this stays SPSC-clean.
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/pod/builder.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <time.h>
 
 // One quantum hint (frames) — asks the graph for a small buffer so latency stays low. The
-// ring holds a few of these so jitter doesn't underrun before the writer refills.
+// ring holds a few of these so jitter doesn't underrun before the app refills.
 #define ZICRO_PW_QUANTUM 256
 #define ZICRO_PW_RING_QUANTA 8
 
@@ -33,24 +46,26 @@ struct zicro_pw {
     uint16_t channels;
     int capture; // 0 = playback, 1 = capture
 
-    // Ring of interleaved f32 samples (not frames), size = cap.
+    // Lock-free SPSC ring of interleaved f32 samples (not frames). `cap` is the slot count.
     float *ring;
-    size_t cap;   // total slots
-    size_t head;  // read index (consumer)
-    size_t tail;  // write index (producer)
-    size_t count; // occupied slots
-    int stop;
-
-    pthread_mutex_t mtx;
-    pthread_cond_t not_full;  // signalled when space frees up
-    pthread_cond_t not_empty; // signalled when data arrives
+    size_t cap;
+    _Atomic size_t head; // consumer index (monotonic); occupancy = tail - head
+    _Atomic size_t tail; // producer index (monotonic)
+    _Atomic int stop;
 };
 
 // pw_init is process-global and must run exactly once before any other pw call.
 static pthread_once_t g_pw_once = PTHREAD_ONCE_INIT;
 static void pw_init_once(void) { pw_init(NULL, NULL); }
 
-// ── playback: RT thread pulls, drains the ring, silence-fills on underrun ────
+// App-side wait when the ring is full (write) or empty (read). ~200µs is well under an audio
+// quantum (256/48k ≈ 5.3ms), so this costs a negligible slice of latency and little CPU.
+static void backoff(void) {
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000 };
+    nanosleep(&ts, NULL);
+}
+
+// ── playback: RT thread consumes the ring, silence-fills on underrun ─────────
 static void on_process_playback(void *userdata) {
     struct zicro_pw *pw = userdata;
     struct pw_buffer *pb = pw_stream_dequeue_buffer(pw->stream);
@@ -64,20 +79,16 @@ static void on_process_playback(void *userdata) {
     uint32_t stride = sizeof(float) * pw->channels;
     uint32_t max_frames = buf->datas[0].maxsize / stride;
     uint32_t n_frames = max_frames;
-    // Honour the graph's requested frame count when it asks for fewer (keeps latency tight).
     if (pb->requested && pb->requested < n_frames) n_frames = (uint32_t)pb->requested;
     uint32_t n = n_frames * pw->channels;
 
-    pthread_mutex_lock(&pw->mtx);
-    uint32_t i = 0;
-    for (; i < n && pw->count > 0; i++) {
-        dst[i] = pw->ring[pw->head];
-        pw->head = (pw->head + 1) % pw->cap;
-        pw->count--;
-    }
-    pthread_cond_signal(&pw->not_full);
-    pthread_mutex_unlock(&pw->mtx);
-    for (; i < n; i++) dst[i] = 0.0f; // underrun → silence, never a stale buffer
+    size_t h = atomic_load_explicit(&pw->head, memory_order_relaxed); // consumer owns head
+    size_t t = atomic_load_explicit(&pw->tail, memory_order_acquire);
+    size_t avail = t - h;
+    uint32_t give = (avail < n) ? (uint32_t)avail : n;
+    for (uint32_t i = 0; i < give; i++) dst[i] = pw->ring[(h + i) % pw->cap];
+    atomic_store_explicit(&pw->head, h + give, memory_order_release);
+    for (uint32_t i = give; i < n; i++) dst[i] = 0.0f; // underrun → silence
 
     buf->datas[0].chunk->offset = 0;
     buf->datas[0].chunk->stride = stride;
@@ -85,7 +96,7 @@ static void on_process_playback(void *userdata) {
     pw_stream_queue_buffer(pw->stream, pb);
 }
 
-// ── capture: RT thread pushes incoming samples into the ring, drops on overrun ─
+// ── capture: RT thread produces into the ring, overwriting on overrun ────────
 static void on_process_capture(void *userdata) {
     struct zicro_pw *pw = userdata;
     struct pw_buffer *pb = pw_stream_dequeue_buffer(pw->stream);
@@ -93,21 +104,17 @@ static void on_process_capture(void *userdata) {
     struct spa_buffer *buf = pb->buffer;
     const float *src = buf->datas[0].data;
     if (src) {
-        uint32_t stride = sizeof(float) * pw->channels;
         uint32_t offset = SPA_MIN(buf->datas[0].chunk->offset, buf->datas[0].maxsize);
         uint32_t size = SPA_MIN(buf->datas[0].chunk->size, buf->datas[0].maxsize - offset);
         uint32_t n = size / sizeof(float);
         src = (const float *)((const uint8_t *)src + offset);
-        (void)stride;
-        pthread_mutex_lock(&pw->mtx);
-        for (uint32_t i = 0; i < n; i++) {
-            if (pw->count == pw->cap) break; // overrun → drop oldest-tail-first (just stop)
-            pw->ring[pw->tail] = src[i];
-            pw->tail = (pw->tail + 1) % pw->cap;
-            pw->count++;
-        }
-        pthread_cond_signal(&pw->not_empty);
-        pthread_mutex_unlock(&pw->mtx);
+
+        // Producer owns tail: write every incoming sample and advance, even past the
+        // consumer's head. The consumer detects the overrun and drops the oldest — so the RT
+        // thread never blocks and latency stays bounded.
+        size_t t = atomic_load_explicit(&pw->tail, memory_order_relaxed);
+        for (uint32_t i = 0; i < n; i++) pw->ring[(t + i) % pw->cap] = src[i];
+        atomic_store_explicit(&pw->tail, t + n, memory_order_release);
     }
     pw_stream_queue_buffer(pw->stream, pb);
 }
@@ -131,9 +138,9 @@ static struct zicro_pw *pw_open(uint32_t rate, uint16_t channels, int capture) {
     pw->cap = (size_t)pw->channels * ZICRO_PW_QUANTUM * ZICRO_PW_RING_QUANTA;
     pw->ring = calloc(pw->cap, sizeof(float));
     if (!pw->ring) { free(pw); return NULL; }
-    pthread_mutex_init(&pw->mtx, NULL);
-    pthread_cond_init(&pw->not_full, NULL);
-    pthread_cond_init(&pw->not_empty, NULL);
+    atomic_init(&pw->head, 0);
+    atomic_init(&pw->tail, 0);
+    atomic_init(&pw->stop, 0);
 
     pw->loop = pw_thread_loop_new("zicro-pw", NULL);
     if (!pw->loop) goto fail;
@@ -179,9 +186,6 @@ static struct zicro_pw *pw_open(uint32_t rate, uint16_t channels, int capture) {
 fail:
     if (pw->stream) pw_stream_destroy(pw->stream);
     if (pw->loop) pw_thread_loop_destroy(pw->loop);
-    pthread_mutex_destroy(&pw->mtx);
-    pthread_cond_destroy(&pw->not_full);
-    pthread_cond_destroy(&pw->not_empty);
     free(pw->ring);
     free(pw);
     return NULL;
@@ -194,66 +198,57 @@ struct zicro_pw *zicro_pw_open_capture(uint32_t rate, uint16_t channels) {
     return pw_open(rate, channels, 1);
 }
 
-// Blocking write: enqueue every sample, waiting for ring space (backpressure). Returns 0 on
-// success, -1 if the stream is closing.
+// Blocking write (playback): enqueue every sample losslessly, backing off while the ring is
+// full (backpressure). Returns 0 on success, -1 if the stream is closing.
 int zicro_pw_write(struct zicro_pw *pw, const float *src, size_t frames) {
     size_t n = frames * pw->channels;
     size_t off = 0;
-    pthread_mutex_lock(&pw->mtx);
     while (off < n) {
-        while (pw->count == pw->cap && !pw->stop)
-            pthread_cond_wait(&pw->not_full, &pw->mtx);
-        if (pw->stop) {
-            pthread_mutex_unlock(&pw->mtx);
-            return -1;
-        }
-        while (off < n && pw->count < pw->cap) {
-            pw->ring[pw->tail] = src[off++];
-            pw->tail = (pw->tail + 1) % pw->cap;
-            pw->count++;
-        }
-        pthread_cond_signal(&pw->not_empty);
+        if (atomic_load_explicit(&pw->stop, memory_order_acquire)) return -1;
+        size_t t = atomic_load_explicit(&pw->tail, memory_order_relaxed); // producer owns tail
+        size_t h = atomic_load_explicit(&pw->head, memory_order_acquire);
+        size_t space = pw->cap - (t - h);
+        if (space == 0) { backoff(); continue; }
+        size_t chunk = (n - off < space) ? (n - off) : space;
+        for (size_t i = 0; i < chunk; i++) pw->ring[(t + i) % pw->cap] = src[off + i];
+        atomic_store_explicit(&pw->tail, t + chunk, memory_order_release);
+        off += chunk;
     }
-    pthread_mutex_unlock(&pw->mtx);
     return 0;
 }
 
-// Blocking read: wait for at least one sample, then drain up to `frames` frames. Returns the
-// number of *frames* read (0 only if the stream is closing).
+// Blocking read (capture): wait for data, then drain up to `frames` frames. On overrun
+// (occupancy > cap) skip ahead to the freshest `cap` samples — drop-oldest. Returns the
+// number of *frames* read (0 only if the stream is closing with nothing buffered).
 size_t zicro_pw_read(struct zicro_pw *pw, float *dst, size_t frames) {
     size_t want = frames * pw->channels;
-    pthread_mutex_lock(&pw->mtx);
-    while (pw->count == 0 && !pw->stop)
-        pthread_cond_wait(&pw->not_empty, &pw->mtx);
-    if (pw->stop && pw->count == 0) {
-        pthread_mutex_unlock(&pw->mtx);
-        return 0;
+    while (1) {
+        size_t h = atomic_load_explicit(&pw->head, memory_order_relaxed); // consumer owns head
+        size_t t = atomic_load_explicit(&pw->tail, memory_order_acquire);
+        size_t occ = t - h;
+        if (occ == 0) {
+            if (atomic_load_explicit(&pw->stop, memory_order_acquire)) return 0;
+            backoff();
+            continue;
+        }
+        if (occ > pw->cap) { // overrun: producer lapped us — drop the oldest, keep the fresh
+            h = t - pw->cap;
+            occ = pw->cap;
+        }
+        size_t give = (want < occ) ? want : occ;
+        for (size_t i = 0; i < give; i++) dst[i] = pw->ring[(h + i) % pw->cap];
+        atomic_store_explicit(&pw->head, h + give, memory_order_release);
+        return give / (pw->channels ? pw->channels : 1);
     }
-    size_t got = 0;
-    while (got < want && pw->count > 0) {
-        dst[got++] = pw->ring[pw->head];
-        pw->head = (pw->head + 1) % pw->cap;
-        pw->count--;
-    }
-    pthread_cond_signal(&pw->not_full);
-    pthread_mutex_unlock(&pw->mtx);
-    return got / (pw->channels ? pw->channels : 1);
 }
 
 void zicro_pw_close(struct zicro_pw *pw) {
     if (!pw) return;
-    pthread_mutex_lock(&pw->mtx);
-    pw->stop = 1;
-    pthread_cond_broadcast(&pw->not_full);
-    pthread_cond_broadcast(&pw->not_empty);
-    pthread_mutex_unlock(&pw->mtx);
+    atomic_store_explicit(&pw->stop, 1, memory_order_release); // wake a blocked app thread
 
     if (pw->loop) pw_thread_loop_stop(pw->loop);
     if (pw->stream) pw_stream_destroy(pw->stream);
     if (pw->loop) pw_thread_loop_destroy(pw->loop);
-    pthread_mutex_destroy(&pw->mtx);
-    pthread_cond_destroy(&pw->not_full);
-    pthread_cond_destroy(&pw->not_empty);
     free(pw->ring);
     free(pw);
 }

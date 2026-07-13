@@ -84,9 +84,10 @@ pub const AudioPipeline = struct {
         const scratch = try ctx.gpa.alloc(f32, @max(self.block_frames, 1) * ch);
         defer ctx.gpa.free(scratch);
         while (!ctx.shouldStop()) {
-            // capture() blocks ≈one block, so shutdown is observed promptly. 0 ⇒ done.
-            const frames = self.in.capture(scratch);
-            if (frames == 0) break;
+            // capture() blocks ≈one block, so shutdown is observed promptly.
+            // `null` ⇒ end-of-stream / unrecoverable → done; `0` ⇒ nothing this round → retry.
+            const frames = self.in.capture(scratch) orelse break;
+            if (frames == 0) continue;
             const used = scratch[0 .. frames * ch];
             // The whole chain runs inline, on this thread — no bus, no per-stage channel.
             for (self.processors) |p| p.process(used, self.channels);
@@ -119,9 +120,9 @@ const FakeMic = struct {
     chunk_frames: usize,
     pos: usize = 0,
 
-    pub fn capture(self: *FakeMic, buf: []f32) usize {
+    pub fn capture(self: *FakeMic, buf: []f32) ?usize {
         const ch: usize = @max(self.channels, 1);
-        if (self.pos >= self.data.len) return 0;
+        if (self.pos >= self.data.len) return null;
         const want = @min(buf.len, self.chunk_frames * ch);
         const n = @min(want, self.data.len - self.pos);
         @memcpy(buf[0..n], self.data[self.pos .. self.pos + n]);

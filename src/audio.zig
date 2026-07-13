@@ -47,15 +47,21 @@ pub const AudioOut = struct {
 /// A device that can capture audio — the dual of [`AudioOut`]. Implement this to read from
 /// real hardware; the [`AudioSource`] calls it in a loop for one block at a time. Fill `buf`
 /// with interleaved f32 samples (device format) and return the number of *frames* read
-/// (samples = frames × channels); return 0 to signal end-of-stream so the source stops.
+/// (samples = frames × channels). The return distinguishes the two ways a read can come up
+/// short:
+///   - `null` — **end-of-stream / unrecoverable**: the source stops (a closed device, a
+///     drained file). Live hardware should recover transient errors internally and never
+///     return `null` for a glitch.
+///   - `0` — **nothing this round** (transient): the source retries. Real blocking devices
+///     rarely return this; it's the safe "try again" answer.
 pub const AudioIn = struct {
     ptr: *anyopaque,
-    captureFn: *const fn (*anyopaque, []f32) usize,
+    captureFn: *const fn (*anyopaque, []f32) ?usize,
 
-    /// Wrap any type with `pub fn capture(self: *T, buf: []f32) usize`.
+    /// Wrap any type with `pub fn capture(self: *T, buf: []f32) ?usize`.
     pub fn of(comptime T: type, instance: *T) AudioIn {
         const Impl = struct {
-            fn capture(ptr: *anyopaque, buf: []f32) usize {
+            fn capture(ptr: *anyopaque, buf: []f32) ?usize {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.capture(buf);
             }
@@ -63,7 +69,7 @@ pub const AudioIn = struct {
         return .{ .ptr = instance, .captureFn = Impl.capture };
     }
 
-    pub fn capture(in: AudioIn, buf: []f32) usize {
+    pub fn capture(in: AudioIn, buf: []f32) ?usize {
         return in.captureFn(in.ptr, buf);
     }
 };
@@ -152,10 +158,10 @@ pub const AudioSource = struct {
         const scratch = try ctx.gpa.alloc(f32, @max(self.block_frames, 1) * ch);
         defer ctx.gpa.free(scratch);
         while (!ctx.shouldStop()) {
-            // capture() blocks ~one block (≈10ms), so shutdown is observed promptly. 0 =
-            // end-of-stream or an unrecoverable device error → the source is done.
-            const frames = self.in.capture(scratch);
-            if (frames == 0) break;
+            // capture() blocks ~one block (≈10ms), so shutdown is observed promptly.
+            // `null` = end-of-stream / unrecoverable → done; `0` = nothing this round → retry.
+            const frames = self.in.capture(scratch) orelse break;
+            if (frames == 0) continue;
             var block = try AudioBlock.init(ctx.gpa, self.rate, self.channels, scratch[0 .. frames * ch]);
             switch (self.policy) {
                 .block => self.blocks.send(block) catch {
@@ -259,9 +265,9 @@ const FakeMic = struct {
     chunk_frames: usize,
     pos: usize = 0,
 
-    fn capture(self: *FakeMic, buf: []f32) usize {
+    fn capture(self: *FakeMic, buf: []f32) ?usize {
         const ch: usize = @max(self.channels, 1);
-        if (self.pos >= self.data.len) return 0; // exhausted → end-of-stream
+        if (self.pos >= self.data.len) return null; // exhausted → end-of-stream
         const want = @min(buf.len, self.chunk_frames * ch);
         const n = @min(want, self.data.len - self.pos);
         @memcpy(buf[0..n], self.data[self.pos .. self.pos + n]);
