@@ -30,6 +30,15 @@ pub fn build(b: *std.Build) void {
         zicro.linkSystemLibrary("wayland-client", .{});
         zicro.linkSystemLibrary("asound", .{}); // ALSA: backend audio (audio_device.zig)
 
+        // PipeWire: low-latency audio backend, preferred over ALSA at runtime when a
+        // PipeWire graph is reachable. The pull-model pw_stream is bridged to zicro's
+        // blocking device contract by the audio_pw.c shim (SPA format PODs live in C).
+        zicro.linkSystemLibrary("libpipewire-0.3", .{}); // pkg-config: adds the include dirs too
+        zicro.addCSourceFile(.{
+            .file = b.path("src/audio_pw.c"),
+            .flags = &.{ "-O2", "-D_REENTRANT", "-fno-sanitize=undefined" },
+        });
+
         // We only need the xdg-shell stable protocol for basic windowing
         const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
         const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });

@@ -95,8 +95,10 @@ pub const DeviceIn = struct {
 };
 
 // ── Backend selection ───────────────────────────────────────────────────────
-const Backend = if (is_win) WaveOut else if (is_linux) Alsa else NullDev;
-const InBackend = if (is_win) WaveIn else if (is_linux) AlsaIn else NullIn;
+// On Linux both audio backends are tried at runtime: PipeWire first (low latency), ALSA as
+// the fallback when no PipeWire graph is reachable (see LinuxOut/LinuxIn).
+const Backend = if (is_win) WaveOut else if (is_linux) LinuxOut else NullDev;
+const InBackend = if (is_win) WaveIn else if (is_linux) LinuxIn else NullIn;
 
 /// Fallback for platforms without a backend: silent, always "succeeds".
 const NullDev = struct {
@@ -448,6 +450,94 @@ const AlsaIn = struct {
 
     fn close(self: *AlsaIn) void {
         _ = Alsa.snd_pcm_close(self.pcm);
+    }
+};
+
+// ── Linux: PipeWire (via the audio_pw.c shim) ───────────────────────────────
+// The shim exposes a blocking push/pull API over pw_stream's realtime callback, so these
+// backends look exactly like the ALSA ones to DeviceOut/DeviceIn.
+extern fn zicro_pw_open_playback(rate: u32, channels: u16) ?*anyopaque;
+extern fn zicro_pw_open_capture(rate: u32, channels: u16) ?*anyopaque;
+extern fn zicro_pw_write(pw: *anyopaque, src: [*]const f32, frames: usize) c_int;
+extern fn zicro_pw_read(pw: *anyopaque, dst: [*]f32, frames: usize) usize;
+extern fn zicro_pw_close(pw: *anyopaque) void;
+
+const PipeWireOut = struct {
+    handle: *anyopaque,
+    channels: u16,
+
+    fn open(rate: u32, channels: u16) Error!PipeWireOut {
+        const h = zicro_pw_open_playback(rate, channels) orelse return Error.OpenFailed;
+        return .{ .handle = h, .channels = channels };
+    }
+    fn write(self: *PipeWireOut, samples: []const f32) void {
+        const ch: usize = @max(self.channels, 1);
+        _ = zicro_pw_write(self.handle, samples.ptr, samples.len / ch);
+    }
+    fn close(self: *PipeWireOut) void {
+        zicro_pw_close(self.handle);
+    }
+};
+
+const PipeWireIn = struct {
+    handle: *anyopaque,
+    channels: u16,
+
+    fn open(rate: u32, channels: u16) Error!PipeWireIn {
+        const h = zicro_pw_open_capture(rate, channels) orelse return Error.OpenFailed;
+        return .{ .handle = h, .channels = channels };
+    }
+    fn read(self: *PipeWireIn, buf: []f32, channels: u16) usize {
+        const ch: usize = @max(channels, 1);
+        return zicro_pw_read(self.handle, buf.ptr, buf.len / ch);
+    }
+    fn close(self: *PipeWireIn) void {
+        zicro_pw_close(self.handle);
+    }
+};
+
+// ── Linux output/input: PipeWire first, ALSA fallback ───────────────────────
+const LinuxOut = union(enum) {
+    pw: PipeWireOut,
+    alsa: Alsa,
+
+    fn open(rate: u32, channels: u16) Error!LinuxOut {
+        if (PipeWireOut.open(rate, channels)) |p| return .{ .pw = p } else |_| {}
+        return .{ .alsa = try Alsa.open(rate, channels) };
+    }
+    fn write(self: *LinuxOut, samples: []const f32) void {
+        switch (self.*) {
+            .pw => |*p| p.write(samples),
+            .alsa => |*a| a.write(samples),
+        }
+    }
+    fn close(self: *LinuxOut) void {
+        switch (self.*) {
+            .pw => |*p| p.close(),
+            .alsa => |*a| a.close(),
+        }
+    }
+};
+
+const LinuxIn = union(enum) {
+    pw: PipeWireIn,
+    alsa: AlsaIn,
+
+    fn open(rate: u32, channels: u16) Error!LinuxIn {
+        if (PipeWireIn.open(rate, channels)) |p| return .{ .pw = p } else |_| {}
+        return .{ .alsa = try AlsaIn.open(rate, channels) };
+    }
+    fn read(self: *LinuxIn, buf: []f32, channels: u16) usize {
+        return switch (self.*) {
+            .pw => |*p| p.read(buf, channels),
+            .alsa => |*a| a.read(buf, channels),
+        };
+    }
+    fn close(self: *LinuxIn) void {
+        switch (self.*) {
+            .pw => |*p| p.close(),
+            .alsa => |*a| a.close(),
+        }
     }
 };
 
