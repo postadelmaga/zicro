@@ -65,6 +65,25 @@ static void backoff(void) {
     nanosleep(&ts, NULL);
 }
 
+// Contiguous ring copies: a transfer wraps at most once, so it's one or two memcpy()s — no
+// per-sample division in the realtime path. `pos` is the logical (free-running) index; `n`
+// must be ≤ cap so the copy wraps only once. Only the modulo for the start offset remains,
+// once per call rather than once per sample.
+static void ring_read(const struct zicro_pw *pw, size_t pos, float *dst, size_t n) {
+    size_t start = pos % pw->cap;
+    size_t first = pw->cap - start;
+    if (first > n) first = n;
+    memcpy(dst, &pw->ring[start], first * sizeof(float));
+    if (n > first) memcpy(dst + first, &pw->ring[0], (n - first) * sizeof(float));
+}
+static void ring_write(struct zicro_pw *pw, size_t pos, const float *src, size_t n) {
+    size_t start = pos % pw->cap;
+    size_t first = pw->cap - start;
+    if (first > n) first = n;
+    memcpy(&pw->ring[start], src, first * sizeof(float));
+    if (n > first) memcpy(&pw->ring[0], src + first, (n - first) * sizeof(float));
+}
+
 // ── playback: RT thread consumes the ring, silence-fills on underrun ─────────
 static void on_process_playback(void *userdata) {
     struct zicro_pw *pw = userdata;
@@ -86,7 +105,7 @@ static void on_process_playback(void *userdata) {
     size_t t = atomic_load_explicit(&pw->tail, memory_order_acquire);
     size_t avail = t - h;
     uint32_t give = (avail < n) ? (uint32_t)avail : n;
-    for (uint32_t i = 0; i < give; i++) dst[i] = pw->ring[(h + i) % pw->cap];
+    ring_read(pw, h, dst, give);
     atomic_store_explicit(&pw->head, h + give, memory_order_release);
     for (uint32_t i = give; i < n; i++) dst[i] = 0.0f; // underrun → silence
 
@@ -111,9 +130,12 @@ static void on_process_capture(void *userdata) {
 
         // Producer owns tail: write every incoming sample and advance, even past the
         // consumer's head. The consumer detects the overrun and drops the oldest — so the RT
-        // thread never blocks and latency stays bounded.
+        // thread never blocks and latency stays bounded. A batch bigger than the whole ring
+        // (never in practice — a quantum ≪ cap) keeps only its freshest `cap` samples so the
+        // single-wrap copy stays valid.
+        if (n > pw->cap) { src += (n - pw->cap); n = (uint32_t)pw->cap; }
         size_t t = atomic_load_explicit(&pw->tail, memory_order_relaxed);
-        for (uint32_t i = 0; i < n; i++) pw->ring[(t + i) % pw->cap] = src[i];
+        ring_write(pw, t, src, n);
         atomic_store_explicit(&pw->tail, t + n, memory_order_release);
     }
     pw_stream_queue_buffer(pw->stream, pb);
@@ -210,7 +232,7 @@ int zicro_pw_write(struct zicro_pw *pw, const float *src, size_t frames) {
         size_t space = pw->cap - (t - h);
         if (space == 0) { backoff(); continue; }
         size_t chunk = (n - off < space) ? (n - off) : space;
-        for (size_t i = 0; i < chunk; i++) pw->ring[(t + i) % pw->cap] = src[off + i];
+        ring_write(pw, t, src + off, chunk);
         atomic_store_explicit(&pw->tail, t + chunk, memory_order_release);
         off += chunk;
     }
@@ -236,7 +258,7 @@ size_t zicro_pw_read(struct zicro_pw *pw, float *dst, size_t frames) {
             occ = pw->cap;
         }
         size_t give = (want < occ) ? want : occ;
-        for (size_t i = 0; i < give; i++) dst[i] = pw->ring[(h + i) % pw->cap];
+        ring_read(pw, h, dst, give);
         atomic_store_explicit(&pw->head, h + give, memory_order_release);
         return give / (pw->channels ? pw->channels : 1);
     }
