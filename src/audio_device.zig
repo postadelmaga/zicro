@@ -1,18 +1,22 @@
-//! # zicro.audio_device — real hardware audio output
+//! # zicro.audio_device — real hardware audio I/O
 //!
-//! The missing piece of [`audio`]: a concrete [`AudioOut`](audio.AudioOut) that drives the
-//! sound card, so an [`AudioSink`](audio.AudioSink) actually makes noise. Platform backend
-//! behind a comptime switch, like the window backends:
-//!   - **Windows** → `winmm` **waveOut** (a plain C API — no COM to hand-declare; Wine
-//!     implements it too), double-buffered with a small pool of `WAVEHDR`s.
-//!   - **Linux**   → **ALSA** `snd_pcm` (`default` device), blocking interleaved writes.
-//!   - other       → a no-op device (compiles everywhere; silent).
+//! The missing pieces of [`audio`]: concrete [`AudioOut`](audio.AudioOut) / [`AudioIn`](audio.AudioIn)
+//! devices that drive the sound card, so an [`AudioSink`](audio.AudioSink) actually makes
+//! noise and an [`AudioSource`](audio.AudioSource) actually hears. Platform backend behind a
+//! comptime switch, like the window backends:
+//!   - **Windows** → `winmm` **waveOut** / **waveIn** (a plain C API — no COM to hand-declare;
+//!     Wine implements it too), double-buffered with a small pool of `WAVEHDR`s.
+//!   - **Linux**   → **ALSA** `snd_pcm` (`default` device), blocking interleaved reads/writes.
+//!   - other       → a no-op device (compiles everywhere; silent output / silent capture).
 //!
 //! The device opens at a FIXED format — 32-bit float, interleaved, `channels`×`rate` — and
 //! does NOT resample: the producer (e.g. a libav player, or a MIDI synth) renders straight
-//! to `openedRate()`/`openedChannels()`. That keeps the device dumb and the policy (A/V
-//! sync, resampling) where the data comes from. `play()` blocks until the block is queued,
-//! so backpressure flows back through the lossless [`AudioSink`] channel — no dropped audio.
+//! to `openedRate()`/`openedChannels()`, and a consumer of [`DeviceIn`] reads that same
+//! format. That keeps the device dumb and the policy (A/V sync, resampling) where the data
+//! comes from. `play()` blocks until the block is queued, so backpressure flows back through
+//! the lossless [`AudioSink`] channel — no dropped audio. `capture()` blocks until the next
+//! block is read; capture hardware won't wait, so the *overflow* policy (drop vs. block a
+//! slow consumer) lives in [`AudioSource`], not here.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -57,8 +61,42 @@ pub const DeviceOut = struct {
     }
 };
 
+/// Hardware audio input — the dual of [`DeviceOut`]. Wrap with `audio.AudioIn.of(DeviceIn, &dev)`
+/// to feed an `AudioSource`, or call `capture()` directly. Not thread-safe: one consumer thread.
+pub const DeviceIn = struct {
+    backend: InBackend,
+    rate: u32,
+    channels: u16,
+
+    /// Open the default capture device at `rate` Hz / `channels`, 32-bit float.
+    pub fn open(rate: u32, channels: u16) Error!DeviceIn {
+        return .{ .backend = try InBackend.open(rate, channels), .rate = rate, .channels = channels };
+    }
+
+    pub fn openedRate(self: *const DeviceIn) u32 {
+        return self.rate;
+    }
+    pub fn openedChannels(self: *const DeviceIn) u16 {
+        return self.channels;
+    }
+
+    /// Read one block of interleaved f32 samples into `buf` (device format). Blocks until
+    /// the hardware delivers samples, then returns the number of *frames* read (samples =
+    /// frames × channels). Returns 0 on end-of-stream or an unrecoverable device error, so
+    /// the caller (an `AudioSource`) can stop. `buf` should hold whole frames.
+    pub fn capture(self: *DeviceIn, buf: []f32) usize {
+        if (buf.len == 0) return 0;
+        return self.backend.read(buf, self.channels);
+    }
+
+    pub fn close(self: *DeviceIn) void {
+        self.backend.close();
+    }
+};
+
 // ── Backend selection ───────────────────────────────────────────────────────
 const Backend = if (is_win) WaveOut else if (is_linux) Alsa else NullDev;
+const InBackend = if (is_win) WaveIn else if (is_linux) AlsaIn else NullIn;
 
 /// Fallback for platforms without a backend: silent, always "succeeds".
 const NullDev = struct {
@@ -67,6 +105,19 @@ const NullDev = struct {
     }
     fn write(_: *NullDev, _: []const f32) void {}
     fn close(_: *NullDev) void {}
+};
+
+/// Capture fallback: fills the buffer with silence and "succeeds". Reports a full block so a
+/// polling `AudioSource` still makes progress (and observes shutdown) on a device-less build.
+const NullIn = struct {
+    fn open(_: u32, _: u16) Error!NullIn {
+        return .{};
+    }
+    fn read(_: *NullIn, buf: []f32, channels: u16) usize {
+        @memset(buf, 0);
+        return buf.len / @max(channels, 1);
+    }
+    fn close(_: *NullIn) void {}
 };
 
 // ── Windows: winmm waveOut ──────────────────────────────────────────────────
@@ -186,6 +237,124 @@ const WaveOut = struct {
     }
 };
 
+// ── Windows: winmm waveIn (dual of WaveOut) ─────────────────────────────────
+const WaveIn = struct {
+    const HWAVEIN = *anyopaque;
+    const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
+    const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
+    const CALLBACK_NULL: u32 = 0;
+    const WHDR_DONE: u32 = 0x0000_0001;
+    const WHDR_PREPARED: u32 = 0x0000_0002;
+    const MMSYSERR_NOERROR: u32 = 0;
+
+    // WAVEFORMATEX / WAVEHDR are laid out exactly as WaveOut's; reuse those declarations.
+    const WAVEFORMATEX = WaveOut.WAVEFORMATEX;
+    const WAVEHDR = WaveOut.WAVEHDR;
+
+    extern "winmm" fn waveInOpen(phwi: *HWAVEIN, uDeviceID: u32, pwfx: *const WAVEFORMATEX, cb: usize, inst: usize, flags: u32) callconv(.winapi) u32;
+    extern "winmm" fn waveInPrepareHeader(hwi: HWAVEIN, pwh: *WAVEHDR, cb: u32) callconv(.winapi) u32;
+    extern "winmm" fn waveInUnprepareHeader(hwi: HWAVEIN, pwh: *WAVEHDR, cb: u32) callconv(.winapi) u32;
+    extern "winmm" fn waveInAddBuffer(hwi: HWAVEIN, pwh: *WAVEHDR, cb: u32) callconv(.winapi) u32;
+    extern "winmm" fn waveInStart(hwi: HWAVEIN) callconv(.winapi) u32;
+    extern "winmm" fn waveInStop(hwi: HWAVEIN) callconv(.winapi) u32;
+    extern "winmm" fn waveInReset(hwi: HWAVEIN) callconv(.winapi) u32;
+    extern "winmm" fn waveInClose(hwi: HWAVEIN) callconv(.winapi) u32;
+    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
+    const NBUF = 8; // WAVEHDR pool: queue depth ~ NBUF × block size
+
+    hwi: HWAVEIN,
+    channels: u16,
+    hdrs: [NBUF]WAVEHDR,
+    bufs: [NBUF][]u8, // capture buffer per header (sized on first read)
+    next: usize,
+    started: bool,
+    gpa: std.mem.Allocator,
+
+    fn open(rate: u32, channels: u16) Error!WaveIn {
+        const block_align: u16 = channels * 4; // f32
+        const fmt = WAVEFORMATEX{
+            .wFormatTag = WAVE_FORMAT_IEEE_FLOAT,
+            .nChannels = channels,
+            .nSamplesPerSec = rate,
+            .nAvgBytesPerSec = rate * block_align,
+            .nBlockAlign = block_align,
+            .wBitsPerSample = 32,
+            .cbSize = 0,
+        };
+        var hwi: HWAVEIN = undefined;
+        if (waveInOpen(&hwi, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
+            return Error.OpenFailed;
+        var self = WaveIn{
+            .hwi = hwi,
+            .channels = channels,
+            .hdrs = undefined,
+            .bufs = undefined,
+            .next = 0,
+            .started = false,
+            .gpa = std.heap.c_allocator,
+        };
+        for (0..NBUF) |i| {
+            self.hdrs[i] = .{ .lpData = undefined, .dwBufferLength = 0 };
+            self.bufs[i] = &.{};
+        }
+        return self;
+    }
+
+    /// The capture queue is sized to the first `read`'s block: allocate and enqueue every
+    /// header at that size, then start recording. Idempotent — later reads with a bigger
+    /// buffer keep the original block size (the producer picks one size and sticks to it).
+    fn ensureStarted(self: *WaveIn, bytes: usize) bool {
+        if (self.started) return true;
+        for (0..NBUF) |i| {
+            self.bufs[i] = self.gpa.alloc(u8, bytes) catch return false;
+            self.hdrs[i] = .{ .lpData = self.bufs[i].ptr, .dwBufferLength = @intCast(bytes) };
+            if (waveInPrepareHeader(self.hwi, &self.hdrs[i], @sizeOf(WAVEHDR)) != MMSYSERR_NOERROR) return false;
+            if (waveInAddBuffer(self.hwi, &self.hdrs[i], @sizeOf(WAVEHDR)) != MMSYSERR_NOERROR) return false;
+        }
+        if (waveInStart(self.hwi) != MMSYSERR_NOERROR) return false;
+        self.started = true;
+        return true;
+    }
+
+    /// Waits for the next header the driver has filled, copies its recorded samples into
+    /// `buf`, re-queues that header, and advances. Returns frames read (0 on failure).
+    fn read(self: *WaveIn, buf: []f32, channels: u16) usize {
+        const want = std.mem.sliceAsBytes(buf);
+        if (!self.ensureStarted(want.len)) return 0;
+        const h = &self.hdrs[self.next];
+        // Wait until the driver has finished filling this header, but cap the wait (~2s) so
+        // the capture thread stays responsive (stop/join) if the device stalls.
+        var spins: u32 = 0;
+        while ((h.dwFlags & WHDR_DONE) == 0) : (spins += 1) {
+            if (spins > 2000) return 0;
+            Sleep(1);
+        }
+        const recorded = @min(h.dwBytesRecorded, self.bufs[self.next].len);
+        const n = @min(recorded, want.len);
+        @memcpy(want[0..n], self.bufs[self.next][0..n]);
+        // Re-queue the header for reuse (dwFlags keeps WHDR_PREPARED; clear DONE via re-add).
+        h.dwFlags &= ~WHDR_DONE;
+        h.dwBytesRecorded = 0;
+        _ = waveInAddBuffer(self.hwi, h, @sizeOf(WAVEHDR));
+        self.next = (self.next + 1) % NBUF;
+        return n / (4 * @as(usize, @max(channels, 1)));
+    }
+
+    fn close(self: *WaveIn) void {
+        if (self.started) {
+            _ = waveInStop(self.hwi);
+            _ = waveInReset(self.hwi); // marks queued headers as DONE
+        }
+        for (0..NBUF) |i| {
+            if ((self.hdrs[i].dwFlags & WHDR_PREPARED) != 0)
+                _ = waveInUnprepareHeader(self.hwi, &self.hdrs[i], @sizeOf(WAVEHDR));
+            if (self.bufs[i].len > 0) self.gpa.free(self.bufs[i]);
+        }
+        _ = waveInClose(self.hwi);
+    }
+};
+
 // ── Linux: ALSA snd_pcm ─────────────────────────────────────────────────────
 const Alsa = struct {
     const snd_pcm_t = opaque {};
@@ -236,6 +405,52 @@ const Alsa = struct {
     }
 };
 
+// ── Linux: ALSA snd_pcm capture (dual of Alsa) ──────────────────────────────
+const AlsaIn = struct {
+    const snd_pcm_t = Alsa.snd_pcm_t;
+    const SND_PCM_STREAM_CAPTURE: c_int = 1;
+    const SND_PCM_FORMAT_FLOAT_LE = Alsa.SND_PCM_FORMAT_FLOAT_LE;
+    const SND_PCM_ACCESS_RW_INTERLEAVED = Alsa.SND_PCM_ACCESS_RW_INTERLEAVED;
+
+    // snd_pcm_readi is the capture dual of snd_pcm_writei (not declared on the output side).
+    extern "c" fn snd_pcm_readi(pcm: *snd_pcm_t, buffer: *anyopaque, size: c_ulong) c_long;
+
+    pcm: *snd_pcm_t,
+    channels: u16,
+
+    fn open(rate: u32, channels: u16) Error!AlsaIn {
+        var pcm: *snd_pcm_t = undefined;
+        if (Alsa.snd_pcm_open(&pcm, "default", SND_PCM_STREAM_CAPTURE, 0) < 0) return Error.OpenFailed;
+        // soft_resample=1; ~100ms of buffering. A low-latency capture path is issue #16.
+        if (Alsa.snd_pcm_set_params(pcm, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels, rate, 1, 100_000) < 0) {
+            _ = Alsa.snd_pcm_close(pcm);
+            return Error.OpenFailed;
+        }
+        return .{ .pcm = pcm, .channels = channels };
+    }
+
+    /// Read up to `buf.len / channels` frames; blocks until at least one arrives. Returns
+    /// the frame count (0 only on an unrecoverable error), recovering from over/underruns.
+    fn read(self: *AlsaIn, buf: []f32, channels: u16) usize {
+        const ch: usize = @max(channels, 1);
+        const want_frames = buf.len / ch;
+        if (want_frames == 0) return 0;
+        while (true) {
+            const n = snd_pcm_readi(self.pcm, buf.ptr, @intCast(want_frames));
+            if (n < 0) {
+                // Overrun/error: recover and retry (silent=1). Give up if unrecoverable.
+                if (Alsa.snd_pcm_recover(self.pcm, @intCast(n), 1) < 0) return 0;
+                continue;
+            }
+            return @intCast(n);
+        }
+    }
+
+    fn close(self: *AlsaIn) void {
+        _ = Alsa.snd_pcm_close(self.pcm);
+    }
+};
+
 test "device out compiles and plays into the null/real backend without error" {
     // On headless CI the real device may fail to open: we tolerate OpenFailed, what matters
     // is that the API compiles and that play() on an open device doesn't crash.
@@ -244,4 +459,14 @@ test "device out compiles and plays into the null/real backend without error" {
     var block = try AudioBlock.init(std.testing.allocator, 48_000, 2, &(.{0.0} ** 512));
     defer block.deinit();
     dev.play(&block);
+}
+
+test "device in compiles and captures from the null/real backend without error" {
+    // Same tolerance as the output test: on headless CI the real device may fail to open.
+    // What matters is that the capture API compiles on every backend and doesn't crash.
+    var dev = DeviceIn.open(48_000, 2) catch return;
+    defer dev.close();
+    var buf: [1024]f32 = undefined; // 512 frames × 2ch
+    const frames = dev.capture(&buf);
+    try std.testing.expect(frames <= 512);
 }

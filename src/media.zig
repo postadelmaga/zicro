@@ -313,6 +313,18 @@ pub fn BoundedSender(comptime T: type) type {
             }
         }
 
+        /// Non-blocking push (wait-free): `false` when the queue is at capacity — the
+        /// caller keeps `value` and decides the overflow policy (drop it, coalesce, …).
+        /// This is the producer-side dual of [`BoundedReceiver.tryRecv`]; a live capture
+        /// source uses it to drop rather than stall the hardware. `error.Disconnected`
+        /// once the receiver is gone (the caller still owns `value`).
+        pub fn trySend(self: @This(), value: T) error{Disconnected}!bool {
+            const inner = self.inner;
+            if (inner.tryPushRaw(value)) return true;
+            if (!inner.receiver_alive.load(.acquire)) return error.Disconnected;
+            return false;
+        }
+
         pub fn deinit(self: @This()) void {
             const inner = self.inner;
             inner.sender_alive.store(false, .release);

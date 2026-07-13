@@ -91,6 +91,7 @@ test {
     _ = input;
     _ = video;
     _ = audio;
+    _ = audio_device;
     _ = bridge;
     _ = ipc;
     _ = shmem;
