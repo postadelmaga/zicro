@@ -175,6 +175,6 @@ orchestrates external Demucs/basic-pitch subprocesses).
   released under the AGPLv3 with complete source available.
 - **Commercial** · for use in a **proprietary / closed-source** product, without the AGPL
   copyleft, buy a commercial license from the author. See [`LICENSING.md`](LICENSING.md) —
-  contact **Francesco Magazzù** <magazzu.francesco@gmail.com>.
+  contact **Francesco Magazzù** <postadelmaga@gmail.com>.
 
 © 2026 Francesco Magazzù.

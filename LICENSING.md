@@ -23,7 +23,7 @@ the copyleft obligations for your product.
 
 Commercial licenses are available from the copyright holder:
 
-> **Francesco Magazzù** — <magazzu.francesco@gmail.com>
+> **Francesco Magazzù** — <postadelmaga@gmail.com>
 
 Reach out with a short description of your use case and we'll sort out terms.
 
