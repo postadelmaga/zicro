@@ -76,6 +76,7 @@ extern fn AMotionEvent_getAction(e: *const AInputEvent) i32;
 extern fn AMotionEvent_getX(e: *const AInputEvent, pointer_index: usize) f32;
 extern fn AMotionEvent_getY(e: *const AInputEvent, pointer_index: usize) f32;
 extern fn ALooper_pollOnce(timeout_ms: i32, out_fd: ?*i32, out_events: ?*i32, out_data: ?*?*anyopaque) i32;
+extern fn AConfiguration_getDensity(config: ?*anyopaque) i32;
 
 const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 const AINPUT_EVENT_TYPE_KEY: i32 = 1;
@@ -87,6 +88,8 @@ const AMOTION_EVENT_ACTION_UP: i32 = 1;
 const AMOTION_EVENT_ACTION_MOVE: i32 = 2;
 const APP_CMD_INIT_WINDOW: i32 = 1;
 const APP_CMD_TERM_WINDOW: i32 = 2;
+const APP_CMD_WINDOW_RESIZED: i32 = 3;
+const APP_CMD_CONFIG_CHANGED: i32 = 8;
 
 const BTN_LEFT: u32 = 272; // touch maps to the left-button contract the toolkit expects
 
@@ -129,11 +132,13 @@ pub const Window = struct {
 
     fn setNative(self: *Window, nw: *ANativeWindow) void {
         self.native = nw;
+        // Reset to the window's native size (0,0) with our pixel format, THEN read the size —
+        // so after a rotation we pick up the new dimensions, not the stale ones.
+        _ = ANativeWindow_setBuffersGeometry(nw, 0, 0, WINDOW_FORMAT_RGBA_8888);
         const w: u32 = @intCast(@max(ANativeWindow_getWidth(nw), 1));
         const h: u32 = @intCast(@max(ANativeWindow_getHeight(nw), 1));
         self.width = w;
         self.height = h;
-        _ = ANativeWindow_setBuffersGeometry(nw, @intCast(w), @intCast(h), WINDOW_FORMAT_RGBA_8888);
         self.ensureBackbuf(@as(usize, w) * h);
     }
 
@@ -154,6 +159,16 @@ pub const Window = struct {
     }
     pub fn setMinimized(self: *Window) void {
         _ = self;
+    }
+
+    /// Display scale (density/160): 1.0 at mdpi, ~2.75 at 440 dpi. Apps multiply their UI
+    /// sizes by this so text and controls aren't tiny on high-density phones.
+    pub fn scaleFactor(self: *const Window) f32 {
+        const app = self.app orelse return 1;
+        const cfg = app.config orelse return 1;
+        const d = AConfiguration_getDensity(cfg);
+        if (d <= 0 or d == 0xffff) return 1; // 0 = default/unset, 0xffff = ACONFIGURATION_DENSITY_NONE
+        return @as(f32, @floatFromInt(d)) / 160.0;
     }
 
     pub fn textFont(self: *Window) !*text.Font {
@@ -228,6 +243,9 @@ pub const Window = struct {
         switch (cmd) {
             APP_CMD_INIT_WINDOW => if (app.window) |nw| self.setNative(nw),
             APP_CMD_TERM_WINDOW => self.native = null,
+            // Rotation / resize: re-read the surface geometry (and re-set the buffer format),
+            // otherwise we present at the old dimensions and the image is skewed.
+            APP_CMD_WINDOW_RESIZED, APP_CMD_CONFIG_CHANGED => if (app.window) |nw| self.setNative(nw),
             else => {},
         }
     }
