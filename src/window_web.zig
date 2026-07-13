@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const paint = @import("paint.zig");
+const widget = @import("widget.zig");
 
 pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
 
@@ -163,6 +164,7 @@ export fn zicroResize(w: u32, h: u32, scale: f32) void {
 export fn zicroFrame(now_ms: f64) void {
     const win = active orelse return;
     frame_now_ms = @intFromFloat(now_ms);
+    widget.web_now_ms = frame_now_ms; // so `widget.nowMs()` (Ui.begin) sees the browser clock
     if (win.opts.on_tick) |tick| tick(win, win.opts.user);
     if (win.opts.on_draw) |draw| {
         var canvas = paint.Canvas.initRgba8(win.buffer(), win.width, win.height);

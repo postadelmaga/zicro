@@ -43,6 +43,11 @@ pub const BTN_LEFT: u32 = 272;
 pub const BTN_RIGHT: u32 = 273;
 pub const BTN_MIDDLE: u32 = 274;
 
+/// Browser frame time (ms) for the wasm build: freestanding has no OS clock, so the web
+/// window backend (`window_web.zig`) publishes each rAF timestamp here and `nowMs` returns
+/// it. A plain global is fine — wasm is single-threaded.
+pub var web_now_ms: i64 = 0;
+
 /// Monotonic milliseconds for [`Ui.begin`]'s `now_ms` — the per-OS clock apps need for
 /// caret blink and animations (0.16 has no ambient `std.time` clock; tests pass explicit
 /// timestamps instead and stay pure).
@@ -55,6 +60,8 @@ pub fn nowMs() i64 {
             };
             return @intCast(k32.GetTickCount64());
         },
+        // wasm: no OS clock — the browser feeds the time via `web_now_ms`.
+        .freestanding => return web_now_ms,
         else => {
             var ts: std.os.linux.timespec = undefined;
             _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
