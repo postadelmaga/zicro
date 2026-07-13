@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const window = @import("window.zig");
 const paint = @import("paint.zig");
 const text = @import("text.zig");
+const gesture = @import("gesture.zig");
 
 pub const Options = window.Options;
 pub const MouseEvent = window.MouseEvent;
@@ -75,6 +76,8 @@ extern fn AKeyEvent_getKeyCode(e: *const AInputEvent) i32;
 extern fn AMotionEvent_getAction(e: *const AInputEvent) i32;
 extern fn AMotionEvent_getX(e: *const AInputEvent, pointer_index: usize) f32;
 extern fn AMotionEvent_getY(e: *const AInputEvent, pointer_index: usize) f32;
+extern fn AMotionEvent_getPointerCount(e: *const AInputEvent) usize;
+extern fn AMotionEvent_getPointerId(e: *const AInputEvent, pointer_index: usize) i32;
 extern fn ALooper_pollOnce(timeout_ms: i32, out_fd: ?*i32, out_events: ?*i32, out_data: ?*?*anyopaque) i32;
 extern fn AConfiguration_getDensity(config: ?*anyopaque) i32;
 
@@ -86,12 +89,19 @@ const AMOTION_EVENT_ACTION_MASK: i32 = 0xff;
 const AMOTION_EVENT_ACTION_DOWN: i32 = 0;
 const AMOTION_EVENT_ACTION_UP: i32 = 1;
 const AMOTION_EVENT_ACTION_MOVE: i32 = 2;
+const AMOTION_EVENT_ACTION_CANCEL: i32 = 3;
+const AMOTION_EVENT_ACTION_POINTER_DOWN: i32 = 5;
+const AMOTION_EVENT_ACTION_POINTER_UP: i32 = 6;
+const AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT: u5 = 8;
 const APP_CMD_INIT_WINDOW: i32 = 1;
 const APP_CMD_TERM_WINDOW: i32 = 2;
 const APP_CMD_WINDOW_RESIZED: i32 = 3;
 const APP_CMD_CONFIG_CHANGED: i32 = 8;
 
 const BTN_LEFT: u32 = 272; // touch maps to the left-button contract the toolkit expects
+
+/// Recognizer gesti condiviso (una sola activity/finestra su Android).
+var touch_recognizer: gesture.Recognizer = .{};
 
 // --- the Window ---------------------------------------------------------------------
 
@@ -250,26 +260,56 @@ pub const Window = struct {
         }
     }
 
+    /// Un campione touch nel recognizer condiviso; ne inoltra gli eventi (un dito → mouse,
+    /// due dita → pinch su `on_gesture`).
+    fn feedTouch(self: *Window, id: i32, phase: gesture.Phase, x: f32, y: f32) void {
+        var out: [2]gesture.Out = undefined;
+        for (touch_recognizer.push(id, phase, x, y, &out)) |ev| switch (ev) {
+            .pointer_down => |p| if (self.opts.on_mouse) |cb| {
+                cb(self, .{ .kind = .motion, .x = p.x, .y = p.y }, self.opts.user);
+                cb(self, .{ .kind = .press, .x = p.x, .y = p.y, .button = BTN_LEFT }, self.opts.user);
+            },
+            .pointer_move => |p| if (self.opts.on_mouse) |cb| cb(self, .{ .kind = .motion, .x = p.x, .y = p.y }, self.opts.user),
+            .pointer_up => |p| if (self.opts.on_mouse) |cb| {
+                cb(self, .{ .kind = .motion, .x = p.x, .y = p.y }, self.opts.user);
+                cb(self, .{ .kind = .release, .x = p.x, .y = p.y, .button = BTN_LEFT }, self.opts.user);
+            },
+            .pinch => |g| if (self.opts.on_gesture) |cb| cb(self, g, self.opts.user),
+        };
+    }
+
     fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) i32 {
         const self: *Window = @ptrCast(@alignCast(app.userData orelse return 0));
         switch (AInputEvent_getType(event)) {
             AINPUT_EVENT_TYPE_MOTION => {
-                const action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
-                const x = AMotionEvent_getX(event, 0);
-                const y = AMotionEvent_getY(event, 0);
-                const kind: MouseEvent.Kind = switch (action) {
-                    AMOTION_EVENT_ACTION_DOWN => .press,
-                    AMOTION_EVENT_ACTION_UP => .release,
-                    else => .motion, // MOVE and everything else is a drag/hover
-                };
-                if (self.opts.on_mouse) |cb| {
-                    // A touch always reports position; press/release also carry the button.
-                    if (kind == .motion) {
-                        cb(self, .{ .kind = .motion, .x = x, .y = y }, self.opts.user);
-                    } else {
-                        cb(self, .{ .kind = .motion, .x = x, .y = y }, self.opts.user);
-                        cb(self, .{ .kind = kind, .x = x, .y = y, .button = BTN_LEFT }, self.opts.user);
-                    }
+                // Multi-touch attraverso il recognizer condiviso `gesture.zig` (stesso di web):
+                // un dito → eventi mouse, due dita → pinch su `on_gesture`.
+                const raw = AMotionEvent_getAction(event);
+                const action = raw & AMOTION_EVENT_ACTION_MASK;
+                const idx: usize = @intCast((raw >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT) & 0xff);
+                switch (action) {
+                    AMOTION_EVENT_ACTION_DOWN, AMOTION_EVENT_ACTION_POINTER_DOWN => self.feedTouch(
+                        AMotionEvent_getPointerId(event, idx),
+                        .down,
+                        AMotionEvent_getX(event, idx),
+                        AMotionEvent_getY(event, idx),
+                    ),
+                    AMOTION_EVENT_ACTION_UP, AMOTION_EVENT_ACTION_POINTER_UP, AMOTION_EVENT_ACTION_CANCEL => self.feedTouch(
+                        AMotionEvent_getPointerId(event, idx),
+                        .up,
+                        AMotionEvent_getX(event, idx),
+                        AMotionEvent_getY(event, idx),
+                    ),
+                    else => { // MOVE: aggiorna tutti i pointer
+                        var i: usize = 0;
+                        const count = AMotionEvent_getPointerCount(event);
+                        while (i < count) : (i += 1) self.feedTouch(
+                            AMotionEvent_getPointerId(event, i),
+                            .move,
+                            AMotionEvent_getX(event, i),
+                            AMotionEvent_getY(event, i),
+                        );
+                    },
                 }
                 return 1;
             },

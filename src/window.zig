@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const paint = @import("paint.zig");
+pub const gesture = @import("gesture.zig");
 
 pub const Rect = struct {
     x: i32,
@@ -32,6 +33,9 @@ pub const Options = struct {
     /// When set, pointer events are delivered to the app and the default
     /// drag-anywhere window move is disabled (UI apps own their clicks).
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) void = null,
+    /// Gesto multi-touch riconosciuto dal substrato (pinch, …). Un dito arriva come
+    /// evento mouse su `on_mouse`; due dita qui (vedi `gesture.zig`).
+    on_gesture: ?*const fn (window: *Window, g: gesture.Gesture, user: ?*anyopaque) void = null,
     /// Periodic callback from the event loop (runtime pumps: dispatch queues,
     /// timers, animations). 0 disables ticking and the loop blocks on events.
     on_tick: ?*const fn (window: *Window, user: ?*anyopaque) void = null,

@@ -20,6 +20,7 @@
 const std = @import("std");
 const paint = @import("paint.zig");
 const widget = @import("widget.zig");
+const gesture = @import("gesture.zig");
 
 pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
 
@@ -40,6 +41,8 @@ pub const Options = struct {
     on_draw: ?*const fn (canvas: *paint.Canvas, content: Rect, user: ?*anyopaque) void = null,
     on_key: ?*const fn (window: *Window, key: u32, state: u32, user: ?*anyopaque) void = null,
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) void = null,
+    /// Gesto multi-touch (pinch, …) dal recognizer condiviso `gesture.zig`.
+    on_gesture: ?*const fn (window: *Window, g: gesture.Gesture, user: ?*anyopaque) void = null,
     on_tick: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
     tick_ms: u32 = 0,
     decorations: bool = false,
@@ -205,4 +208,44 @@ export fn zicroScroll(dy: f32) void {
 export fn zicroKey(code: u32, pressed: i32) void {
     const win = active orelse return;
     if (win.opts.on_key) |on_key| on_key(win, code, if (pressed != 0) 1 else 0, win.opts.user);
+}
+
+// --- multi-touch → gesti (substrato, condiviso web/android via `gesture.zig`) ------------
+// JS inoltra QUI i punti touch grezzi (i pointer con `pointerType==='touch'`); mouse/pen
+// restano sul path pointer sopra. Il recognizer condiviso traduce un dito negli STESSI
+// eventi mouse (tap/drag/spostamento item/pan funzionano identici) e due dita in un PINCH
+// semantico consegnato all'app via `on_gesture`.
+var recognizer: gesture.Recognizer = .{};
+
+fn dispatchGesture(g: gesture.Gesture) void {
+    const win = active orelse return;
+    if (win.opts.on_gesture) |cb| cb(win, g, win.opts.user);
+}
+
+/// JS: un punto touch. `phase` 0=giù 1=muovi 2=su/annulla; x/y in px fisici (già ×dpr).
+export fn zicroTouch(id: i32, phase: u32, x: f32, y: f32) void {
+    const ph: gesture.Phase = switch (phase) {
+        0 => .down,
+        1 => .move,
+        else => .up,
+    };
+    var out: [2]gesture.Out = undefined;
+    for (recognizer.push(id, ph, x, y, &out)) |ev| switch (ev) {
+        .pointer_down => |p| {
+            last_x = p.x;
+            last_y = p.y;
+            dispatchMouse(.{ .kind = .press, .x = p.x, .y = p.y, .button = 272 });
+        },
+        .pointer_move => |p| {
+            last_x = p.x;
+            last_y = p.y;
+            dispatchMouse(.{ .kind = .motion, .x = p.x, .y = p.y });
+        },
+        .pointer_up => |p| {
+            last_x = p.x;
+            last_y = p.y;
+            dispatchMouse(.{ .kind = .release, .x = p.x, .y = p.y, .button = 272 });
+        },
+        .pinch => |g| dispatchGesture(g),
+    };
 }

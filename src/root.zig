@@ -48,6 +48,7 @@ pub const scroll = @import("scroll.zig");
 pub const widget = @import("widget.zig");
 pub const keymap = @import("keymap.zig");
 pub const window = @import("window.zig");
+pub const gesture = @import("gesture.zig");
 pub const proportion = @import("proportion.zig");
 
 // -- out-of-process transports (the Rust `ipc` feature of micro-bus)
@@ -109,5 +110,6 @@ test {
     _ = widget;
     _ = keymap;
     _ = window;
+    _ = gesture;
     _ = proportion;
 }
