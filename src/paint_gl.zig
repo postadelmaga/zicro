@@ -237,6 +237,19 @@ pub const GlRecorder = struct {
         const uv = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
         self.texQuad(pos, uv, .{ .r = 1, .g = 1, .b = 1, .a = 1 }, 2, clip, 1, @intFromPtr(src.ptr), src_w, src_h);
     }
+    fn blitMask(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, tint: Color, clip: ?Clip) void {
+        const self: *GlRecorder = @ptrCast(@alignCast(ptr));
+        if (src.len == 0 or src_w == 0 or src_h == 0) return;
+        const x0: f32 = @floatFromInt(dst_x);
+        const y0: f32 = @floatFromInt(dst_y);
+        const x1 = x0 + @as(f32, @floatFromInt(dst_w));
+        const y1 = y0 + @as(f32, @floatFromInt(dst_h));
+        const pos = [4][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
+        const uv = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+        // mode 5 = maschera RGBA (sample .a) tinta da `tint`; fmt 1 (texture RGBA). Il
+        // sorgente è STATICO (icona baked) → puntatore stabile e cacheable.
+        self.texQuad(pos, uv, tint, 5, clip, 1, @intFromPtr(src.ptr), src_w, src_h);
+    }
     fn blitImageRot(ptr: *anyopaque, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
         if (src.len == 0 or src_w == 0 or src_h == 0) return;
@@ -290,6 +303,7 @@ pub const GlRecorder = struct {
         .strokeSegment = strokeSegment,
         .strokeRoundedRect = strokeRoundedRect,
         .blitImage = blitImage,
+        .blitMask = blitMask,
         .blitImageRot = blitImageRot,
         .drawText = drawText,
     };

@@ -422,6 +422,9 @@ pub const GlBackend = struct {
         strokeSegment: *const fn (*anyopaque, ax: f32, ay: f32, bx: f32, by: f32, width: f32, color: Color, clip: ?Canvas.Clip) void,
         strokeRoundedRect: *const fn (*anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: Color, clip: ?Canvas.Clip) void,
         blitImage: *const fn (*anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, clip: ?Canvas.Clip) void,
+        // Come blitImage ma il sorgente è una MASCHERA: solo il canale alpha conta, tinto da
+        // `tint` (in shader). Per le icone UI (alpha mask) senza buffer tinto transiente.
+        blitMask: *const fn (*anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, tint: Color, clip: ?Canvas.Clip) void,
         blitImageRot: *const fn (*anyopaque, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32, clip: ?Canvas.Clip) void,
         drawText: *const fn (*anyopaque, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts, clip: ?Canvas.Clip) void,
     };
@@ -787,6 +790,34 @@ pub const Canvas = struct {
                     @as(f32, @floatFromInt(src[si + 2])) * inv,
                     @as(f32, @floatFromInt(a)) * inv,
                 );
+            }
+        }
+    }
+
+    /// Come [`blitImage`] ma il sorgente è una MASCHERA (conta solo l'alpha), tinta da
+    /// `tint`. Per le icone-maschera (UI): niente buffer tinto transiente lato chiamante
+    /// (che sul backend GL sarebbe un puntatore penzolante/collidente).
+    pub fn blitMask(self: *Canvas, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, tint: Color) void {
+        if (self.gl) |g| return g.vtable.blitMask(g.ptr, dst_x, dst_y, dst_w, dst_h, src, src_w, src_h, tint, self.clip);
+        if (dst_w == 0 or dst_h == 0 or src_w == 0 or src_h == 0) return;
+        const bx0: u32 = @intCast(@max(0, dst_x));
+        const by0: u32 = @intCast(@max(0, dst_y));
+        const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, dst_x + @as(i32, @intCast(dst_w))))));
+        const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        const inv: f32 = 1.0 / 255.0;
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const rel_y: u32 = @intCast(@as(i32, @intCast(py)) - dst_y);
+            const sy = @min(src_h - 1, rel_y * src_h / dst_h);
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+                const sx = @min(src_w - 1, rel_x * src_w / dst_w);
+                const a = src[(@as(usize, sy) * src_w + sx) * 4 + 3];
+                if (a == 0) continue;
+                row[px] = self.overColor(row[px], tint.r, tint.g, tint.b, @as(f32, @floatFromInt(a)) * inv * tint.a);
             }
         }
     }
