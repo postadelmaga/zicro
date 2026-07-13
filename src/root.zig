@@ -42,6 +42,7 @@ pub const bridge = @import("bridge.zig");
 pub const wl = @import("wl.zig");
 pub const text = @import("text.zig");
 pub const paint = @import("paint.zig");
+pub const paint_gl = @import("paint_gl.zig");
 pub const scroll = @import("scroll.zig");
 pub const widget = @import("widget.zig");
 pub const keymap = @import("keymap.zig");

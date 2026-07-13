@@ -8,6 +8,7 @@
 //! `wasm_shim.zig` (referenced below so its `export`s are emitted into the module).
 
 pub const paint = @import("paint.zig");
+pub const paint_gl = @import("paint_gl.zig");
 pub const text = @import("text.zig");
 /// Wayland client bindings — pulled in only for the keycode/cursor CONSTANTS the panels
 /// reference (`wl.KEYBOARD_KEY_STATE_*`, cursor shapes); the extern libwayland functions
