@@ -164,7 +164,7 @@ pub const Window = struct {
     /// Copy a straight-RGBA frame into the ANativeWindow surface (honoring its stride).
     pub fn presentRgba(self: *Window, w: u32, h: u32, rgba: []const u8) void {
         const nw = self.native orelse return;
-        var buf: ANativeWindow_Buffer = undefined;
+        var buf: ANativeWindow_Buffer = std.mem.zeroes(ANativeWindow_Buffer);
         if (ANativeWindow_lock(nw, &buf, null) != 0) return;
         const bits: [*]u8 = @ptrCast(buf.bits orelse {
             _ = ANativeWindow_unlockAndPost(nw);
@@ -188,16 +188,22 @@ pub const Window = struct {
     pub fn run(self: *Window) !void {
         const app = self.app orelse return error.NotAttached;
         while (!self.closed and app.destroyRequested == 0) {
-            // Drain pending events; block when there's no surface to draw (timeout -1).
-            const timeout: i32 = if (self.native != null) 0 else -1;
+            // ONE poll per iteration with a *recomputed* timeout: block (-1) while there is no
+            // surface, else 16 ms so an idle surface still redraws at ~60 fps. On an event
+            // (ident ≥ 0) we process it and re-loop (so `native` set by APP_CMD_INIT_WINDOW is
+            // seen immediately); on timeout/wake (< 0) we fall through and draw. The previous
+            // code captured the timeout before the inner loop could set `native`, so it blocked
+            // forever on pollOnce(-1) and never reached the draw — a black screen.
+            const timeout: i32 = if (self.native != null) 16 else -1;
             var events: i32 = 0;
             var source: ?*anyopaque = null;
-            while (ALooper_pollOnce(timeout, null, &events, &source) >= 0) {
+            if (ALooper_pollOnce(timeout, null, &events, &source) >= 0) {
                 if (source) |s| {
                     const ps: *android_poll_source = @ptrCast(@alignCast(s));
                     if (ps.process) |proc| proc(app, ps);
                 }
                 if (app.destroyRequested != 0) return;
+                continue;
             }
             if (self.native == null) continue;
 
