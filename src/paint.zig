@@ -405,6 +405,28 @@ pub const Format = enum {
 };
 
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.
+/// Backend 2D GPU (GLES3/WebGL2) intercambiabile col raster CPU: quando un [`Canvas`]
+/// ne ha uno, ogni primitivo delega a questa vtable invece di scrivere pixel. `paint.zig`
+/// resta **agnostico** — conosce solo l'interfaccia, non l'impl (che vive in `paint_gl`).
+/// Ogni op è in coord pixel del canvas; `clip` = scissor corrente (null = intero canvas).
+/// I widget rari (arc/spinner/progress/chrome) restano CPU-only per ora.
+pub const GlBackend = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        fillRoundedRect: *const fn (*anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color, clip: ?Canvas.Clip) void,
+        fillRoundedRectPerCorner: *const fn (*anyopaque, x: f32, y: f32, w: f32, h: f32, corners: Corners, color: Color, clip: ?Canvas.Clip) void,
+        fillRoundedRectVGradient: *const fn (*anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, top: Color, bottom: Color, clip: ?Canvas.Clip) void,
+        fillConcaveCorner: *const fn (*anyopaque, x: f32, y: f32, size: f32, cx: f32, cy: f32, color: Color, clip: ?Canvas.Clip) void,
+        strokeSegment: *const fn (*anyopaque, ax: f32, ay: f32, bx: f32, by: f32, width: f32, color: Color, clip: ?Canvas.Clip) void,
+        strokeRoundedRect: *const fn (*anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: Color, clip: ?Canvas.Clip) void,
+        blitImage: *const fn (*anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, clip: ?Canvas.Clip) void,
+        blitImageRot: *const fn (*anyopaque, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32, clip: ?Canvas.Clip) void,
+        drawText: *const fn (*anyopaque, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts, clip: ?Canvas.Clip) void,
+    };
+};
+
 pub const Canvas = struct {
     pixels: []u32,
     width: u32,
@@ -415,6 +437,9 @@ pub const Canvas = struct {
     /// primitive is confined to it — how apps keep scrolled content from bleeding over
     /// the chrome. `null` = draw to the whole canvas.
     clip: ?Clip = null,
+    /// Backend GPU opzionale: se presente, i primitivi delegano alla sua vtable (GLES3/
+    /// WebGL2) invece di rasterizzare su CPU. `null` = raster CPU (default, output invariato).
+    gl: ?*GlBackend = null,
 
     pub const Clip = struct { x0: u32, y0: u32, x1: u32, y1: u32 };
 
@@ -735,6 +760,7 @@ pub const Canvas = struct {
     /// Blit an RGBA8 (straight-alpha, bytes R,G,B,A) sprite into the dst rect, source-over,
     /// nearest-neighbour scaled and honoring clip + canvas [`Format`]. For app icons/thumbnails.
     pub fn blitImage(self: *Canvas, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32) void {
+        if (self.gl) |g| return g.vtable.blitImage(g.ptr, dst_x, dst_y, dst_w, dst_h, src, src_w, src_h, self.clip);
         if (dst_w == 0 or dst_h == 0 or src_w == 0 or src_h == 0) return;
         const bx0: u32 = @intCast(@max(0, dst_x));
         const by0: u32 = @intCast(@max(0, dst_y));
@@ -768,6 +794,7 @@ pub const Canvas = struct {
     /// Like [`blitImage`] but rotated by `angle` radians about the dst-rect centre. Inverse-
     /// rotates each output pixel back into the sprite; nearest-neighbour, alpha-over, clipped.
     pub fn blitImageRot(self: *Canvas, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32) void {
+        if (self.gl) |g| return g.vtable.blitImageRot(g.ptr, dx, dy, dw, dh, src, src_w, src_h, angle, self.clip);
         if (dw <= 0 or dh <= 0 or src_w == 0 or src_h == 0) return;
         const cx = dx + dw * 0.5;
         const cy = dy + dh * 0.5;
@@ -814,6 +841,7 @@ pub const Canvas = struct {
     /// where pixels at distance >= `size` from the center (cx,cy) are filled → concave arc with AA.
     /// With cx,cy at the square's outer-top corner you get the wing that widens the tab at the bottom.
     pub fn fillConcaveCorner(self: *Canvas, x: f32, y: f32, size: f32, cx: f32, cy: f32, color: Color) void {
+        if (self.gl) |g| return g.vtable.fillConcaveCorner(g.ptr, x, y, size, cx, cy, color, self.clip);
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(y)));
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + size)))));
@@ -836,6 +864,7 @@ pub const Canvas = struct {
         }
     }
     pub fn fillRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) void {
+        if (self.gl) |g| return g.vtable.fillRoundedRect(g.ptr, x, y, w, h, radius, color, self.clip);
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
@@ -870,6 +899,7 @@ pub const Canvas = struct {
     /// canvas [`Format`]). Same primitive as [`fillRoundedRect`] but takes a [`Corners`]
     /// — for tabs, sheet headers and any panel that rounds only some corners.
     pub fn fillRoundedRectPerCorner(self: *Canvas, x: f32, y: f32, w: f32, h: f32, corners: Corners, color: Color) void {
+        if (self.gl) |g| return g.vtable.fillRoundedRectPerCorner(g.ptr, x, y, w, h, corners, color, self.clip);
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
@@ -902,6 +932,7 @@ pub const Canvas = struct {
     /// top-sheen (macOS) or a tonal accent (the signature theme). Pass equal colors for a
     /// flat fill (a no-op gradient).
     pub fn fillRoundedRectVGradient(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, top: Color, bottom: Color) void {
+        if (self.gl) |g| return g.vtable.fillRoundedRectVGradient(g.ptr, x, y, w, h, radius, top, bottom, self.clip);
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
@@ -1062,6 +1093,7 @@ pub const Canvas = struct {
     /// `width`, anti-aliased and source-over composited. The building block for the
     /// procedural window-control glyphs (✕, –). Honors the canvas [`Format`].
     pub fn strokeSegment(self: *Canvas, ax: f32, ay: f32, bx: f32, by: f32, width: f32, color: Color) void {
+        if (self.gl) |g| return g.vtable.strokeSegment(g.ptr, ax, ay, bx, by, width, color, self.clip);
         const r = width / 2.0;
         const minx = @min(ax, bx) - r - 1.0;
         const miny = @min(ay, by) - r - 1.0;
@@ -1090,6 +1122,7 @@ pub const Canvas = struct {
     /// stays hollow. The maximize ▢ and the restore double-square are drawn with this.
     /// Honors the canvas [`Format`].
     pub fn strokeRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: Color) void {
+        if (self.gl) |g| return g.vtable.strokeRoundedRect(g.ptr, x, y, w, h, radius, stroke, color, self.clip);
         const hs = stroke / 2.0;
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - hs - 1)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(y - hs - 1)));
@@ -1115,6 +1148,7 @@ pub const Canvas = struct {
     /// over the premultiplied pixels (source-over). Use `font.ascent` to convert
     /// a top edge into a baseline if needed.
     pub fn drawText(self: *Canvas, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts) void {
+        if (self.gl) |g| return g.vtable.drawText(g.ptr, font, x, baseline_y, s, opts, self.clip);
         var pen_x: f32 = @floatFromInt(x);
         var prev_cp: ?u32 = null;
         var i: usize = 0;
