@@ -37,8 +37,11 @@
 
 // One quantum hint (frames) — asks the graph for a small buffer so latency stays low. The
 // ring holds a few of these so jitter doesn't underrun before the app refills.
+// RING_QUANTA governs the app-side output buffer (≈ QUANTUM×RING_QUANTA/rate): backpressure
+// keeps it near-full, so it IS the steady-state output latency. 4 quanta ≈ 21 ms — bassa
+// latenza per il player/oscilloscopio; alzarlo se un sistema lento produce crackle/underrun.
 #define ZICRO_PW_QUANTUM 256
-#define ZICRO_PW_RING_QUANTA 8
+#define ZICRO_PW_RING_QUANTA 4
 
 struct zicro_pw {
     struct pw_thread_loop *loop;
