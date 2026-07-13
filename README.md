@@ -163,3 +163,18 @@ orchestrates external Demucs/basic-pitch subprocesses).
 ---
 
 <sub>Ported from Rust 🦀 to Zig ⚡ — same skeleton, explicit memory.</sub>
+
+---
+
+## License
+
+`zicro` is **dual-licensed** — pick the one that fits you:
+
+- **Open source** · GNU **AGPL v3.0** (see [`LICENSE`](LICENSE)). Free to use, study and
+  modify, but derivative works — **including services offered over a network** — must also be
+  released under the AGPLv3 with complete source available.
+- **Commercial** · for use in a **proprietary / closed-source** product, without the AGPL
+  copyleft, buy a commercial license from the author. See [`LICENSING.md`](LICENSING.md) —
+  contact **Francesco Magazzù** <magazzu.francesco@gmail.com>.
+
+© 2026 Francesco Magazzù.

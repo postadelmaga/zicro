@@ -107,12 +107,12 @@ const WaveOut = struct {
     extern "winmm" fn waveOutClose(hwo: HWAVEOUT) callconv(.winapi) u32;
     extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
-    const NBUF = 8; // pool di WAVEHDR: profondità di coda ~ NBUF × dimensione blocco
+    const NBUF = 8; // WAVEHDR pool: queue depth ~ NBUF × block size
 
     hwo: HWAVEOUT,
     channels: u16,
     hdrs: [NBUF]WAVEHDR,
-    bufs: [NBUF][]u8, // buffer per header (cresce per il blocco più grande visto)
+    bufs: [NBUF][]u8, // buffer per header (grows to the largest block seen)
     next: usize,
     gpa: std.mem.Allocator,
 
@@ -145,30 +145,30 @@ const WaveOut = struct {
         return self;
     }
 
-    /// Copia i sample nel prossimo header libero (attendendone uno se tutti in coda),
-    /// (ri)preparandolo e sottomettendolo. Scrittura bloccante = backpressure.
+    /// Copies the samples into the next free header (waiting for one if all are queued),
+    /// (re)preparing and submitting it. Blocking write = backpressure.
     fn write(self: *WaveOut, samples: []const f32) void {
         const bytes = std.mem.sliceAsBytes(samples);
         const h = &self.hdrs[self.next];
-        // Attendi che questo header sia stato consumato dall'hardware, ma con un
-        // tetto (~2s): se il device non drena (es. Wine senza audio) NON bloccare
-        // all'infinito — droppa il blocco, così il thread resta reattivo (stop/join).
+        // Wait until this header has been consumed by the hardware, but with a
+        // cap (~2s): if the device doesn't drain (e.g. Wine without audio) do NOT block
+        // forever — drop the block, so the thread stays responsive (stop/join).
         var spins: u32 = 0;
         while ((h.dwFlags & WHDR_DONE) == 0) : (spins += 1) {
             if (spins > 2000) return;
             Sleep(1);
         }
         if ((h.dwFlags & WHDR_PREPARED) != 0) _ = waveOutUnprepareHeader(self.hwo, h, @sizeOf(WAVEHDR));
-        // Assicura il buffer capiente e copiaci dentro i sample.
+        // Ensure the buffer is large enough and copy the samples into it.
         if (self.bufs[self.next].len < bytes.len) {
             if (self.bufs[self.next].len > 0) self.gpa.free(self.bufs[self.next]);
-            self.bufs[self.next] = &.{}; // mai lasciare lo slot puntare a memoria liberata
+            self.bufs[self.next] = &.{}; // never leave the slot pointing at freed memory
             self.bufs[self.next] = self.gpa.alloc(u8, bytes.len) catch return;
         }
         @memcpy(self.bufs[self.next][0..bytes.len], bytes);
         h.* = .{ .lpData = self.bufs[self.next].ptr, .dwBufferLength = @intCast(bytes.len) };
         if (waveOutPrepareHeader(self.hwo, h, @sizeOf(WAVEHDR)) != MMSYSERR_NOERROR) {
-            h.dwFlags = WHDR_DONE; // slot ancora libero: la prossima write non deve attendere il timeout
+            h.dwFlags = WHDR_DONE; // slot still free: the next write must not wait on the timeout
             return;
         }
         _ = waveOutWrite(self.hwo, h, @sizeOf(WAVEHDR));
@@ -176,7 +176,7 @@ const WaveOut = struct {
     }
 
     fn close(self: *WaveOut) void {
-        _ = waveOutReset(self.hwo); // marca tutti gli header come DONE
+        _ = waveOutReset(self.hwo); // marks all headers as DONE
         for (0..NBUF) |i| {
             if ((self.hdrs[i].dwFlags & WHDR_PREPARED) != 0)
                 _ = waveOutUnprepareHeader(self.hwo, &self.hdrs[i], @sizeOf(WAVEHDR));
@@ -207,7 +207,7 @@ const Alsa = struct {
     fn open(rate: u32, channels: u16) Error!Alsa {
         var pcm: *snd_pcm_t = undefined;
         if (snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) return Error.OpenFailed;
-        // soft_resample=1 (ALSA adatta se il device non regge il rate); ~100ms di latenza.
+        // soft_resample=1 (ALSA resamples if the device can't handle the rate); ~100ms of latency.
         if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels, rate, 1, 100_000) < 0) {
             _ = snd_pcm_close(pcm);
             return Error.OpenFailed;
@@ -222,7 +222,7 @@ const Alsa = struct {
         while (off < total_frames) {
             const n = snd_pcm_writei(self.pcm, samples.ptr + off * ch, @intCast(total_frames - off));
             if (n < 0) {
-                // Underrun/errore: prova a recuperare e ritenta lo stesso chunk.
+                // Underrun/error: try to recover and retry the same chunk.
                 if (snd_pcm_recover(self.pcm, @intCast(n), 1) < 0) return;
                 continue;
             }
@@ -237,8 +237,8 @@ const Alsa = struct {
 };
 
 test "device out compiles and plays into the null/real backend without error" {
-    // Su CI headless il device reale può non aprirsi: tolleriamo OpenFailed, ci interessa
-    // che l'API compili e che play() su un device aperto non crashi.
+    // On headless CI the real device may fail to open: we tolerate OpenFailed, what matters
+    // is that the API compiles and that play() on an open device doesn't crash.
     var dev = DeviceOut.open(48_000, 2) catch return;
     defer dev.close();
     var block = try AudioBlock.init(std.testing.allocator, 48_000, 2, &(.{0.0} ** 512));

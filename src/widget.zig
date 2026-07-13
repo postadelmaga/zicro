@@ -143,56 +143,56 @@ pub const Theme = struct {
     focus_ring: Color,
     danger: Color,
     dim_overlay: Color,
-    /// Riempimento di pomelli/thumb (slider/toggle/scrollbar): alto contrasto in entrambi i modi.
+    /// Fill of knobs/thumbs (slider/toggle/scrollbar): high contrast in both modes.
     knob: Color,
 
-    // --- stile superfici: elevazione + sheen + gradiente accento. -------------------------
-    // I default sono NO-OP: `dark()`/`light()` restano piatti byte-per-byte come prima; solo i
-    // preset di emulazione (`macos`/`material`/`signature`) li accendono. È qui che i widget
-    // guadagnano profondità (ombra), luce (gradiente verticale) e brillantezza (accento sfumato).
-    /// Colore dell'ombra di elevazione (alpha = opacità di picco). a=0 → nessuna ombra.
+    // --- surface style: elevation + sheen + accent gradient. -------------------------
+    // The defaults are NO-OP: `dark()`/`light()` stay flat byte-for-byte as before; only the
+    // emulation presets (`macos`/`material`/`signature`) turn them on. This is where the widgets
+    // gain depth (shadow), light (vertical gradient), and shine (blended accent).
+    /// Color of the elevation shadow (alpha = peak opacity). a=0 → no shadow.
     shadow_color: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-    /// Ampiezza della penombra dell'ombra, in px logici. 0 → nessuna ombra.
+    /// Width of the shadow's penumbra, in logical px. 0 → no shadow.
     shadow_blur: f32 = 0,
-    /// Offset verticale dell'ombra (luce dall'alto), in px logici.
+    /// Vertical offset of the shadow (light from above), in logical px.
     shadow_y: f32 = 0,
-    /// Sheen verticale sui riempimenti dei widget: 0 = piatto; >0 schiarisce il bordo alto,
-    /// scurendo appena il basso (vetro/rilievo). Tipico 0.05–0.10.
+    /// Vertical sheen on widget fills: 0 = flat; >0 lightens the top edge,
+    /// slightly darkening the bottom (glass/relief). Typically 0.05–0.10.
     surface_sheen: f32 = 0,
-    /// Colore finale del gradiente per i riempimenti accento/primary; null = accento piatto.
+    /// Final gradient color for accent/primary fills; null = flat accent.
     accent2: ?Color = null,
 
-    // --- geometria: token in px LOGICI @ scale 1; `scaled(f)` li porta a pixel nativi. ---
-    // Tutte le misure dei widget derivano da qui o da `s(px)` → scalabilità 1:1 su HiDPI.
-    /// Fattore display corrente (impostato da `scaled`). `s(px) = px * scale`.
+    // --- geometry: tokens in LOGICAL px @ scale 1; `scaled(f)` brings them to native pixels. ---
+    // Every widget measurement derives from here or from `s(px)` → 1:1 scalability on HiDPI.
+    /// Current display factor (set by `scaled`). `s(px) = px * scale`.
     scale: f32 = 1,
     window_pad: f32 = 14,
     gap: f32 = 8,
     pad_x: f32 = 12,
     radius: f32 = 7,
-    /// Altezza standard di un controllo (target ergonomico; 30 desktop denso, scala su touch).
+    /// Standard height of a control (ergonomic target; 30 for dense desktop, scales up on touch).
     ctl_h: f32 = 30,
     check_size: f32 = 18,
-    /// Spessore di riferimento per bordi/segni (check, spunte).
+    /// Reference thickness for borders/marks (check, ticks).
     stroke: f32 = 1.5,
     caret_w: f32 = 1.5,
-    /// Diametro del pomello di slider/toggle.
+    /// Diameter of the slider/toggle knob.
     knob_d: f32 = 16,
     toggle_w: f32 = 42,
     toggle_h: f32 = 24,
-    /// Spessore della traccia di progress/slider.
+    /// Thickness of the progress/slider track.
     bar_h: f32 = 8,
     scrollbar_w: f32 = 6,
     scrollbar_thumb_min: f32 = 28,
     dialog_title_h: f32 = 44,
-    /// Dimensione dei glifi/chevron disegnati a mano.
+    /// Size of the hand-drawn glyphs/chevrons.
     icon: f32 = 16,
     tooltip_pad: f32 = 8,
     font_size: u16 = 15,
     font_small: u16 = 13,
     font_heading: u16 = 19,
 
-    /// Scala una misura in px logici al fattore display corrente (per i letterali residui).
+    /// Scales a measurement in logical px to the current display factor (for residual literals).
     pub fn s(t: Theme, px: f32) f32 {
         return px * t.scale;
     }
@@ -269,13 +269,13 @@ pub const Theme = struct {
         };
     }
 
-    // ── preset di emulazione ────────────────────────────────────────────────────────────────
-    // Token *neutri*: gli stessi widget si vestono da macOS, da Material 3, o dal look di casa
-    // `signature` (che vuole battere entrambi). L'app sceglie con una riga: `Theme.signature()`.
-    // Ognuno parte da `dark()`/`light()` e sovrascrive colori accento, raggi e stile superfici.
+    // ── emulation presets ────────────────────────────────────────────────────────────────
+    // *Neutral* tokens: the same widgets dress up as macOS, as Material 3, or as the in-house
+    // `signature` look (which aims to beat both). The app chooses with one line: `Theme.signature()`.
+    // Each starts from `dark()`/`light()` and overrides accent colors, radii, and surface style.
 
-    /// Preset: **macOS / SF** (dark). Blu di sistema, angoli stretti, ombra bassa e discreta,
-    /// leggerissimo sheen. Sobrio e nitido.
+    /// Preset: **macOS / SF** (dark). System blue, tight corners, low and discreet shadow,
+    /// very light sheen. Sober and crisp.
     pub fn macos() Theme {
         var t = dark();
         t.accent = Color.rgba(10, 132, 255, 0.98);
@@ -304,15 +304,15 @@ pub const Theme = struct {
         return t;
     }
 
-    /// Preset: **Material Design 3** (dark). Superfici tonali senza bordo, angoli ampi,
-    /// accento viola con testo scuro, elevazione (ombra) marcata. Nessuno sheen: tinte piatte.
+    /// Preset: **Material Design 3** (dark). Tonal surfaces with no border, wide corners,
+    /// purple accent with dark text, pronounced elevation (shadow). No sheen: flat tints.
     pub fn material() Theme {
         var t = dark();
         t.accent = Color.rgba(208, 188, 255, 0.98); // M3 primary (dark)
         t.accent_text = Color.rgba(56, 30, 114, 0.98); // on-primary
         t.focus_ring = Color.rgba(208, 188, 255, 0.85);
-        t.bg_card = Color.rgba(208, 188, 255, 0.06); // surface tonale
-        t.border = Color.rgba(255, 255, 255, 0.0); // niente bordi: superfici piene
+        t.bg_card = Color.rgba(208, 188, 255, 0.06); // tonal surface
+        t.border = Color.rgba(255, 255, 255, 0.0); // no borders: solid surfaces
         t.radius = 16;
         t.surface_sheen = 0;
         t.shadow_color = Color.rgba(0, 0, 0, 0.32);
@@ -336,10 +336,10 @@ pub const Theme = struct {
         return t;
     }
 
-    /// Preset: **signature** (dark) — il look di casa. Accento sfumato blu→viola, sheen vetroso,
-    /// elevazione morbida con alone d'accento sul focus, angoli medi. La proposta "meglio di
-    /// macOS e Material": profondità *e* brillantezza, senza il piattume dell'uno né il peso
-    /// dell'altro.
+    /// Preset: **signature** (dark) — the in-house look. Blue→purple blended accent, glassy sheen,
+    /// soft elevation with an accent halo on focus, medium corners. The "better than
+    /// macOS and Material" proposition: depth *and* shine, without the flatness of the one nor the weight
+    /// of the other.
     pub fn signature() Theme {
         var t = dark();
         t.accent = Color.rgba(120, 170, 255, 0.98);
@@ -387,7 +387,7 @@ pub const OsClipboard = struct {
     get: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 = null,
 };
 
-/// Valore d'animazione retained con stamp di generazione (per il pruning delle entry stale).
+/// Retained animation value with a generation stamp (for pruning stale entries).
 const AnimEntry = struct { v: f32, gen: u64 };
 
 /// Everything that must survive between frames. One per UI surface (window/panel).
@@ -463,10 +463,10 @@ pub const Store = struct {
     /// spinners/bars (stays small, unlike epoch ms, so f32 keeps precision).
     phase_s: f32 = 0,
 
-    /// Valore d'animazione + generazione dell'ultimo frame in cui è stato toccato (per il GC).
+    /// Animation value + the generation of the last frame it was touched (for the GC).
     anims: std.AutoHashMapUnmanaged(Id, AnimEntry) = .empty,
     scrolls: std.AutoHashMapUnmanaged(Id, f32) = .empty,
-    /// Contatore di frame monotono; le entry `anims` con `gen` diverso vengono potate in `end()`.
+    /// Monotonic frame counter; `anims` entries with a different `gen` are pruned in `end()`.
     frame_gen: u64 = 0,
 
     last_now_ms: i64 = 0,
@@ -567,7 +567,7 @@ pub const Ui = struct {
             std.math.clamp(@as(f32, @floatFromInt(now_ms - store.last_now_ms)) / 1000.0, 0.0, 0.1);
         store.last_now_ms = now_ms;
         store.phase_s += dt;
-        store.frame_gen +%= 1; // stamp del frame per il GC delle animazioni
+        store.frame_gen +%= 1; // frame stamp for the animation GC
 
         // Reset frame-scoped input, aggregate the event slice.
         store.mouse_dx = 0;
@@ -804,8 +804,8 @@ pub const Ui = struct {
         if (ui.store.left_pressed and ui.store.active == 0) ui.store.active = ground_id;
         if (ui.store.left_released) ui.store.active = 0;
 
-        // GC: pota le animazioni non toccate in questo frame (id transitori di liste dinamiche non
-        // gonfiano più la mappa). Fino a 64 rimozioni/frame → convergenza graduale, costo O(vive).
+        // GC: prune animations not touched this frame (transient ids from dynamic lists no
+        // longer bloat the map). Up to 64 removals/frame → gradual convergence, cost O(live).
         {
             var stale: [64]Id = undefined;
             var n: usize = 0;
@@ -1025,7 +1025,7 @@ pub const Ui = struct {
         const s = ui.store;
         const old = if (s.anims.get(id)) |e| e.v else 0;
         const new = anim.approach(old, hovered, ui.dt);
-        // Stampa sempre (anche se invariato) così l'entry resta "viva" e non viene potata.
+        // Always stamp (even if unchanged) so the entry stays "alive" and is not pruned.
         s.anims.put(s.gpa, id, .{ .v = new, .gen = s.frame_gen }) catch return new;
         if (new != old) ui.animating = true;
         return new;
@@ -1036,8 +1036,8 @@ pub const Ui = struct {
     const lerpColor = Color.lerp;
     const shade = Color.shade;
 
-    /// Riempie la superficie di un widget onorando lo sheen del tema: gradiente verticale
-    /// (chiaro→cupo) quando `surface_sheen != 0`, altrimenti fill piatto identico a prima.
+    /// Fills a widget's surface honoring the theme's sheen: vertical gradient
+    /// (light→dark) when `surface_sheen != 0`, otherwise a flat fill identical to before.
     fn surfaceFill(ui: *Ui, r: Rect, radius: f32, base: Color) void {
         const sh = ui.theme.surface_sheen;
         if (sh == 0) {
@@ -1047,12 +1047,12 @@ pub const Ui = struct {
         ui.canvas.fillRoundedRectVGradient(r.x, r.y, r.w, r.h, radius, shade(base, sh), shade(base, -sh * 0.6));
     }
 
-    /// Proietta l'ombra di elevazione del tema sotto `r` (no-op quando l'ombra è disattiva).
-    /// Va chiamata *prima* del riempimento, così la superficie copre il nucleo dell'ombra.
+    /// Casts the theme's elevation shadow under `r` (no-op when the shadow is disabled).
+    /// Must be called *before* the fill, so the surface covers the core of the shadow.
     fn elevate(ui: *Ui, r: Rect, radius: f32) void {
         const s = ui.theme.shadow_color;
         if (s.a <= 0 or ui.theme.shadow_blur <= 0) return;
-        // shadow_blur/shadow_y sono già in px nativi (scalati da `scaled`): niente doppio scaling.
+        // shadow_blur/shadow_y are already in native px (scaled by `scaled`): no double scaling.
         ui.canvas.dropShadowRoundedRect(r.x, r.y, r.w, r.h, radius, ui.theme.shadow_blur, ui.theme.shadow_y, s);
     }
 
@@ -1164,9 +1164,9 @@ pub const Ui = struct {
         var bg = if (primary) t.accent else lerpColor(t.bg_widget, t.bg_widget_hot, ht);
         if (sig.held) bg = if (primary) lerpColor(t.accent, t.bg_widget_active, 0.3) else t.bg_widget_active;
         if (primary and !sig.held) bg = lerpColor(bg, Color.rgba(255, 255, 255, bg.a), 0.12 * ht);
-        // I pulsanti primary sono superfici *rialzate*: ombra sotto, e — se il tema definisce
-        // `accent2` — l'accento sfuma in verticale (blu→viola nel tema signature). I secondari
-        // restano a filo, ma guadagnano lo sheen del tema tramite `surfaceFill`.
+        // Primary buttons are *raised* surfaces: shadow underneath, and — if the theme defines
+        // `accent2` — the accent fades vertically (blue→purple in the signature theme). Secondary ones
+        // stay flush, but gain the theme's sheen via `surfaceFill`.
         if (primary) ui.elevate(r, t.radius);
         if (primary and t.accent2 != null and !sig.held) {
             ui.canvas.fillRoundedRectVGradient(r.x, r.y, r.w, r.h, t.radius, bg, t.accent2.?);
@@ -1251,11 +1251,11 @@ pub const Ui = struct {
         ui.canvas.fillRoundedRect(r.x, py, pill_w, pill_h, pill_h / 2, bg);
         ui.canvas.strokeRoundedRect(r.x, py, pill_w, pill_h, pill_h / 2, t.s(1), t.border);
         ui.focusRing(id, .{ .x = r.x, .y = py, .w = pill_w, .h = pill_h }, pill_h / 2);
-        const m = (pill_h - t.knob_d) / 2; // margine ergonomico del pomello dentro la pill
+        const m = (pill_h - t.knob_d) / 2; // ergonomic margin of the knob inside the pill
         const kx = r.x + m + anim.cubicOut(on_t) * (pill_w - t.knob_d - 2 * m);
-        ui.elevate(.{ .x = kx, .y = py + m, .w = t.knob_d, .h = t.knob_d }, t.knob_d / 2); // il pomello galleggia
+        ui.elevate(.{ .x = kx, .y = py + m, .w = t.knob_d, .h = t.knob_d }, t.knob_d / 2); // the knob floats
         ui.canvas.fillRoundedRect(kx, py + m, t.knob_d, t.knob_d, t.knob_d / 2, t.knob);
-        ui.canvas.strokeRoundedRect(kx, py + m, t.knob_d, t.knob_d, t.knob_d / 2, t.s(1), t.border); // definizione in light mode
+        ui.canvas.strokeRoundedRect(kx, py + m, t.knob_d, t.knob_d, t.knob_d / 2, t.s(1), t.border); // definition in light mode
         var lr = r;
         lr.x += pill_w + t.gap;
         lr.w -= pill_w + t.gap;
@@ -1371,10 +1371,10 @@ pub const Ui = struct {
         const ty = r.y + r.h / 2 - bh / 2;
         ui.canvas.fillRoundedRect(track.x, ty, track.w, bh, bh / 2, t.bg_widget);
         ui.canvas.fillRoundedRect(track.x, ty, track.w * vt, bh, bh / 2, t.accent);
-        const knob: f32 = t.knob_d + t.s(2) * ht; // cresce leggermente all'hover/drag
+        const knob: f32 = t.knob_d + t.s(2) * ht; // grows slightly on hover/drag
         const kx = track.x + track.w * vt - knob / 2;
         const ky = r.y + (r.h - knob) / 2;
-        ui.elevate(.{ .x = kx, .y = ky, .w = knob, .h = knob }, knob / 2); // il pomello galleggia
+        ui.elevate(.{ .x = kx, .y = ky, .w = knob, .h = knob }, knob / 2); // the knob floats
         ui.canvas.fillRoundedRect(kx, ky, knob, knob, knob / 2, t.knob);
         ui.canvas.strokeRoundedRect(kx, ky, knob, knob, knob / 2, t.s(1), t.border);
         ui.focusRing(id, .{ .x = kx, .y = ky, .w = knob, .h = knob }, knob / 2);
@@ -1387,7 +1387,7 @@ pub const Ui = struct {
         ui.pushIdScope(label_);
         defer ui.popIdScope();
 
-        const val_w = t.s(64); // larghezza colonna valore
+        const val_w = t.s(64); // value column width
         const r = ui.allocRect(ui.availW(), t.ctl_h);
         var lr = r;
         lr.w = r.w - (2 * t.ctl_h + val_w + 2 * ui.theme.gap);
@@ -2105,7 +2105,7 @@ pub const Ui = struct {
                 changed = true;
             }
             const ht = ui.hoverT(id, sig.hovered);
-            const in = t.s(2); // inset del segmento attivo/hover
+            const in = t.s(2); // inset of the active/hover segment
             if (i == active.*) {
                 if (t.accent2) |a2| {
                     ui.canvas.fillRoundedRectVGradient(tr.x + in, tr.y + in, tr.w - 2 * in, tr.h - 2 * in, t.radius - in, t.accent, a2);
@@ -2208,7 +2208,7 @@ pub const Ui = struct {
         const c = ui.cur();
         const r = Rect{ .x = c.x, .y = c.y, .w = ui.availW(), .h = h };
         const card_radius = t.radius + t.s(2);
-        ui.elevate(r, card_radius); // una card è una superficie rialzata
+        ui.elevate(r, card_radius); // a card is a raised surface
         ui.surfaceFill(r, card_radius, t.bg_card);
         ui.canvas.strokeRoundedRect(r.x, r.y, r.w, r.h, card_radius, t.s(1), t.border);
         std.debug.assert(ui.depth < ui.cursors.len);
@@ -2793,7 +2793,7 @@ test "textField: shift-selection, clipboard copy/paste, replace-typing" {
     try testing.expectEqualStrings("q", buf.items);
 }
 
-test "textField: Tab traversal tra i campi, con wrap e Shift+Tab" {
+test "textField: Tab traversal between fields, with wrap and Shift+Tab" {
     const gpa = testing.allocator;
     var h = try Harness.init(gpa);
     defer h.deinit(gpa);
@@ -2849,7 +2849,7 @@ test "textField: Tab traversal tra i campi, con wrap e Shift+Tab" {
     try testing.expectEqual(ids[0], h.store.focus);
 }
 
-test "keyboard: Tab raggiunge un bottone, Enter lo attiva, click toglie il focus" {
+test "keyboard: Tab reaches a button, Enter activates it, click clears focus" {
     const gpa = testing.allocator;
     var h = try Harness.init(gpa);
     defer h.deinit(gpa);
@@ -2873,7 +2873,7 @@ test "keyboard: Tab raggiunge un bottone, Enter lo attiva, click toglie il focus
     try testing.expectEqual(@as(Id, 0), h.store.focus);
 }
 
-test "textArea: Enter = newline, frecce verticali e Home/End per riga" {
+test "textArea: Enter = newline, vertical arrows and Home/End per line" {
     const gpa = testing.allocator;
     var h = try Harness.init(gpa);
     defer h.deinit(gpa);

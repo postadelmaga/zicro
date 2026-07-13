@@ -59,7 +59,7 @@ const AppState = struct {
         var text_field_buf: std.ArrayList(u8) = .empty;
         try text_field_buf.appendSlice(gpa, "Zicro input");
         var text_area_buf: std.ArrayList(u8) = .empty;
-        try text_area_buf.appendSlice(gpa, "Questo è un editor di testo multi-riga.\nPuoi premere Invio per andare a capo e usare la tastiera.");
+        try text_area_buf.appendSlice(gpa, "This is a multi-line text editor.\nPress Enter for a new line and use the keyboard.");
 
         return AppState{
             .gpa = gpa,
@@ -120,7 +120,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     ui.beginRow();
     ui.heading("Zicro Widget Demo");
     ui.gap(ui.availW() - 300); // Push controls to the right
-    ui.labelDim("Tema →");
+    ui.labelDim("Theme →");
     if (ui.buttonPrimary(preset.name)) state.theme_idx +%= 1; // click to cycle presets
     ui.endRow();
     ui.endCard();
@@ -128,7 +128,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     ui.gap(10);
 
     // Tab bar to switch categories
-    const tab_labels = &[_][]const u8{ "Widget Base", "Input Avanzati", "Indicatori & Dialoghi", "Area Scorrimento" };
+    const tab_labels = &[_][]const u8{ "Basic Widgets", "Advanced Inputs", "Indicators & Dialogs", "Scroll Area" };
     _ = ui.tabBar("main_tabs", tab_labels, &state.active_tab);
 
     ui.gap(15);
@@ -137,27 +137,27 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     switch (state.active_tab) {
         0 => { // Basic Widgets
             ui.beginCard(320);
-            ui.heading("Pulsanti e Selezioni");
+            ui.heading("Buttons and Selections");
             ui.separator();
             ui.gap(5);
 
             ui.beginRow();
-            if (ui.button("Pulsante Semplice")) {
+            if (ui.button("Simple Button")) {
                 state.button_clicks += 1;
             }
-            if (ui.buttonPrimary("Pulsante Primario")) {
+            if (ui.buttonPrimary("Primary Button")) {
                 state.primary_clicks += 1;
             }
             ui.endRow();
 
             ui.gap(5);
             ui.beginRow();
-            ui.label("Click pulsante semplice:");
+            ui.label("Simple button clicks:");
             var clicks_buf: [32]u8 = undefined;
             const clicks_str = std.fmt.bufPrint(&clicks_buf, "{d}", .{state.button_clicks}) catch "0";
             ui.labelDim(clicks_str);
             ui.gap(20);
-            ui.label("Click pulsante primario:");
+            ui.label("Primary button clicks:");
             var pclicks_buf: [32]u8 = undefined;
             const pclicks_str = std.fmt.bufPrint(&pclicks_buf, "{d}", .{state.primary_clicks}) catch "0";
             ui.labelDim(pclicks_str);
@@ -165,50 +165,50 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
 
             ui.separator();
             ui.gap(5);
-            ui.heading("Checkbox, Toggle e Radio");
+            ui.heading("Checkbox, Toggle and Radio");
 
             ui.beginRow();
-            _ = ui.checkbox("Abilita funzionalità", &state.checkbox_val);
-            _ = ui.toggle("Attiva opzione", &state.toggle_val);
+            _ = ui.checkbox("Enable feature", &state.checkbox_val);
+            _ = ui.toggle("Activate option", &state.toggle_val);
             ui.endRow();
 
             ui.gap(5);
             ui.beginRow();
-            ui.label("Selezione singola (Radio):");
-            _ = ui.radio("Opzione A", &state.radio_val, 0);
-            _ = ui.radio("Opzione B", &state.radio_val, 1);
-            _ = ui.radio("Opzione C", &state.radio_val, 2);
+            ui.label("Single selection (Radio):");
+            _ = ui.radio("Option A", &state.radio_val, 0);
+            _ = ui.radio("Option B", &state.radio_val, 1);
+            _ = ui.radio("Option C", &state.radio_val, 2);
             ui.endRow();
 
             ui.endCard();
         },
         1 => { // Advanced Inputs
             ui.beginCard(320);
-            ui.heading("Controlli Avanzati");
+            ui.heading("Advanced Controls");
             ui.separator();
             ui.gap(5);
 
             ui.beginRow();
-            _ = ui.stepper("Contatore Intero", &state.stepper_val, 0, 100);
-            _ = ui.slider("Regolazione", &state.slider_val, 0.0, 1.0);
+            _ = ui.stepper("Integer Counter", &state.stepper_val, 0, 100);
+            _ = ui.slider("Adjustment", &state.slider_val, 0.0, 1.0);
             ui.endRow();
 
             ui.gap(10);
-            ui.label("Campi di Testo (Fuoco con click, Tab per scorrere, Esc per uscire)");
-            
+            ui.label("Text Fields (Click to focus, Tab to cycle, Esc to exit)");
+
             ui.beginRow();
-            ui.label("Nome:");
+            ui.label("Name:");
             _ = ui.textField("name_field", &state.text_field_buf);
             ui.endRow();
 
             ui.gap(10);
-            ui.label("Note / Descrizione:");
+            ui.label("Notes / Description:");
             _ = ui.textArea("notes_field", &state.text_area_buf, 90);
 
             ui.gap(10);
             ui.beginRow();
-            ui.label("Menu a tendina:");
-            const dropdown_options = &[_][]const u8{ "Opzione 1", "Opzione 2", "Opzione 3", "Opzione 4" };
+            ui.label("Dropdown menu:");
+            const dropdown_options = &[_][]const u8{ "Option 1", "Option 2", "Option 3", "Option 4" };
             _ = ui.dropdown("opts_dropdown", dropdown_options, &state.dropdown_val);
             ui.endRow();
 
@@ -216,37 +216,37 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
         },
         2 => { // Indicators & Dialogs
             ui.beginCard(320);
-            ui.heading("Stato e Modali");
+            ui.heading("Status and Modals");
             ui.separator();
             ui.gap(10);
 
-            ui.label("Avanzamento Operazione (Determinato ed Indeterminato)");
+            ui.label("Operation Progress (Determinate and Indeterminate)");
             ui.progressBar(state.progress_val);
             ui.gap(10);
             ui.progressIndeterminate();
 
             ui.gap(10);
             ui.beginRow();
-            ui.label("Spinner animato:");
+            ui.label("Animated spinner:");
             ui.spinner();
             ui.gap(40);
-            if (ui.buttonPrimary("Apri Dialogo Modale")) {
+            if (ui.buttonPrimary("Open Modal Dialog")) {
                 ui.openDialog("demo_dialog");
             }
             ui.endRow();
             
             ui.gap(20);
-            ui.label("Passa con il mouse sopra il pulsante sotto per visualizzare un tooltip:");
-            if (ui.button("Pulsante con Tooltip")) {
-                // Azione inutile, serve solo a mostrare il tooltip
+            ui.label("Hover the mouse over the button below to show a tooltip:");
+            if (ui.button("Button with Tooltip")) {
+                // Useless action, just there to show the tooltip
             }
-            ui.tooltip("Questo è un tooltip interattivo generato da Zicro!");
+            ui.tooltip("This is an interactive tooltip generated by Zicro!");
 
             ui.endCard();
         },
         3 => { // Scrolling
             ui.beginCard(320);
-            ui.heading("Contenuto con Scorrimento");
+            ui.heading("Scrollable Content");
             ui.separator();
             ui.gap(5);
 
@@ -257,7 +257,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
                 ui.pushIdScopeIndex(i);
                 
                 var item_buf: [64]u8 = undefined;
-                const item_str = std.fmt.bufPrint(&item_buf, "Elemento della lista {d} (Click per selezionare)", .{i}) catch "Elemento";
+                const item_str = std.fmt.bufPrint(&item_buf, "List item {d} (Click to select)", .{i}) catch "Item";
                 
                 const sel_idx = i % 3;
                 if (ui.selectable(item_str, state.selectable_vals[sel_idx])) {
@@ -275,27 +275,27 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
 
     // --- Modal dialog drawing ---
     // If the modal dialog is open, it will overlay and dim the application background.
-    if (ui.beginDialog("demo_dialog", "Conferma Operazione", 420, 260)) {
-        ui.label("Attenzione: Stai per eseguire un'azione simulata.");
-        ui.labelDim("I dialoghi modali bloccano l'input delle finestre sottostanti.");
+    if (ui.beginDialog("demo_dialog", "Confirm Operation", 420, 260)) {
+        ui.label("Warning: You are about to perform a simulated action.");
+        ui.labelDim("Modal dialogs block input to the windows underneath.");
         ui.gap(10);
         ui.separator();
         ui.gap(10);
 
-        ui.label("Valori correnti:");
+        ui.label("Current values:");
         var stat_buf: [128]u8 = undefined;
-        const stat_str = std.fmt.bufPrint(&stat_buf, "Regolazione: {d:0.2} | Contatore: {d}", .{ state.slider_val, state.stepper_val }) catch "Stato";
+        const stat_str = std.fmt.bufPrint(&stat_buf, "Adjustment: {d:0.2} | Counter: {d}", .{ state.slider_val, state.stepper_val }) catch "Status";
         ui.textLine(stat_str, theme.font_small, .regular, theme.text_dim);
 
         ui.gap(20);
-        ui.label("Vuoi procedere con la conferma?");
+        ui.label("Do you want to proceed with the confirmation?");
         ui.gap(20);
 
         ui.beginRow();
-        if (ui.buttonPrimary("Conferma")) {
+        if (ui.buttonPrimary("Confirm")) {
             ui.closeDialog();
         }
-        if (ui.button("Annulla")) {
+        if (ui.button("Cancel")) {
             ui.closeDialog();
         }
         ui.endRow();

@@ -99,22 +99,22 @@ pub fn main() !void {
             canvas.fillRoundedRectVGradient(band.x, band.y, band.w, band.h, 0, paint.Color.rgba(30, 24, 40, 1.0), paint.Color.rgba(16, 12, 22, 1.0));
             var ui = widget.Ui.begin(&store, &canvas, &font, widget.Theme.signature(), band, now, no_events);
             ui.openDialog("preview"); // force it open for the snapshot
-            if (ui.beginDialog("preview", "Conferma Operazione", 420, 260)) {
-                ui.label("Attenzione: Stai per eseguire un'azione simulata.");
-                ui.labelDim("I dialoghi modali bloccano l'input delle finestre sottostanti.");
+            if (ui.beginDialog("preview", "Confirm Operation", 420, 260)) {
+                ui.label("Warning: You are about to perform a simulated action.");
+                ui.labelDim("Modal dialogs block input to the windows underneath.");
                 ui.gap(10);
                 ui.separator();
                 ui.gap(10);
-                ui.label("Valori correnti:");
+                ui.label("Current values:");
                 var stat_buf: [128]u8 = undefined;
-                const stat_str = std.fmt.bufPrint(&stat_buf, "Regolazione: {d:0.2} | Contatore: {d}", .{ slider_v, stepper_v }) catch "Stato";
+                const stat_str = std.fmt.bufPrint(&stat_buf, "Adjustment: {d:0.2} | Counter: {d}", .{ slider_v, stepper_v }) catch "Status";
                 ui.labelDim(stat_str);
                 ui.gap(16);
-                ui.label("Vuoi procedere con la conferma?");
+                ui.label("Do you want to proceed with the confirmation?");
                 ui.gap(16);
                 ui.beginRow();
-                _ = ui.buttonPrimary("Conferma");
-                _ = ui.button("Annulla");
+                _ = ui.buttonPrimary("Confirm");
+                _ = ui.button("Cancel");
                 ui.endRow();
                 ui.endDialog();
             }

@@ -250,9 +250,9 @@ test "GpuFrameSink wraps presentGpu, forwards the frame, and reports fallback" {
     var be = Backend{};
     const sink = GpuFrameSink.of(Backend, &be);
 
-    // `fd_t` è c_int su Linux ma un HANDLE (*anyopaque) su Windows: fd fittizio
-    // per-OS così il test compila ovunque (i dmabuf sono comunque Linux-only e
-    // l'fd viene solo inoltrato al backend, mai dereferenziato).
+    // `fd_t` is c_int on Linux but a HANDLE (*anyopaque) on Windows: a dummy
+    // per-OS fd so the test compiles everywhere (dmabufs are Linux-only anyway and
+    // the fd is only forwarded to the backend, never dereferenced).
     const fake_fd: std.posix.fd_t = if (@import("builtin").os.tag == .windows) @ptrFromInt(7) else 7;
     const planes = [_]DmabufPlane{.{ .fd = fake_fd, .offset = 0, .stride = 4096 }};
     const frame = GpuFrame{

@@ -170,9 +170,9 @@ fn coverage(d: f32) f32 {
 /// sRGB (0..1) → linear light (0..1). Needed to blend glyph antialiasing in
 /// linear space (typographic rendering): blending coverage directly in sRGB
 /// thins and dirties text edges, especially on a dark background.
-/// Pub: le app con raster di testo propri (es. il layout documento di zuer)
-/// riusano ESATTAMENTE queste curve, così la resa tipografica è identica per
-/// costruzione ovunque.
+/// Pub: apps with their own text rasterizer (e.g. zuer's document layout)
+/// reuse EXACTLY these curves, so the typographic rendering is identical by
+/// construction everywhere.
 pub fn srgbToLinear(u: f32) f32 {
     return if (u <= 0.04045) u / 12.92 else std.math.pow(f32, (u + 0.055) / 1.055, 2.4);
 }
@@ -200,8 +200,8 @@ pub const smooth_coverage_lut: [256]f32 = blk: {
     break :blk t;
 };
 
-/// LUT sRGB byte (0..255) → luce lineare (0..1), per i loop di blending
-/// byte-oriented delle app (un load al posto di un `pow` per canale).
+/// LUT sRGB byte (0..255) → linear light (0..1), for apps' byte-oriented
+/// blending loops (a load instead of a `pow` per channel).
 pub const srgb_byte_to_linear: [256]f32 = blk: {
     @setEvalBranchQuota(20_000);
     var t: [256]f32 = undefined;
@@ -212,9 +212,9 @@ pub const srgb_byte_to_linear: [256]f32 = blk: {
     break :blk t;
 };
 
-/// LUT lineare (0..1) → sRGB byte, indicizzata con `round(x*4095)`. Con 4096
-/// campioni l'errore di quantizzazione resta entro ~mezzo LSB anche nel tratto
-/// più ripido della curva (quello lineare vicino allo zero).
+/// LUT linear (0..1) → sRGB byte, indexed by `round(x*4095)`. With 4096
+/// samples the quantization error stays within ~half an LSB even in the
+/// steepest part of the curve (the linear one near zero).
 pub const linear_to_srgb_byte: [4096]u8 = blk: {
     @setEvalBranchQuota(2_000_000);
     var t: [4096]u8 = undefined;
@@ -289,10 +289,10 @@ pub const Style = struct {
     border_alpha: f32 = 0.22,
     /// Progressive fade-out width of the glass color near the edges (0 to disable).
     glass_fade_width: f32 = 0,
-    /// Sheen metallico: gradiente verticale del vetro (schiarisce in alto, scurisce in basso).
-    /// 0 = piatto. ~0.3 = metallizzato/bagnato.
+    /// Metallic sheen: vertical gradient of the glass (lighter at top, darker at bottom).
+    /// 0 = flat. ~0.3 = metallic/wet.
     sheen: f32 = 0,
-    /// Highlight speculare vicino al bordo superiore (riflesso vetroso/bagnato). 0 = off.
+    /// Specular highlight near the top edge (glassy/wet reflection). 0 = off.
     specular: f32 = 0,
     /// Corner radius of the content frames.
     content_radius: f32 = 14,
@@ -338,8 +338,8 @@ pub const Style = struct {
         };
     }
 
-    /// Preset: Carbon Glass — vetro scuro metallizzato/bagnato, angoli arrotondati e fine
-    /// cornice vetrosa. Pensato per titlebar/chrome sopra il blur del compositor.
+    /// Preset: Carbon Glass — dark metallic/wet glass, rounded corners and a thin
+    /// glassy border. Meant for titlebar/chrome over the compositor blur.
     pub fn carbon() Style {
         return .{
             .corner_radius = 20,
@@ -525,7 +525,7 @@ pub const Canvas = struct {
             const fy = @as(f32, @floatFromInt(y)) + 0.5;
             const row = self.pixels[@as(usize, y) * self.width ..][0..self.width];
             const core_row = has_core and y >= cy0 and y < cy1;
-            // Core piatto (memset veloce): colore per-riga se il vetro ha un gradiente verticale.
+            // Flat core (fast memset): per-row color if the glass has a vertical gradient.
             const row_core_px = if (dynamic_core) blk: {
                 const gc = glassColorAt(style, g, m, ph, fy);
                 break :blk packPremul(gc[0] * ga_full, gc[1] * ga_full, gc[2] * ga_full, ga_full);
@@ -546,8 +546,8 @@ pub const Canvas = struct {
     /// One chrome pixel at sub-pixel `(fx,fy)`: drop shadow, rounded glass and the 1px
     /// highlight ring, composited back-to-front in premultiplied space. The hot inner body
     /// of `drawChrome`, kept separate so the flat-core fast path can skip it.
-    /// Colore del vetro (straight RGB) alla riga `fy`: applica sheen (gradiente verticale) e
-    /// speculare superiore. Base per lo shader del pannello e per il fill del core.
+    /// Glass color (straight RGB) at row `fy`: applies sheen (vertical gradient) and
+    /// top specular. Basis for the panel shader and the core fill.
     fn glassColorAt(style: Style, g: Color, m: f32, ph: f32, fy: f32) [3]f32 {
         const ty = std.math.clamp((fy - m) / @max(1.0, ph), 0.0, 1.0);
         const sheen_mul = 1.0 + style.sheen * (0.5 - ty);
@@ -640,8 +640,8 @@ pub const Canvas = struct {
         const flat_cy0 = dy_f + guard;
         const flat_cy1 = dy_f + sh_f - guard;
 
-        // Rispetta il clip attivo del canvas (usato dal present parziale di zrame:
-        // la regione damage limita quali pixel del frame vengono ricompositi).
+        // Respect the canvas's active clip (used by zrame's partial present:
+        // the damage region limits which pixels of the frame get recomposited).
         var sy_start: u32 = 0;
         var sy_end: u32 = src_h;
         var sx_start: u32 = 0;
@@ -810,9 +810,9 @@ pub const Canvas = struct {
 
     /// Fill a rounded rect with a straight-alpha color (source-over). For decorative
     /// content drawn by apps that don't push zicro frames.
-    /// Riempie un raccordo CONCAVO (flare stile Chrome-tab): un quadrato `size`×`size` a (x,y)
-    /// dove i pixel a distanza >= `size` dal centro (cx,cy) sono riempiti → arco concavo con AA.
-    /// Con cx,cy sull'angolo esterno-alto del quadrato ottieni l'ala che allarga la tab in basso.
+    /// Fill a CONCAVE fillet (Chrome-tab-style flare): a `size`×`size` square at (x,y)
+    /// where pixels at distance >= `size` from the center (cx,cy) are filled → concave arc with AA.
+    /// With cx,cy at the square's outer-top corner you get the wing that widens the tab at the bottom.
     pub fn fillConcaveCorner(self: *Canvas, x: f32, y: f32, size: f32, cx: f32, cy: f32, color: Color) void {
         const bx0: u32 = @intFromFloat(@max(0.0, @floor(x)));
         const by0: u32 = @intFromFloat(@max(0.0, @floor(y)));
@@ -841,14 +841,24 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
         const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        // Interior fast-path: beyond a margin (radius+0.5) from every edge the coverage is
+        // EXACTLY 1.0 (neither corner curve nor edge AA) → skip the SDF/@sqrt there. For
+        // large fills (backdrop, stage, panels) that's the vast majority of the pixels:
+        // per-pixel sqrt → plain blend. Identical output (cov=1 on both paths).
+        const m = radius + 0.5;
+        const iy0 = y + m;
+        const iy1 = y + h - m;
+        const ix0 = x + m;
+        const ix1 = x + w - m;
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            const interior_row = fy >= iy0 and fy <= iy1;
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const cov = coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
+                const cov = if (interior_row and fx >= ix0 and fx <= ix1) 1.0 else coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
                 if (cov <= 0.0) continue;
                 const sa = color.a * cov;
                 row[px] = self.overColor(row[px], color.r, color.g, color.b, sa);
@@ -865,14 +875,21 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
         const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        // Stesso fast-path interno di fillRoundedRect, con margine = max raggio d'angolo.
+        const m = @max(@max(corners.nw, corners.ne), @max(corners.se, corners.sw)) + 0.5;
+        const iy0 = y + m;
+        const iy1 = y + h - m;
+        const ix0 = x + m;
+        const ix1 = x + w - m;
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            const interior_row = fy >= iy0 and fy <= iy1;
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const cov = coverage(roundedRectSdfPerCorner(fx, fy, x, y, w, h, corners));
+                const cov = if (interior_row and fx >= ix0 and fx <= ix1) 1.0 else coverage(roundedRectSdfPerCorner(fx, fy, x, y, w, h, corners));
                 if (cov <= 0.0) continue;
                 row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * cov);
             }

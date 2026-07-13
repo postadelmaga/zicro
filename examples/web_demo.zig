@@ -117,15 +117,15 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     ui.beginRow();
     ui.heading("zicro · web");
     ui.gap(ui.theme.s(24));
-    ui.labelDim("Tema:");
+    ui.labelDim("Theme:");
     if (ui.buttonPrimary(preset.name)) s.theme_idx +%= 1;
     ui.gap(ui.theme.s(16));
-    ui.labelDim("(click per ciclare)");
+    ui.labelDim("(click to cycle)");
     ui.endRow();
     ui.endCard();
     ui.gap(ui.theme.s(10));
 
-    const tabs = &[_][]const u8{ "Widget Base", "Input Avanzati", "Indicatori", "Scorrimento" };
+    const tabs = &[_][]const u8{ "Basic Widgets", "Input Avanzati", "Indicators", "Scroll" };
     _ = ui.tabBar("main_tabs", tabs, &s.active_tab);
     ui.gap(ui.theme.s(12));
 
@@ -136,8 +136,8 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             ui.separator();
             ui.gap(ui.theme.s(5));
             ui.beginRow();
-            if (ui.button("Pulsante")) s.button_clicks += 1;
-            if (ui.buttonPrimary("Primario")) s.primary_clicks += 1;
+            if (ui.button("Button")) s.button_clicks += 1;
+            if (ui.buttonPrimary("Primary")) s.primary_clicks += 1;
             ui.endRow();
             ui.gap(ui.theme.s(5));
             ui.beginRow();
@@ -148,7 +148,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             ui.separator();
             ui.gap(ui.theme.s(5));
             ui.beginRow();
-            _ = ui.checkbox("Abilita", &s.checkbox_val);
+            _ = ui.checkbox("Enable", &s.checkbox_val);
             _ = ui.toggle("Notifiche", &s.toggle_val);
             ui.endRow();
             ui.gap(ui.theme.s(5));
@@ -165,25 +165,25 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             ui.heading("Controlli avanzati");
             ui.separator();
             ui.gap(ui.theme.s(5));
-            _ = ui.stepper("Contatore", &s.stepper_val, 0, 100);
+            _ = ui.stepper("Counter", &s.stepper_val, 0, 100);
             ui.gap(ui.theme.s(8));
             _ = ui.slider("Volume", &s.slider_val, 0, 1);
             ui.gap(ui.theme.s(10));
             ui.beginRow();
-            ui.label("Nome:");
+            ui.label("Name:");
             _ = ui.textField("name_field", &s.name_buf);
             ui.endRow();
             ui.gap(ui.theme.s(10));
             ui.beginRow();
             ui.label("Menu:");
-            const opts = &[_][]const u8{ "Opzione 1", "Opzione 2", "Opzione 3", "Opzione 4" };
+            const opts = &[_][]const u8{ "Option 1", "Option 2", "Option 3", "Option 4" };
             _ = ui.dropdown("opts_dd", opts, &s.dropdown_val);
             ui.endRow();
             ui.endCard();
         },
         2 => {
             ui.beginCard(ui.theme.s(280));
-            ui.heading("Stato");
+            ui.heading("Status");
             ui.separator();
             ui.gap(ui.theme.s(10));
             ui.label("Avanzamento");
@@ -207,7 +207,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             while (i < 24) : (i += 1) {
                 ui.pushIdScopeIndex(i);
                 var ib: [48]u8 = undefined;
-                const str = std.fmt.bufPrint(&ib, "Elemento {d}", .{i}) catch "Elemento";
+                const str = std.fmt.bufPrint(&ib, "Item {d}", .{i}) catch "Item";
                 const sel = i % 3;
                 if (ui.selectable(str, s.selectable_vals[sel])) s.selectable_vals[sel] = !s.selectable_vals[sel];
                 ui.popIdScope();
