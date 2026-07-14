@@ -32,9 +32,15 @@
 
 const std = @import("std");
 
+// Only the STANDARD header. wgpu-native ships a `wgpu.h` of its own extensions and it is
+// tempting to reach for it — but the browser has no such file, and every symbol taken
+// from it is a symbol the web host cannot supply. Everything this module needs is in the
+// standard header, SPIR-V passthrough included (it is an optional instance FEATURE, not
+// a vendor extension). So the same Zig compiles against Dawn's copy of `webgpu.h` under
+// Emscripten and against wgpu-native's on the desktop, unchanged. That is the entire
+// reason this header was worth choosing over wgpu's own Rust API.
 pub const c = @cImport({
     @cInclude("webgpu/webgpu.h");
-    @cInclude("webgpu/wgpu.h"); // wgpu-native's own extensions (SPIR-V passthrough, poll)
 });
 
 pub const Error = error{

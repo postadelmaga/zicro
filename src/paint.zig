@@ -478,6 +478,11 @@ pub const Canvas = struct {
             .rgba_straight => {
                 const dr, const dg, const db, const da = unpackStraight(dst);
                 const inv = 1.0 - sa;
+                // Destinazione OPACA: il caso normale di una UI (si dipinge sopra uno sfondo,
+                // non su un buco). L'alpha risultante è 1, quindi la de-premoltiplicazione è
+                // una divisione per 1 — e sono QUATTRO divisioni per pixel che spariscono. Su
+                // un velo a schermo intero (il pannello laterale) valevano 70 ms a frame.
+                if (da >= 1.0) return packStraight(sr * sa + dr * inv, sg * sa + dg * inv, sb * sa + db * inv, 1.0);
                 const oa = sa + da * inv;
                 if (oa <= 0.0) return packStraight(0, 0, 0, 0);
                 // De-premultiply the blended result back to straight alpha.
@@ -807,6 +812,58 @@ pub const Canvas = struct {
         }
     }
 
+    /// Come [`blitImage`], ma **con gli angoli arrotondati**: l'alpha del sorgente viene
+    /// moltiplicata per la copertura della stessa SDF che disegna i pannelli. Serve a una cosa
+    /// sola, ma è quella che distingue una griglia disegnata da una griglia incollata: una
+    /// miniatura quadrata dentro una tessera tonda mostra quattro angoli che sbordano, e non
+    /// c'è palette che tenga. Il costo è la SDF, e solo dove serve — l'interno è blit puro.
+    pub fn blitImageRounded(self: *Canvas, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, radius: f32) void {
+        if (dst_w == 0 or dst_h == 0 or src_w == 0 or src_h == 0) return;
+        if (radius <= 0.5) return self.blitImage(dst_x, dst_y, dst_w, dst_h, src, src_w, src_h);
+        const bx0: u32 = @intCast(@max(0, dst_x));
+        const by0: u32 = @intCast(@max(0, dst_y));
+        const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, dst_x + @as(i32, @intCast(dst_w))))));
+        const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        const inv: f32 = 1.0 / 255.0;
+        const rx: f32 = @floatFromInt(dst_x);
+        const ry: f32 = @floatFromInt(dst_y);
+        const rw: f32 = @floatFromInt(dst_w);
+        const rh: f32 = @floatFromInt(dst_h);
+        // Passo di campionamento in virgola fissa 16.16: `rel_x * src_w / dst_w` sarebbe una
+        // DIVISIONE INTERA per pixel — su una griglia di miniature, decine di migliaia a frame.
+        const step_x: u32 = (src_w << 16) / dst_w;
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const rel_y: u32 = @intCast(@as(i32, @intCast(py)) - dst_y);
+            const sy = @min(src_h - 1, rel_y * src_h / dst_h);
+            const src_row = src[@as(usize, sy) * src_w * 4 ..];
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            const s0, const s1 = self.fullSpan(fy, rx, ry, rw, rh, radius, x0, x1);
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const cov = if (px >= s0 and px < s1)
+                    1.0
+                else
+                    coverage(roundedRectSdf(@as(f32, @floatFromInt(px)) + 0.5, fy, rx, ry, rw, rh, radius));
+                if (cov <= 0.0) continue;
+                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+                const sx = @min(src_w - 1, (rel_x * step_x) >> 16);
+                const si = sx * 4;
+                const a = @as(f32, @floatFromInt(src_row[si + 3])) * inv * cov;
+                if (a <= 0.0) continue;
+                row[px] = self.overColor(
+                    row[px],
+                    @as(f32, @floatFromInt(src_row[si])) * inv,
+                    @as(f32, @floatFromInt(src_row[si + 1])) * inv,
+                    @as(f32, @floatFromInt(src_row[si + 2])) * inv,
+                    a,
+                );
+            }
+        }
+    }
+
     /// Come [`blitImage`] ma il sorgente è una MASCHERA (conta solo l'alpha), tinta da
     /// `tint`. Per le icone-maschera (UI): niente buffer tinto transiente lato chiamante
     /// (che sul backend GL sarebbe un puntatore penzolante/collidente).
@@ -918,32 +975,56 @@ pub const Canvas = struct {
         // EXACTLY 1.0 (neither corner curve nor edge AA) → skip the SDF/@sqrt there. For
         // large fills (backdrop, stage, panels) that's the vast majority of the pixels:
         // per-pixel sqrt → plain blend. Identical output (cov=1 on both paths).
-        const m = radius + 0.5;
-        const iy0 = y + m;
-        const iy1 = y + h - m;
-        const ix0 = x + m;
-        const ix1 = x + w - m;
-        // Opaque interior: the run is a @memset (see fillRoundedRectVGradient).
         const solid: ?u32 = if (color.a >= 1.0) self.packOpaque(color.r, color.g, color.b) else null;
-        const cx0: u32 = std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @ceil(ix0 - 0.5)))), x0, x1);
-        const cx1: u32 = @max(cx0, std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @floor(ix1 - 0.5) + 1))), x0, x1));
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
-            const interior_row = fy >= iy0 and fy <= iy1;
-            if (interior_row) if (solid) |s| if (cx1 > cx0) @memset(row[cx0..cx1], s);
+            // La corsa a copertura PIENA di questa riga (vedi fullSpan): tutto il resto della
+            // riga sta in un angolo o sul filo del bordo, ed è l'unico posto dove serve la SDF.
+            const s0, const s1 = self.fullSpan(fy, x, y, w, h, radius, x0, x1);
+            if (s1 > s0) {
+                if (solid) |s| @memset(row[s0..s1], s) else {
+                    var px: u32 = s0;
+                    while (px < s1) : (px += 1) row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a);
+                }
+            }
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
+                if (px >= s0 and px < s1) continue; // già coperto sopra
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const interior = interior_row and fx >= ix0 and fx <= ix1;
-                if (interior and solid != null) continue; // già scritto dal @memset
-                const cov = if (interior) 1.0 else coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
+                const cov = coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
                 if (cov <= 0.0) continue;
-                const sa = color.a * cov;
-                row[px] = self.overColor(row[px], color.r, color.g, color.b, sa);
+                row[px] = self.overColor(row[px], color.r, color.g, color.b, color.a * cov);
             }
         }
+    }
+
+    /// L'intervallo di colonne `[s0, s1)` in cui, su questa riga, la copertura del rettangolo
+    /// arrotondato è **esattamente 1** — l'unico modo per non pagare una `@sqrt` per pixel su
+    /// una forma che di curvo ha solo quattro angoli.
+    ///
+    /// La prima versione di questa ottimizzazione escludeva un bordo di `raggio+0.5` su tutti
+    /// e quattro i lati: su una tessera di 170 px con raggio 27 quel bordo è **metà** della
+    /// tessera, e lì la SDF girava lo stesso — 40 ms a frame per riempire dei quadrati.
+    /// La geometria dice altro: la copertura è piena ovunque tranne che nei quattro dischi
+    /// d'angolo (e sul mezzo pixel di antialiasing lungo i bordi dritti). Quindi:
+    ///
+    ///   * riga dentro la fascia centrale (`y+r .. y+h-r`) → pieno da `x+0.5` a `x+w-0.5`;
+    ///   * riga nella fascia d'angolo → pieno solo da `x+r` a `x+w-r`, e le due code passano
+    ///     dalla SDF perché lì c'è davvero la curva;
+    ///   * riga fuori dal rettangolo (o nel mezzo pixel di bordo) → nessuna corsa piena.
+    fn fullSpan(self: *const Canvas, fy: f32, x: f32, y: f32, w: f32, h: f32, radius: f32, x0: u32, x1: u32) struct { u32, u32 } {
+        if (fy < y + 0.5 or fy > y + h - 0.5) return .{ x0, x0 }; // riga di solo antialiasing
+        const corner_row = fy < y + radius or fy > y + h - radius;
+        const f0 = if (corner_row) x + radius else x + 0.5;
+        const f1 = if (corner_row) x + w - radius else x + w - 0.5;
+        if (f1 <= f0) return .{ x0, x0 };
+        // Centro pixel `px + 0.5` dentro [f0, f1] ⟺ px ∈ [ceil(f0-0.5), floor(f1-0.5)].
+        const a: u32 = std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @ceil(f0 - 0.5)))), x0, x1);
+        const b: u32 = std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @floor(f1 - 0.5) + 1))), x0, x1);
+        _ = self;
+        return .{ a, @max(a, b) };
     }
 
     /// Fill a rounded rect with independent corner radii (source-over, honoring the
@@ -995,11 +1076,6 @@ pub const Canvas = struct {
         // a vertical gradient is CONSTANT along a scanline, an opaque interior row isn't a
         // blend loop at all — it's one @memset. A full-screen backdrop is the commonest
         // fill in any UI: it must cost a memory write per pixel, nothing more.
-        const m = radius + 0.5;
-        const iy0 = y + m;
-        const iy1 = y + h - m;
-        const cx0: u32 = std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @ceil(x + m - 0.5)))), x0, x1);
-        const cx1: u32 = @max(cx0, std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @floor(x + w - m - 0.5) + 1))), x0, x1));
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
@@ -1010,22 +1086,18 @@ pub const Canvas = struct {
             const cb = top.b + (bottom.b - top.b) * g;
             const ca = top.a + (bottom.a - top.a) * g;
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
-            const interior_row = fy >= iy0 and fy <= iy1;
+            const s0, const s1 = self.fullSpan(fy, x, y, w, h, radius, x0, x1);
 
-            if (interior_row and ca >= 1.0 and cx1 > cx0) {
-                @memset(row[cx0..cx1], self.packOpaque(cr, cg, cb));
-                self.gradEdge(row, x0, cx0, fy, x, y, w, h, radius, cr, cg, cb, ca);
-                self.gradEdge(row, cx1, x1, fy, x, y, w, h, radius, cr, cg, cb, ca);
-                continue;
+            if (s1 > s0) {
+                if (ca >= 1.0) {
+                    @memset(row[s0..s1], self.packOpaque(cr, cg, cb));
+                } else {
+                    var px: u32 = s0;
+                    while (px < s1) : (px += 1) row[px] = self.overColor(row[px], cr, cg, cb, ca);
+                }
             }
-
-            var px: u32 = x0;
-            while (px < x1) : (px += 1) {
-                const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const cov = if (interior_row and px >= cx0 and px < cx1) 1.0 else coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
-                if (cov <= 0.0) continue;
-                row[px] = self.overColor(row[px], cr, cg, cb, ca * cov);
-            }
+            self.gradEdge(row, x0, s0, fy, x, y, w, h, radius, cr, cg, cb, ca);
+            self.gradEdge(row, s1, x1, fy, x, y, w, h, radius, cr, cg, cb, ca);
         }
     }
 
