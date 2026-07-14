@@ -189,6 +189,29 @@ pub fn init(surface: Surface) !Gpu {
 // and the window backends are zicro's (`window_wayland.zig`, `window_cocoa.zig`,
 // `window_win32.zig`, `window_web.zig`). Each host has exactly one way in.
 
+/// Is this build talking to a browser? The one question the layer above is allowed to
+/// ask about its host — and it is here, not in the renderer, because "what am I drawing
+/// into" is a window question.
+pub const is_web = @import("builtin").target.os.tag == .emscripten;
+
+/// A `<canvas>`, by CSS selector — the browser's whole answer to "what is a window".
+///
+/// The chained struct is Emscripten's, not the standard header's: `webgpu.h` describes
+/// how to make a surface out of a Wayland surface, an HWND, a CAMetalLayer and a canvas,
+/// and each of those lives only in the header of a host that HAS one. This is the exact
+/// mirror of `surfaceFromWayland` below, and the pair is the whole reason this module
+/// sits in zicro: everything above it can be written once, because the two functions
+/// that cannot be are both here.
+pub fn surfaceFromCanvas(instance: Instance, selector: [:0]const u8) !Surface {
+    if (!is_web) @compileError("a canvas is a browser's window — this host has none");
+    var src = c.WGPUEmscriptenSurfaceSourceCanvasHTMLSelector{
+        .chain = .{ .sType = c.WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector },
+        .selector = .{ .data = selector.ptr, .length = selector.len },
+    };
+    const desc = c.WGPUSurfaceDescriptor{ .nextInChain = &src.chain };
+    return c.wgpuInstanceCreateSurface(instance, &desc) orelse Error.RequestFailed;
+}
+
 /// A Wayland surface. The two pointers are the compositor's, and the caller got them
 /// from `window_wayland.zig` — which is why this function is here and not in the
 /// renderer.
