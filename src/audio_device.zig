@@ -56,6 +56,22 @@ pub const DeviceOut = struct {
         self.backend.write(s);
     }
 
+    /// Same as [`play`] but straight from a caller-owned slice: no `AudioBlock` wrapping,
+    /// so no per-block allocation + copy. For real-time producers (a media player thread)
+    /// that already own a scratch buffer and just need the blocking submit.
+    pub fn playRaw(self: *DeviceOut, samples: []const f32) void {
+        if (samples.len == 0) return;
+        self.backend.write(samples);
+    }
+
+    /// Current estimated output latency in frames — how far the newest submitted sample is
+    /// from the speaker — or `null` when the backend can't tell (ALSA/waveOut/null device).
+    /// PipeWire reports ring occupancy + one graph quantum, live: a player can derive an
+    /// exact-ish playback clock (`submitted - latencyFrames()`) instead of guessing.
+    pub fn latencyFrames(self: *const DeviceOut) ?u32 {
+        return self.backend.latencyFrames();
+    }
+
     pub fn close(self: *DeviceOut) void {
         self.backend.close();
     }
@@ -107,6 +123,9 @@ const NullDev = struct {
         return .{};
     }
     fn write(_: *NullDev, _: []const f32) void {}
+    fn latencyFrames(_: *const NullDev) ?u32 {
+        return null;
+    }
     fn close(_: *NullDev) void {}
 };
 
@@ -227,6 +246,10 @@ const WaveOut = struct {
         }
         _ = waveOutWrite(self.hwo, h, @sizeOf(WAVEHDR));
         self.next = (self.next + 1) % NBUF;
+    }
+
+    fn latencyFrames(_: *const WaveOut) ?u32 {
+        return null; // queue depth is known only in bytes queued, not device position
     }
 
     fn close(self: *WaveOut) void {
@@ -403,6 +426,10 @@ const Alsa = struct {
         }
     }
 
+    fn latencyFrames(_: *const Alsa) ?u32 {
+        return null; // snd_pcm_delay would need error/xrun handling; callers keep their estimate
+    }
+
     fn close(self: *Alsa) void {
         _ = snd_pcm_drain(self.pcm);
         _ = snd_pcm_close(self.pcm);
@@ -463,6 +490,7 @@ extern fn zicro_pw_open_playback(rate: u32, channels: u16) ?*anyopaque;
 extern fn zicro_pw_open_capture(rate: u32, channels: u16) ?*anyopaque;
 extern fn zicro_pw_write(pw: *anyopaque, src: [*]const f32, frames: usize) c_int;
 extern fn zicro_pw_read(pw: *anyopaque, dst: [*]f32, frames: usize) usize;
+extern fn zicro_pw_delay_frames(pw: *anyopaque) u32;
 extern fn zicro_pw_close(pw: *anyopaque) void;
 
 const PipeWireOut = struct {
@@ -476,6 +504,9 @@ const PipeWireOut = struct {
     fn write(self: *PipeWireOut, samples: []const f32) void {
         const ch: usize = @max(self.channels, 1);
         _ = zicro_pw_write(self.handle, samples.ptr, samples.len / ch);
+    }
+    fn latencyFrames(self: *const PipeWireOut) ?u32 {
+        return zicro_pw_delay_frames(self.handle);
     }
     fn close(self: *PipeWireOut) void {
         zicro_pw_close(self.handle);
@@ -514,6 +545,12 @@ const LinuxOut = union(enum) {
             .pw => |*p| p.write(samples),
             .alsa => |*a| a.write(samples),
         }
+    }
+    fn latencyFrames(self: *const LinuxOut) ?u32 {
+        return switch (self.*) {
+            .pw => |*p| p.latencyFrames(),
+            .alsa => |*a| a.latencyFrames(),
+        };
     }
     fn close(self: *LinuxOut) void {
         switch (self.*) {

@@ -465,6 +465,10 @@ pub const Canvas = struct {
     /// premultiplied branch is the hot default and is byte-identical to the inline
     /// blend it replaced.
     inline fn overColor(self: *const Canvas, dst: u32, sr: f32, sg: f32, sb: f32, sa: f32) u32 {
+        // Opaque source: source-over with alpha 1 IS the source. Skipping the read-blend
+        // saves an unpack and — on the straight-alpha path — four divisions per pixel,
+        // which on a phone CPU is the difference between a 70 ms background and a 1 ms one.
+        if (sa >= 1.0) return self.packOpaque(sr, sg, sb);
         switch (self.format) {
             .argb_premul => {
                 const dr, const dg, const db, const da = unpackPremul(dst);
@@ -485,6 +489,15 @@ pub const Canvas = struct {
                 );
             },
         }
+    }
+
+    /// Pack a fully opaque color in this canvas's [`Format`] — the value an opaque fill
+    /// stores directly (and a whole run of which is a `@memset`).
+    inline fn packOpaque(self: *const Canvas, r: f32, g: f32, b: f32) u32 {
+        return switch (self.format) {
+            .argb_premul => packPremul(r, g, b, 1.0),
+            .rgba_straight => packStraight(r, g, b, 1.0),
+        };
     }
 
     /// Restrict subsequent drawing to `(x,y,w,h)` (canvas coords), intersected with the
@@ -910,15 +923,22 @@ pub const Canvas = struct {
         const iy1 = y + h - m;
         const ix0 = x + m;
         const ix1 = x + w - m;
+        // Opaque interior: the run is a @memset (see fillRoundedRectVGradient).
+        const solid: ?u32 = if (color.a >= 1.0) self.packOpaque(color.r, color.g, color.b) else null;
+        const cx0: u32 = std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @ceil(ix0 - 0.5)))), x0, x1);
+        const cx1: u32 = @max(cx0, std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @floor(ix1 - 0.5) + 1))), x0, x1));
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
             const interior_row = fy >= iy0 and fy <= iy1;
+            if (interior_row) if (solid) |s| if (cx1 > cx0) @memset(row[cx0..cx1], s);
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const cov = if (interior_row and fx >= ix0 and fx <= ix1) 1.0 else coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
+                const interior = interior_row and fx >= ix0 and fx <= ix1;
+                if (interior and solid != null) continue; // già scritto dal @memset
+                const cov = if (interior) 1.0 else coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
                 if (cov <= 0.0) continue;
                 const sa = color.a * cov;
                 row[px] = self.overColor(row[px], color.r, color.g, color.b, sa);
@@ -970,6 +990,16 @@ pub const Canvas = struct {
         const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
         const inv_h = if (h > 0.0) 1.0 / h else 0.0;
+        // Same interior fast-path as `fillRoundedRect`: past `radius+0.5` from every edge
+        // the coverage is exactly 1, so neither the SDF nor its @sqrt is needed. And since
+        // a vertical gradient is CONSTANT along a scanline, an opaque interior row isn't a
+        // blend loop at all — it's one @memset. A full-screen backdrop is the commonest
+        // fill in any UI: it must cost a memory write per pixel, nothing more.
+        const m = radius + 0.5;
+        const iy0 = y + m;
+        const iy1 = y + h - m;
+        const cx0: u32 = std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @ceil(x + m - 0.5)))), x0, x1);
+        const cx1: u32 = @max(cx0, std.math.clamp(@as(u32, @intFromFloat(@max(0.0, @floor(x + w - m - 0.5) + 1))), x0, x1));
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
@@ -980,13 +1010,33 @@ pub const Canvas = struct {
             const cb = top.b + (bottom.b - top.b) * g;
             const ca = top.a + (bottom.a - top.a) * g;
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            const interior_row = fy >= iy0 and fy <= iy1;
+
+            if (interior_row and ca >= 1.0 and cx1 > cx0) {
+                @memset(row[cx0..cx1], self.packOpaque(cr, cg, cb));
+                self.gradEdge(row, x0, cx0, fy, x, y, w, h, radius, cr, cg, cb, ca);
+                self.gradEdge(row, cx1, x1, fy, x, y, w, h, radius, cr, cg, cb, ca);
+                continue;
+            }
+
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const cov = coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
+                const cov = if (interior_row and px >= cx0 and px < cx1) 1.0 else coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
                 if (cov <= 0.0) continue;
                 row[px] = self.overColor(row[px], cr, cg, cb, ca * cov);
             }
+        }
+    }
+
+    /// The antialiased sliver of a gradient scanline left of/right of the memset interior.
+    fn gradEdge(self: *const Canvas, row: []u32, from: u32, to: u32, fy: f32, x: f32, y: f32, w: f32, h: f32, radius: f32, cr: f32, cg: f32, cb: f32, ca: f32) void {
+        var px: u32 = from;
+        while (px < to) : (px += 1) {
+            const fx = @as(f32, @floatFromInt(px)) + 0.5;
+            const cov = coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
+            if (cov <= 0.0) continue;
+            row[px] = self.overColor(row[px], cr, cg, cb, ca * cov);
         }
     }
 
@@ -1216,6 +1266,12 @@ pub const Canvas = struct {
         const lin_r = srgbToLinear(color.r);
         const lin_g = srgbToLinear(color.g);
         const lin_b = srgbToLinear(color.b);
+        // Il formato del canvas decide DOVE stanno rosso e blu nella parola: ARGB8888 (premul)
+        // li tiene a 16 e 0, RGBA8888 (straight, il formato delle surface Android) a 0 e 16.
+        // Comporre sempre come premoltiplicato — che è quel che faceva questa funzione —
+        // scambia i due canali su un canvas straight: il testo giallo diventava ciano.
+        const sh_r: u5 = if (self.format == .argb_premul) 16 else 0;
+        const sh_b: u5 = if (self.format == .argb_premul) 0 else 16;
         var gy: i32 = 0;
         while (gy < g.h) : (gy += 1) {
             const py = gy0 + gy;
@@ -1232,17 +1288,22 @@ pub const Canvas = struct {
                 const sa = color.a * a0;
                 if (sa <= 0.0) continue;
                 const idx = @as(usize, @intCast(py)) * self.width + @as(usize, @intCast(px));
-                const dr, const dg, const db, const da = unpackPremul(self.pixels[idx]);
+                const p = self.pixels[idx];
+                const dr_b: u8 = @truncate(p >> sh_r);
+                const dg_b: u8 = @truncate(p >> 8);
+                const db_b: u8 = @truncate(p >> sh_b);
+                const da_b: u8 = @truncate(p >> 24);
                 const inv = 1.0 - sa;
                 // Gamma-correct "over": blend RGB in linear light (the premultiplied
                 // channels are ~straight over the chrome's opaque panel), then back to
-                // sRGB. The alpha stays linear (geometric coverage).
-                self.pixels[idx] = packPremul(
-                    linearToSrgb(lin_r * sa + srgbToLinear(dr) * inv),
-                    linearToSrgb(lin_g * sa + srgbToLinear(dg) * inv),
-                    linearToSrgb(lin_b * sa + srgbToLinear(db) * inv),
-                    sa + da * inv,
-                );
+                // sRGB. The alpha stays linear (geometric coverage). Tutto per LUT: la
+                // conversione sRGB↔lineare a `pow` costava SEI potenze per pixel di glifo —
+                // su una griglia piena di etichette era metà del frame.
+                const nr: u32 = linearToSrgbByte(lin_r * sa + srgb_byte_to_linear[dr_b] * inv);
+                const ng: u32 = linearToSrgbByte(lin_g * sa + srgb_byte_to_linear[dg_b] * inv);
+                const nb: u32 = linearToSrgbByte(lin_b * sa + srgb_byte_to_linear[db_b] * inv);
+                const na: u32 = @intFromFloat(@round(std.math.clamp(sa + @as(f32, @floatFromInt(da_b)) / 255.0 * inv, 0.0, 1.0) * 255.0));
+                self.pixels[idx] = (na << 24) | (nr << sh_r) | (ng << 8) | (nb << sh_b);
             }
         }
     }

@@ -61,6 +61,17 @@
         //    // actually used.
         //    .lazy = false,
         //},
+
+        // wgpu-native: the prebuilt `webgpu.h` implementation (Vulkan / Metal / DX12
+        // underneath — no Rust toolchain to install, one static library to link).
+        // LAZY on purpose: it is ~50 MB, and nothing that does not ask for the wgpu
+        // device pays for it. The browser host implements the same header itself, so
+        // this dependency is the DESKTOP half of `gpu_wgpu.zig` and only that.
+        .wgpu_native = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-x86_64-release.zip",
+            .hash = "N-V-__8AAAVLrgM9jWFLs7n4rHyodpjIYxtBBE1No8nK0pRz",
+            .lazy = true,
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

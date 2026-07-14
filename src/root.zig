@@ -43,6 +43,7 @@ pub const bridge = @import("bridge.zig");
 pub const wl = @import("wl.zig");
 pub const text = @import("text.zig");
 pub const paint = @import("paint.zig");
+pub const theme = @import("theme.zig");
 pub const paint_gl = @import("paint_gl.zig");
 pub const scroll = @import("scroll.zig");
 pub const widget = @import("widget.zig");
@@ -59,7 +60,6 @@ pub const shmem = @import("shmem.zig");
 // -- GPU memory: autonomous, format-agnostic, API-bindable
 pub const gpu_memory = @import("gpu_memory.zig");
 pub const gpu_vulkan = @import("gpu_vulkan.zig");
-pub const gpu_wgpu_bridge_ffi = @import("gpu_wgpu_bridge_ffi.zig");
 
 // -- the short names an app usually wants
 pub const Envelope = protocol.Envelope;
@@ -105,7 +105,6 @@ test {
     _ = shmem;
     _ = gpu_memory;
     _ = gpu_vulkan;
-    _ = gpu_wgpu_bridge_ffi;
     _ = text;
     _ = paint;
     _ = widget;

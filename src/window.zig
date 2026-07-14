@@ -40,6 +40,13 @@ pub const Options = struct {
     /// timers, animations). 0 disables ticking and the loop blocks on events.
     on_tick: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
     tick_ms: u32 = 0,
+    /// Cap on the LONGER side of the render surface, in pixels (0 = render at the display's
+    /// native resolution). Only the Android backend honors it, and there it matters: a CPU
+    /// canvas on a 1080×2400 phone is 2.6 M pixels per frame, while the same UI drawn into a
+    /// smaller buffer and scaled up by the compositor (free, it's the display hardware) costs
+    /// a fraction of that and looks the same at arm's length. `scaleFactor()` folds the
+    /// reduction in, so an app keeps sizing its UI in dp and needs to know nothing about it.
+    surface_max_dim: u32 = 0,
     /// Ask the compositor for a server-side frame (title bar with close/
     /// minimize/maximize) via xdg-decoration. Default off: zicro shells are
     /// borderless drag-anywhere surfaces; app windows (e.g. zart) opt in.

@@ -320,6 +320,10 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     height: u32,
     closed: bool = false,
     fullscreen: bool = false,
+    /// Native glass active: the window is non-opaque with an NSVisualEffectView
+    /// (desktop blur) behind the content view. Real AppKit only — Darling's
+    /// Cocotron lacks the class and stays on the opaque fallback.
+    has_blur: bool = false,
     mutex: std.Io.Mutex = .init,
     /// Modifier state as last synthesized to `on_key` (evdev transitions) — see `syncMods`.
     mods_shift: bool = false,
@@ -385,7 +389,36 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         ) orelse return error.WindowCreationFailed;
         self.view = view;
         registerView(view, self);
-        msgVoidId(win, "setContentView:", view);
+
+        // Native glass (real AppKit only): mount a full-window NSVisualEffectView as
+        // the content view with our view on top — the material blurs the desktop
+        // BEHIND the window (blendingMode BehindWindow), the macOS counterpart of the
+        // Wayland compositor blur. The window turns non-opaque with a clear background
+        // so the framebuffer's alpha (already premultiplied down to CGImage) lets the
+        // glass show through. Cocotron (Darling) DOES declare NSVisualEffectView but as
+        // a non-functional stub — a non-opaque window there renders black — so the
+        // branch is gated on real AppKit via the same marker `present` uses: the
+        // Onyx2D class `O2Context_builtin_FT` exists only under Cocotron.
+        const cocotron = objc_getClass("O2Context_builtin_FT") != null;
+        const vev_cls = objc_getClass("NSVisualEffectView");
+        if (!cocotron and vev_cls != null) blk: {
+            const vev = initWithFrame(
+                msgId(vev_cls, "alloc"),
+                sel_registerName("initWithFrame:"),
+                CGRect{ .origin = .{ .x = 0, .y = 0 }, .size = frame.size },
+            ) orelse break :blk;
+            msgVoidInt(vev, "setBlendingMode:", 0); // NSVisualEffectBlendingModeBehindWindow
+            msgVoidInt(vev, "setMaterial:", 13); // NSVisualEffectMaterialHUDWindow: dark, matches the glass
+            msgVoidInt(vev, "setState:", 1); // NSVisualEffectStateActive: blur even while inactive
+            msgVoidInt(vev, "setAutoresizingMask:", 2 | 16); // width | height sizable
+            msgVoidInt(view, "setAutoresizingMask:", 2 | 16);
+            msgVoidId(win, "setContentView:", vev);
+            msgVoidId(vev, "addSubview:", view);
+            msgVoidBool(win, "setOpaque:", false);
+            msgVoidId(win, "setBackgroundColor:", msgId(class("NSColor"), "clearColor"));
+            self.has_blur = true;
+        }
+        if (!self.has_blur) msgVoidId(win, "setContentView:", view);
         msgVoidId(win, "makeFirstResponder:", view);
 
         msgVoidBool(app, "activateIgnoringOtherApps:", true);
@@ -399,6 +432,11 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         if (self.win) |w| msgVoidId(w, "close", null);
         self.gpa.free(self.pixels);
         self.gpa.destroy(self);
+    }
+
+    /// Native glass (NSVisualEffectView) active behind the content — see `init`.
+    pub fn hasBlur(self: *const Window) bool {
+        return self.has_blur;
     }
 
     pub fn toggleFullscreen(self: *Window) void {
@@ -596,9 +634,9 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         for (0..h) |y| {
             for (0..w) |x| {
                 const px: u32 = if (y < 100) 0xFFFF0000 // top → red
-                else if (y >= h - 100) 0xFF00FF00 // bottom → green
-                else if (x < 100) 0xFF0000FF // left → blue
-                else 0xFF808080;
+                    else if (y >= h - 100) 0xFF00FF00 // bottom → green
+                    else if (x < 100) 0xFF0000FF // left → blue
+                    else 0xFF808080;
                 self.pixels[y * w + x] = px;
             }
         }

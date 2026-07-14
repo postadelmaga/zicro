@@ -5,6 +5,7 @@
 //! real libc (bionic), so unlike the wasm build the native stb_truetype compiles as-is.
 
 pub const paint = @import("paint.zig");
+pub const theme = @import("theme.zig");
 pub const text = @import("text.zig");
 pub const anim = @import("anim.zig");
 pub const keymap = @import("keymap.zig");

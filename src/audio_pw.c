@@ -37,11 +37,18 @@
 
 // One quantum hint (frames) — asks the graph for a small buffer so latency stays low. The
 // ring holds a few of these so jitter doesn't underrun before the app refills.
-// RING_QUANTA governs the app-side output buffer (≈ QUANTUM×RING_QUANTA/rate): backpressure
-// keeps it near-full, so it IS the steady-state output latency. 4 quanta ≈ 21 ms — bassa
-// latenza per il player/oscilloscopio; alzarlo se un sistema lento produce crackle/underrun.
+// RING_QUANTA sizes the ring (capacity); the steady-state fill is governed separately by
+// TARGET_QUANTA below, so capacity can stay generous (a graph forcing a big quantum still
+// finds a whole callback's worth of samples) without paying it as latency.
 #define ZICRO_PW_QUANTUM 256
 #define ZICRO_PW_RING_QUANTA 4
+// Steady-state playback fill, in units of the quantum the graph ACTUALLY runs (observed in
+// the process callback, not the hint): the writer stops filling past this level, so it is
+// the app-side output latency. 2×256 @48k ≈ 10.7 ms; after each callback one quantum
+// (~5.3 ms) of cushion remains while the writer refills (wakes in ~200 µs). If the graph
+// runs a bigger quantum the target scales with it (never past the ring capacity). Raise to
+// 3-4 on systems that crackle under load.
+#define ZICRO_PW_TARGET_QUANTA 2
 
 struct zicro_pw {
     struct pw_thread_loop *loop;
@@ -55,6 +62,9 @@ struct zicro_pw {
     _Atomic size_t head; // consumer index (monotonic); occupancy = tail - head
     _Atomic size_t tail; // producer index (monotonic)
     _Atomic int stop;
+    // Quantum (frames) the graph actually runs, observed in the playback callback. Drives
+    // the writer's fill target and the latency report; starts at the hint until observed.
+    _Atomic uint32_t quantum;
 };
 
 // pw_init is process-global and must run exactly once before any other pw call.
@@ -103,6 +113,8 @@ static void on_process_playback(void *userdata) {
     uint32_t n_frames = max_frames;
     if (pb->requested && pb->requested < n_frames) n_frames = (uint32_t)pb->requested;
     uint32_t n = n_frames * pw->channels;
+    if (n_frames && n_frames != atomic_load_explicit(&pw->quantum, memory_order_relaxed))
+        atomic_store_explicit(&pw->quantum, n_frames, memory_order_relaxed);
 
     size_t h = atomic_load_explicit(&pw->head, memory_order_relaxed); // consumer owns head
     size_t t = atomic_load_explicit(&pw->tail, memory_order_acquire);
@@ -166,6 +178,7 @@ static struct zicro_pw *pw_open(uint32_t rate, uint16_t channels, int capture) {
     atomic_init(&pw->head, 0);
     atomic_init(&pw->tail, 0);
     atomic_init(&pw->stop, 0);
+    atomic_init(&pw->quantum, ZICRO_PW_QUANTUM);
 
     pw->loop = pw_thread_loop_new("zicro-pw", NULL);
     if (!pw->loop) goto fail;
@@ -223,16 +236,22 @@ struct zicro_pw *zicro_pw_open_capture(uint32_t rate, uint16_t channels) {
     return pw_open(rate, channels, 1);
 }
 
-// Blocking write (playback): enqueue every sample losslessly, backing off while the ring is
-// full (backpressure). Returns 0 on success, -1 if the stream is closing.
+// Blocking write (playback): enqueue every sample losslessly, backing off while the fill is
+// at target (backpressure). The target — TARGET_QUANTA × the observed quantum, clamped to
+// the ring capacity — is the steady-state output latency; see the defines up top. Returns 0
+// on success, -1 if the stream is closing.
 int zicro_pw_write(struct zicro_pw *pw, const float *src, size_t frames) {
     size_t n = frames * pw->channels;
     size_t off = 0;
     while (off < n) {
         if (atomic_load_explicit(&pw->stop, memory_order_acquire)) return -1;
+        size_t q = atomic_load_explicit(&pw->quantum, memory_order_relaxed);
+        size_t target = (size_t)ZICRO_PW_TARGET_QUANTA * q * pw->channels;
+        if (target > pw->cap) target = pw->cap;
         size_t t = atomic_load_explicit(&pw->tail, memory_order_relaxed); // producer owns tail
         size_t h = atomic_load_explicit(&pw->head, memory_order_acquire);
-        size_t space = pw->cap - (t - h);
+        size_t occ = t - h;
+        size_t space = (occ < target) ? target - occ : 0;
         if (space == 0) { backoff(); continue; }
         size_t chunk = (n - off < space) ? (n - off) : space;
         ring_write(pw, t, src + off, chunk);
@@ -265,6 +284,19 @@ size_t zicro_pw_read(struct zicro_pw *pw, float *dst, size_t frames) {
         atomic_store_explicit(&pw->head, h + give, memory_order_release);
         return give / (pw->channels ? pw->channels : 1);
     }
+}
+
+// Estimated playback latency in FRAMES: samples still queued in the ring plus one graph
+// quantum (the buffer PipeWire is mixing while ours waits). An estimate — it ignores the
+// device's own period — but it tracks the adaptive fill target, unlike any fixed constant
+// the app could hardcode. Callable from any thread (two relaxed/acquire loads).
+uint32_t zicro_pw_delay_frames(struct zicro_pw *pw) {
+    size_t h = atomic_load_explicit(&pw->head, memory_order_relaxed);
+    size_t t = atomic_load_explicit(&pw->tail, memory_order_acquire);
+    size_t occ = t - h;
+    if (occ > pw->cap) occ = pw->cap;
+    uint32_t q = atomic_load_explicit(&pw->quantum, memory_order_relaxed);
+    return (uint32_t)(occ / (pw->channels ? pw->channels : 1)) + q;
 }
 
 void zicro_pw_close(struct zicro_pw *pw) {

@@ -80,6 +80,7 @@ extern fn AMotionEvent_getPointerCount(e: *const AInputEvent) usize;
 extern fn AMotionEvent_getPointerId(e: *const AInputEvent, pointer_index: usize) i32;
 extern fn ALooper_pollOnce(timeout_ms: i32, out_fd: ?*i32, out_events: ?*i32, out_data: ?*?*anyopaque) i32;
 extern fn AConfiguration_getDensity(config: ?*anyopaque) i32;
+extern fn __android_log_print(prio: c_int, tag: [*:0]const u8, fmt: [*:0]const u8, ...) c_int;
 
 const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 const AINPUT_EVENT_TYPE_KEY: i32 = 1;
@@ -100,6 +101,14 @@ const APP_CMD_CONFIG_CHANGED: i32 = 8;
 
 const BTN_LEFT: u32 = 272; // touch maps to the left-button contract the toolkit expects
 
+/// Monotonic clock in nanoseconds (std.time lost its timestamp helpers; the syscall is
+/// right there). Used only for the frame profile.
+fn nowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 /// Recognizer gesti condiviso (una sola activity/finestra su Android).
 var touch_recognizer: gesture.Recognizer = .{};
 
@@ -117,6 +126,18 @@ pub const Window = struct {
     /// Owned RGBA backbuffer the app draws into; `blit` copies it into the locked surface
     /// (whose stride may exceed the width).
     backbuf: []u32 = &.{},
+    /// Display width in pixels, BEFORE any `surface_max_dim` reduction — the denominator of
+    /// the scale correction in `scaleFactor` and of the touch coordinate mapping.
+    display_w: u32 = 0,
+    /// A frame is only drawn (and posted) when something changed: input, a resize, or an app
+    /// that asked for another one (`requestRedraw`, e.g. mid-animation). A CPU-rasterized UI
+    /// that repaints an unchanged screen 60 times a second is pure battery burn — and on this
+    /// hardware it also starves the very touch handling it is redrawing for.
+    dirty: bool = true,
+    // Contatori del profilo di frame (vedi il log in `run`).
+    frame_ns: u64 = 0,
+    present_ns: u64 = 0,
+    frames: u32 = 0,
 
     pub fn init(gpa: Allocator, _: std.Io, opts: Options) !*Window {
         const self = try gpa.create(Window);
@@ -145,11 +166,28 @@ pub const Window = struct {
         // Reset to the window's native size (0,0) with our pixel format, THEN read the size —
         // so after a rotation we pick up the new dimensions, not the stale ones.
         _ = ANativeWindow_setBuffersGeometry(nw, 0, 0, WINDOW_FORMAT_RGBA_8888);
-        const w: u32 = @intCast(@max(ANativeWindow_getWidth(nw), 1));
-        const h: u32 = @intCast(@max(ANativeWindow_getHeight(nw), 1));
+        const dw: u32 = @intCast(@max(ANativeWindow_getWidth(nw), 1));
+        const dh: u32 = @intCast(@max(ANativeWindow_getHeight(nw), 1));
+        self.display_w = dw;
+        _ = __android_log_print(4, "zicro", "setNative: display=%dx%d cap=%d", dw, dh, self.opts.surface_max_dim);
+
+        // Render surface: the display's own resolution unless the app capped it
+        // (`surface_max_dim`). A smaller buffer means proportionally fewer pixels for the CPU
+        // rasterizer — the display scaler blows it back up for free. The aspect ratio is
+        // preserved, or the image would be stretched.
+        var w = dw;
+        var h = dh;
+        const cap = self.opts.surface_max_dim;
+        if (cap > 0 and @max(dw, dh) > cap) {
+            const s = @as(f32, @floatFromInt(cap)) / @as(f32, @floatFromInt(@max(dw, dh)));
+            w = @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(dw)) * s)));
+            h = @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(dh)) * s)));
+            _ = ANativeWindow_setBuffersGeometry(nw, @intCast(w), @intCast(h), WINDOW_FORMAT_RGBA_8888);
+        }
         self.width = w;
         self.height = h;
         self.ensureBackbuf(@as(usize, w) * h);
+        self.dirty = true;
     }
 
     fn ensureBackbuf(self: *Window, n: usize) void {
@@ -158,8 +196,10 @@ pub const Window = struct {
         self.backbuf = self.gpa.alloc(u32, n) catch &.{};
     }
 
+    /// Ask for one more frame. An app calls this while something is animating; when it stops,
+    /// the loop goes quiet by itself (see `dirty`).
     pub fn requestRedraw(self: *Window) void {
-        _ = self; // the run loop repaints each iteration while the surface is alive
+        self.dirty = true;
     }
     pub fn requestClose(self: *Window) void {
         self.closed = true;
@@ -171,14 +211,27 @@ pub const Window = struct {
         _ = self;
     }
 
-    /// Display scale (density/160): 1.0 at mdpi, ~2.75 at 440 dpi. Apps multiply their UI
-    /// sizes by this so text and controls aren't tiny on high-density phones.
+    /// Pixels per dp IN THE RENDER SURFACE: the display density (density/160 — 1.0 at mdpi,
+    /// ~2.75 at 440 dpi) scaled down by whatever `surface_max_dim` shrank the buffer to. An
+    /// app multiplies its dp sizes by this and gets physically-correct UI either way; the
+    /// reduced-resolution surface stays an invisible implementation detail.
     pub fn scaleFactor(self: *const Window) f32 {
         const app = self.app orelse return 1;
         const cfg = app.config orelse return 1;
         const d = AConfiguration_getDensity(cfg);
         if (d <= 0 or d == 0xffff) return 1; // 0 = default/unset, 0xffff = ACONFIGURATION_DENSITY_NONE
-        return @as(f32, @floatFromInt(d)) / 160.0;
+        var s = @as(f32, @floatFromInt(d)) / 160.0;
+        if (self.display_w > 0 and self.width > 0 and self.width != self.display_w) {
+            s *= @as(f32, @floatFromInt(self.width)) / @as(f32, @floatFromInt(self.display_w));
+        }
+        return s;
+    }
+
+    /// Touch coordinates arrive in DISPLAY pixels; the app draws in SURFACE pixels. When the
+    /// surface is smaller, every pointer position must be scaled or the taps land off-target.
+    fn touchScale(self: *const Window) f32 {
+        if (self.display_w == 0 or self.width == 0) return 1;
+        return @as(f32, @floatFromInt(self.width)) / @as(f32, @floatFromInt(self.display_w));
     }
 
     pub fn textFont(self: *Window) !*text.Font {
@@ -231,14 +284,36 @@ pub const Window = struct {
                 continue;
             }
             if (self.native == null) continue;
+            // Nothing changed since the last frame: don't rasterize an identical screen.
+            if (!self.dirty) continue;
+            self.dirty = false;
 
             if (self.opts.on_tick) |tick| tick(self, self.opts.user);
             self.ensureBackbuf(@as(usize, self.width) * self.height);
-            if (self.backbuf.len < @as(usize, self.width) * self.height) continue;
+            if (self.backbuf.len < @as(usize, self.width) * self.height) {
+                _ = __android_log_print(6, "zicro", "backbuf insufficiente: %d < %dx%d", @as(c_int, @intCast(self.backbuf.len)), self.width, self.height);
+                continue;
+            }
+            if (self.frames == 0) _ = __android_log_print(4, "zicro", "primo frame: %dx%d user=%d", self.width, self.height, @as(c_int, @intFromBool(self.opts.user != null)));
+            const t0 = nowNs();
             var canvas = paint.Canvas.initRgba8(self.backbuf[0 .. self.width * self.height], self.width, self.height);
             if (self.opts.on_draw) |draw| draw(&canvas, self.contentRect(), self.opts.user);
+            const t1 = nowNs();
             const bytes: [*]const u8 = @ptrCast(self.backbuf.ptr);
             self.presentRgba(self.width, self.height, bytes[0 .. @as(usize, self.width) * self.height * 4]);
+            const t2 = nowNs();
+            // Profilo del frame (ZICRO_FRAME_LOG): quanto costa DAVVERO disegnare e quanto
+            // postare. Senza questi due numeri, ottimizzare un rasterizzatore è tirare a
+            // indovinare; con questi, si sa subito da che parte sta il collo di bottiglia.
+            self.frame_ns += t1 - t0;
+            self.present_ns += t2 - t1;
+            self.frames += 1;
+            if (self.frames == 60) {
+                _ = __android_log_print(4, "zicro", "frame: draw %.1f ms · present %.1f ms (%dx%d)", @as(f64, @floatFromInt(self.frame_ns)) / 60e6, @as(f64, @floatFromInt(self.present_ns)) / 60e6, self.width, self.height);
+                self.frames = 0;
+                self.frame_ns = 0;
+                self.present_ns = 0;
+            }
         }
     }
 
@@ -262,7 +337,12 @@ pub const Window = struct {
 
     /// Un campione touch nel recognizer condiviso; ne inoltra gli eventi (un dito → mouse,
     /// due dita → pinch su `on_gesture`).
-    fn feedTouch(self: *Window, id: i32, phase: gesture.Phase, x: f32, y: f32) void {
+    fn feedTouch(self: *Window, id: i32, phase: gesture.Phase, raw_x: f32, raw_y: f32) void {
+        // Ogni tocco muove qualcosa: il prossimo frame va disegnato.
+        self.dirty = true;
+        const s = self.touchScale();
+        const x = raw_x * s;
+        const y = raw_y * s;
         var out: [2]gesture.Out = undefined;
         for (touch_recognizer.push(id, phase, x, y, &out)) |ev| switch (ev) {
             .pointer_down => |p| if (self.opts.on_mouse) |cb| {
@@ -316,6 +396,7 @@ pub const Window = struct {
             AINPUT_EVENT_TYPE_KEY => {
                 const pressed = AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_DOWN;
                 const code: u32 = @intCast(@max(AKeyEvent_getKeyCode(event), 0));
+                self.dirty = true;
                 if (self.opts.on_key) |cb| cb(self, code, @intFromBool(pressed), self.opts.user);
                 return 1;
             },

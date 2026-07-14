@@ -83,6 +83,37 @@ pub fn build(b: *std.Build) void {
     // zig itself links libSystem from a bundled stub).
     if (target.result.os.tag == .macos) addMacosLinks(b, zicro, macos_sysroot);
 
+    // The WebGPU device — its OWN module, not part of `zicro`.
+    //
+    // zicro owns the device and the window; whoever is drawing owns the frame. So the
+    // wgpu binding lives here, next to `gpu_vulkan.zig` and the four window backends
+    // that are the only things in the stack that know what a surface is made of. It is
+    // a separate module because the prebuilt library is ~50 MB and nothing that does
+    // not ask for a wgpu device should link a byte of it.
+    //
+    //   `zig build -Dwgpu` — build it and run its bring-up test.
+    //
+    // The browser implements the same `webgpu.h` itself, so this dependency is only the
+    // DESKTOP half; `window_web.zig`'s canvas is the other.
+    const want_wgpu = b.option(bool, "wgpu", "build the WebGPU device binding (links prebuilt wgpu-native)") orelse false;
+    if (want_wgpu) {
+        if (b.lazyDependency("wgpu_native", .{})) |wgpu_dep| {
+            const wgpu = b.addModule("zicro_wgpu", .{
+                .root_source_file = b.path("src/gpu_wgpu.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            wgpu.addIncludePath(wgpu_dep.path("include"));
+            wgpu.addLibraryPath(wgpu_dep.path("lib"));
+            wgpu.linkSystemLibrary("wgpu_native", .{});
+
+            const wgpu_tests = b.addTest(.{ .root_module = wgpu });
+            const run_wgpu_tests = b.addRunArtifact(wgpu_tests);
+            b.step("test-wgpu", "bring a WebGPU device up and ask what it can do").dependOn(&run_wgpu_tests.step);
+        }
+    }
+
     // `zig build test` — every `test` block in the library.
     const mod_tests = b.addTest(.{ .root_module = zicro });
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -221,6 +252,23 @@ pub fn build(b: *std.Build) void {
         const android_step = b.step("android", "Compile-check the Android (NDK) backend for aarch64-linux-android");
         android_step.dependOn(&and_obj.step);
     }
+
+    // The Android module a dependent app (an APK's libmain.so) imports as "zicro":
+    // `android_root.zig` — the CPU canvas + text + widgets + the NDK window backend, WITHOUT
+    // the Wayland/ALSA/shm stack that doesn't exist on Android. The app owns the target (its
+    // own ABI/api-level) and the libandroid/liblog link, so this module carries only what is
+    // portable: the stb rasterizer. See Zuer's scripts/build-android-apk.sh for the packaging.
+    const zicro_android = b.addModule("zicro_android", .{
+        .root_source_file = b.path("src/android_root.zig"),
+        .link_libc = true,
+    });
+    // Bionic is a real libc, so the native stb_truetype rasterizer compiles as-is (unlike
+    // the wasm build). Same font path as every other platform.
+    zicro_android.addIncludePath(b.path("vendor/stb"));
+    zicro_android.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_truetype_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
 }
 
 /// The macOS link set for a module: libobjc + Cocoa (load command) + CoreGraphics.
@@ -235,6 +283,12 @@ fn addMacosLinks(b: *std.Build, mod: *std.Build.Module, sysroot: ?[]const u8) vo
         mod.addLibraryPath(b.path("vendor/macos-stubs/usr/lib"));
     }
     mod.linkSystemLibrary("objc", .{});
+    // AppKit DIRETTO e PRIMA dell'umbrella Cocoa: `NSApp` vive in AppKit e il
+    // two-level namespace binda il simbolo alla PRIMA dylib vista al link che lo
+    // esporta. Bindarlo ad AppKit è corretto su macOS reale e necessario sotto
+    // Darling, il cui umbrella Cocoa non ri-esporta i simboli di AppKit (exports
+    // trie vuoto) → col bind a Cocoa dyld fallirebbe con "Symbol not found: _NSApp".
+    mod.linkFramework("AppKit", .{});
     mod.linkFramework("Cocoa", .{});
     mod.linkFramework("CoreGraphics", .{});
 }
