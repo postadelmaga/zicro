@@ -50,6 +50,7 @@ pub const keymap = @import("keymap.zig");
 pub const window = @import("window.zig");
 pub const gesture = @import("gesture.zig");
 pub const proportion = @import("proportion.zig");
+pub const clipboard = @import("clipboard.zig");
 
 // -- out-of-process transports (the Rust `ipc` feature of micro-bus)
 pub const ipc = @import("ipc.zig");

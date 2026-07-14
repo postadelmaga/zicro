@@ -30,6 +30,7 @@ pub const gesture = @import("gesture.zig");
 /// responsive metrics). Same surface as the native root so `zicro.phi` resolves on wasm.
 pub const proportion = @import("proportion.zig");
 pub const phi = proportion.phi;
+pub const clipboard = @import("clipboard.zig");
 
 comptime {
     _ = @import("wasm_shim.zig"); // keep zig_malloc/zig_free/zig_pow/… in the link
