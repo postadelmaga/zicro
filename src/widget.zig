@@ -61,7 +61,12 @@ pub fn nowMs() i64 {
             return @intCast(k32.GetTickCount64());
         },
         // wasm: no OS clock — the browser feeds the time via `web_now_ms`.
-        .freestanding => return web_now_ms,
+        //
+        // emscripten belongs here too, and not as a courtesy: it is a browser, the page
+        // calls the same `zicroFrame(now_ms)` that sets `web_now_ms`, and there is no
+        // clock to read. Left in the `else` branch it reached for `std.os.linux`, which
+        // on this target does not compile — a tab was being asked for a VDSO.
+        .freestanding, .emscripten => return web_now_ms,
         else => {
             var ts: std.os.linux.timespec = undefined;
             _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
