@@ -10,7 +10,17 @@ const std = @import("std");
 // A general-purpose heap over wasm memory.grow. C `free`/`realloc` carry no size, so
 // each block is prefixed with its total length (16-byte header keeps the payload
 // 16-aligned — enough for every stb struct).
-const gpa = std.heap.wasm_allocator;
+//
+// …but only where nothing else owns the heap. `wasm_allocator` takes its pages by
+// calling `memory.grow` ITSELF, and emscripten's `malloc` owns them there: the grow
+// fails, `zig_malloc` returns null, and stb_truetype quietly rasterizes no glyphs — a
+// window that draws every shape and not one letter. So on emscripten these shims defer
+// to the libc that is actually present. (This file's header says native builds link real
+// libc and never see it; emscripten links real libc AND sees it, which is the gap.)
+const gpa = if (@import("builtin").os.tag == .emscripten)
+    std.heap.c_allocator
+else
+    std.heap.wasm_allocator;
 const hdr_bytes: usize = 16;
 
 export fn zig_malloc(n: usize) ?*anyopaque {

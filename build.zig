@@ -114,6 +114,30 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // The BROWSER form of the same binding (Zengine's issue #89): the identical module,
+    // minus the prebuilt library — in a browser the implementation of webgpu.h is the
+    // browser's own, supplied at link time by emcc's emdawnwebgpu port. What the module
+    // cannot carry is the header's location, because it lives in the CONSUMER's emsdk
+    // cache; they add it (modules stay mutable across the dependency boundary):
+    //
+    //     const zicro = b.dependency("zicro", .{ .target = wasm_target, .@"wgpu-browser" = true });
+    //     const zw = zicro.module("zicro_wgpu_browser");
+    //     zw.addSystemIncludePath(.{ .cwd_relative = <emsdk>/cache/sysroot/include });
+    //     zw.addIncludePath(.{ .cwd_relative = <emsdk>/.../emdawnwebgpu_pkg/webgpu/include });
+    //
+    // A different NAME from the desktop module, deliberately: enabling both forms in one
+    // build must not put gpu_wgpu.zig in two modules, and a consumer who imports both
+    // deserves the compiler saying so with these two names in the error.
+    const want_wgpu_browser = b.option(bool, "wgpu-browser", "publish the WebGPU binding without wgpu-native (emscripten form; bring the port's include paths)") orelse false;
+    if (want_wgpu_browser) {
+        _ = b.addModule("zicro_wgpu_browser", .{
+            .root_source_file = b.path("src/gpu_wgpu.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+    }
+
     // `zig build test` — every `test` block in the library.
     const mod_tests = b.addTest(.{ .root_module = zicro });
     const run_mod_tests = b.addRunArtifact(mod_tests);
