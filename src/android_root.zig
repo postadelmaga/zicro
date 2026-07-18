@@ -10,7 +10,15 @@ pub const text = @import("text.zig");
 pub const anim = @import("anim.zig");
 pub const keymap = @import("keymap.zig");
 pub const scroll = @import("scroll.zig");
+/// Zig puro (solo std), come nel root nativo e in `web_root.zig`: `zrame.window` espone
+/// `GestureEvent = zicro.gesture.Gesture`, quindi senza questo il build android non compila.
+pub const gesture = @import("gesture.zig");
 pub const wl = @import("wl.zig");
+/// Proporzione: Zig puro, come nel root nativo e in `web_root.zig`. `zrame.window` ci
+/// costruisce sopra le soglie responsive (phone/tablet), quindi serve anche su android.
+pub const clipboard = @import("clipboard.zig"); // Zig puro: uno store in-process, nessun trasporto
+pub const proportion = @import("proportion.zig");
+pub const phi = proportion.phi;
 pub const widget = @import("widget.zig");
 pub const window = @import("window.zig"); // facade → window_android on android
 /// The NDK backend module — exposes `android_app` for an app's `android_main` entry.
