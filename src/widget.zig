@@ -584,6 +584,13 @@ pub const Ui = struct {
         store.text_ops_len = 0;
         store.keys_len = 0;
 
+        for (events) |e| {
+            if (e == .text) {
+                store.saw_text_events = true;
+                break;
+            }
+        }
+
         for (events) |e| switch (e) {
             .motion => |m| {
                 if (store.mouse_x > -1e8) {
@@ -696,7 +703,7 @@ pub const Ui = struct {
 
             // Wheel over the open panel scrolls the list, not what's underneath.
             const in_panel = store.dd_panel.contains(store.mouse_x, store.mouse_y);
-            if (store.wheel != 0 and in_panel) {
+            if (store.wheel != 0) {
                 store.dd_scroll += store.wheel; // clamped in dropdown(), where content height is known
                 store.wheel = 0;
             }
