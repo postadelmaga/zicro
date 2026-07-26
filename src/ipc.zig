@@ -1,10 +1,10 @@
 //! # zicro.ipc — cross-process & in-process transports
 //!
 //! zicro ships the in-process [`LocalBus`](bus.LocalBus) broker in `bus.zig`; this file
-//! adds the transports an app needs to host a module *out of process* — an in-process
-//! channel pair, a stdio codec (JSON lines or length-prefixed postcard), and the wrapper
-//! a supervisor uses to read a spawned child's stdout. Module code written against
-//! `ModuleCtx` is unaffected by which transport hosts it — "write once, host anywhere".
+//! adds the transport an app needs to host a module *out of process*: a stdio codec
+//! (JSON lines or length-prefixed postcard) with a sender/receiver pair a supervisor
+//! uses to talk to a spawned child. Module code written against `ModuleCtx` is
+//! unaffected by which transport hosts it — "write once, host anywhere".
 //!
 //! The wire formats are **byte-compatible with Micro's `ipc` feature**, so a zicro
 //! supervisor can host a Rust Micro sidecar and vice versa:
@@ -14,8 +14,8 @@
 //!   reimplemented here, no Rust dependency).
 //!
 //! Port note (Rust → Zig): Rust returns `Box<dyn Sender>` / `Box<dyn Receiver>` trait
-//! objects; here each transport is a concrete type with the same `send` / `recv` /
-//! `tryRecv` / `recvTimeout` shape — comptime duck typing plays the trait's role.
+//! objects; here the transport is a concrete type with the same `send` / `recv` shape —
+//! comptime duck typing plays the trait's role.
 
 const std = @import("std");
 const Io = std.Io;
@@ -111,143 +111,6 @@ pub fn deserializeEnvelopePostcard(gpa: Allocator, bytes: []const u8) !OwnedEnve
     return .{ .gpa = gpa, .env = .{ .from = from, .channel = channel, .payload = payload } };
 }
 
-// --- in-process transport (thread channel, zero wire encoding) --------------------
-
-/// In-process pair: the default path when the "remote" end is just another thread.
-/// Envelopes are copied once into the queue, no wire encoding. Both halves must be
-/// `deinit`ed.
-pub fn channelPair(gpa: Allocator, io: Io) Allocator.Error!struct { PairSender, PairReceiver } {
-    const inner = try gpa.create(PairInner);
-    inner.* = .{ .gpa = gpa, .io = io };
-    return .{ .{ .inner = inner }, .{ .inner = inner } };
-}
-
-const PairInner = struct {
-    gpa: Allocator,
-    io: Io,
-    mutex: Io.Mutex = .init,
-    changed: sync.Signal = .{},
-    queue: std.ArrayListUnmanaged(OwnedEnvelope) = .empty,
-    head: usize = 0,
-    sender_alive: bool = true,
-    receiver_alive: bool = true,
-    refs: std.atomic.Value(usize) = .init(2),
-
-    fn popLocked(inner: *PairInner) ?OwnedEnvelope {
-        if (inner.head == inner.queue.items.len) return null;
-        const env = inner.queue.items[inner.head];
-        inner.head += 1;
-        if (inner.head == inner.queue.items.len) {
-            inner.queue.clearRetainingCapacity();
-            inner.head = 0;
-        }
-        return env;
-    }
-
-    fn release(inner: *PairInner) void {
-        if (inner.refs.fetchSub(1, .acq_rel) == 1) {
-            while (inner.popLocked()) |env| env.deinit();
-            inner.queue.deinit(inner.gpa);
-            inner.gpa.destroy(inner);
-        }
-    }
-};
-
-/// The producing half of a [`channelPair`].
-pub const PairSender = struct {
-    inner: *PairInner,
-
-    /// Queue a copy of `env`. `error.Disconnected` once the receiver is gone.
-    pub fn send(self: PairSender, env: *const Envelope) !void {
-        const inner = self.inner;
-        const owned: OwnedEnvelope = .{ .gpa = inner.gpa, .env = .{
-            .from = try inner.gpa.dupe(u8, env.from),
-            .channel = try inner.gpa.dupe(u8, env.channel),
-            .payload = try inner.gpa.dupe(u8, env.payload),
-        } };
-        errdefer owned.deinit();
-        sync.lock(&inner.mutex, inner.io);
-        defer sync.unlock(&inner.mutex, inner.io);
-        if (!inner.receiver_alive) return error.Disconnected;
-        try inner.queue.append(inner.gpa, owned);
-        inner.changed.notifyAll(inner.io);
-    }
-
-    pub fn deinit(self: PairSender) void {
-        const inner = self.inner;
-        sync.lock(&inner.mutex, inner.io);
-        inner.sender_alive = false;
-        inner.changed.notifyAll(inner.io);
-        sync.unlock(&inner.mutex, inner.io);
-        inner.release();
-    }
-};
-
-/// The consuming half of a [`channelPair`].
-pub const PairReceiver = struct {
-    inner: *PairInner,
-
-    /// Block until the next envelope; `error.Disconnected` once the sender is gone and
-    /// the queue is drained.
-    pub fn recv(self: PairReceiver) error{Disconnected}!OwnedEnvelope {
-        const inner = self.inner;
-        while (true) {
-            sync.lock(&inner.mutex, inner.io);
-            if (inner.popLocked()) |env| {
-                sync.unlock(&inner.mutex, inner.io);
-                return env;
-            }
-            if (!inner.sender_alive) {
-                sync.unlock(&inner.mutex, inner.io);
-                return error.Disconnected;
-            }
-            const snapshot = inner.changed.prepare();
-            sync.unlock(&inner.mutex, inner.io);
-            inner.changed.wait(inner.io, snapshot);
-        }
-    }
-
-    /// Non-blocking poll: `null` when nothing is queued.
-    pub fn tryRecv(self: PairReceiver) error{Disconnected}!?OwnedEnvelope {
-        const inner = self.inner;
-        sync.lock(&inner.mutex, inner.io);
-        defer sync.unlock(&inner.mutex, inner.io);
-        if (inner.popLocked()) |env| return env;
-        if (!inner.sender_alive) return error.Disconnected;
-        return null;
-    }
-
-    /// Block for at most `timeout_ns`; `null` on timeout.
-    pub fn recvTimeout(self: PairReceiver, timeout_ns: u64) error{Disconnected}!?OwnedEnvelope {
-        const inner = self.inner;
-        const deadline = sync.deadlineAfterNs(inner.io, timeout_ns);
-        while (true) {
-            sync.lock(&inner.mutex, inner.io);
-            if (inner.popLocked()) |env| {
-                sync.unlock(&inner.mutex, inner.io);
-                return env;
-            }
-            if (!inner.sender_alive) {
-                sync.unlock(&inner.mutex, inner.io);
-                return error.Disconnected;
-            }
-            const snapshot = inner.changed.prepare();
-            sync.unlock(&inner.mutex, inner.io);
-            if (sync.expired(inner.io, deadline)) return null;
-            inner.changed.waitTimeout(inner.io, snapshot, .{ .deadline = deadline });
-        }
-    }
-
-    pub fn deinit(self: PairReceiver) void {
-        const inner = self.inner;
-        sync.lock(&inner.mutex, inner.io);
-        inner.receiver_alive = false;
-        inner.changed.notifyAll(inner.io);
-        sync.unlock(&inner.mutex, inner.io);
-        inner.release();
-    }
-};
-
 // --- cross-process transport (stdio JSON-lines or postcard-binary) -----------------
 
 /// Writes envelopes as JSON lines or binary postcard packets to a stream. A supervisor
@@ -289,9 +152,7 @@ pub const ProcessSender = struct {
 /// wraps a child's piped stdout (the return path); a sidecar wraps its own stdin.
 ///
 /// A piped reader has no portable timed read, so (as in the Rust original) consumers
-/// drive `recv` on a dedicated thread: `tryRecv` never blocks but only ever reports
-/// what a `recv` loop has not yet claimed (i.e. nothing), and `recvTimeout` is
-/// best-effort — it simply blocks on the next frame.
+/// drive the blocking `recv` on a dedicated thread.
 pub const ProcessReceiver = struct {
     gpa: Allocator,
     io: Io,
@@ -325,26 +186,7 @@ pub const ProcessReceiver = struct {
         }
     }
 
-    /// Never blocks; a stdio stream cannot be polled portably, so this reports nothing
-    /// (drive the stream with a `recv` thread instead).
-    pub fn tryRecv(self: *ProcessReceiver) !?OwnedEnvelope {
-        _ = self;
-        return null;
-    }
-
-    /// Best-effort: blocks on the next frame regardless of `timeout_ns` (see type docs).
-    pub fn recvTimeout(self: *ProcessReceiver, timeout_ns: u64) !?OwnedEnvelope {
-        _ = timeout_ns;
-        return try self.recv();
-    }
 };
-
-/// Build a [`ProcessReceiver`] over an arbitrary reader — the parent's **return path**:
-/// wrap a spawned child's piped stdout so envelopes the sidecar emits flow back in, one
-/// per `recv()`. Same wire format as the sidecar's own stdio pair.
-pub fn receiverFromReader(gpa: Allocator, io: Io, reader: *Io.Reader, format: IpcFormat) ProcessReceiver {
-    return ProcessReceiver.init(gpa, io, reader, format);
-}
 
 // --- tests ---------------------------------------------------------------------------------
 
@@ -434,26 +276,3 @@ test "process pair round-trips postcard packets" {
     try testing.expectError(error.EndOfStream, rx.recv());
 }
 
-test "channel pair delivers in order and reports disconnect" {
-    const gpa = testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const tx, const rx = try channelPair(gpa, io);
-    defer rx.deinit();
-
-    try tx.send(&.{ .from = "a", .channel = "x", .payload = "1" });
-    try tx.send(&.{ .from = "a", .channel = "x", .payload = "2" });
-    tx.deinit();
-
-    const first = (try rx.tryRecv()).?;
-    defer first.deinit();
-    try testing.expectEqualStrings("1", first.env.payload);
-    const second = try rx.recv();
-    defer second.deinit();
-    try testing.expectEqualStrings("2", second.env.payload);
-    // Sender gone and queue drained → disconnected, like the Rust mpsc pair.
-    try testing.expectError(error.Disconnected, rx.recv());
-    try testing.expectError(error.Disconnected, rx.tryRecv());
-}

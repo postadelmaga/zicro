@@ -10,6 +10,7 @@
 pub const paint = @import("paint.zig");
 pub const paint_gl = @import("paint_gl.zig");
 pub const text = @import("text.zig");
+pub const theme = @import("theme.zig");
 /// Wayland client bindings — pulled in only for the keycode/cursor CONSTANTS the panels
 /// reference (`wl.KEYBOARD_KEY_STATE_*`, cursor shapes); the extern libwayland functions
 /// are never called on wasm, so they stay unresolved-but-harmless (lazy analysis).
@@ -20,9 +21,9 @@ pub const scroll = @import("scroll.zig");
 /// The immediate-mode widget toolkit — the whole point of the web port: the same
 /// button/checkbox/toggle/slider/dropdown/textField that run natively, in a canvas.
 pub const widget = @import("widget.zig");
-/// The web `Window` backend: the same `on_draw`/`on_key`/`on_mouse` contract as the
-/// native windows, with the browser driving the loop. `zicro.window.Window` on the web.
-pub const window = @import("window_web.zig");
+/// The window facade — its comptime switch resolves to the web backend
+/// (`window_web.zig`) on wasm, so `zicro.window` reads the same here as natively.
+pub const window = @import("window.zig");
 /// Recognizer gesti multi-touch (pinch, …) condiviso dai backend. Stessa superficie del
 /// root nativo così `zicro.gesture` risolve su wasm.
 pub const gesture = @import("gesture.zig");
@@ -34,4 +35,7 @@ pub const clipboard = @import("clipboard.zig");
 
 comptime {
     _ = @import("wasm_shim.zig"); // keep zig_malloc/zig_free/zig_pow/… in the link
+    // Parity guard: the portable substrate list lives once, in root.zig.
+    for (@import("root.zig").substrate_decls) |name|
+        if (!@hasDecl(@This(), name)) @compileError("web_root.zig forgot to re-export '" ++ name ++ "'");
 }

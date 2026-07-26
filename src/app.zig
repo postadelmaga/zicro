@@ -45,14 +45,14 @@ pub fn WorldModule(comptime S: type, comptime A: type) type {
         actions: []const u8,
         state: []const u8,
         doc: document.Doc(S, A),
-        subs_buf: [1][]const u8 = undefined,
+        subs_buf: [1][]const u8,
 
         const Self = @This();
 
         /// New world node: `actions` is the channel it reduces, `state` the channel it
         /// republishes the document's state on after every committed action.
         pub fn init(id_: []const u8, actions: []const u8, state: []const u8, doc: document.Doc(S, A)) Self {
-            return .{ .id_ = id_, .actions = actions, .state = state, .doc = doc };
+            return .{ .id_ = id_, .actions = actions, .state = state, .doc = doc, .subs_buf = .{actions} };
         }
 
         pub fn id(self: *Self) []const u8 {
@@ -60,7 +60,6 @@ pub fn WorldModule(comptime S: type, comptime A: type) type {
         }
 
         pub fn subscriptions(self: *Self) []const []const u8 {
-            self.subs_buf[0] = self.actions;
             return &self.subs_buf;
         }
 

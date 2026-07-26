@@ -107,29 +107,6 @@ pub const Buffer = struct {
     }
 };
 
-/// A GPU memory pool: manages multiple buffers with a simple allocation strategy.
-pub const Pool = struct {
-    gpa: Allocator,
-    buffers: std.ArrayListUnmanaged(Buffer) = .empty,
-
-    pub fn init(gpa: Allocator) Pool {
-        return .{ .gpa = gpa };
-    }
-
-    /// Allocate a new GPU buffer from the pool.
-    pub fn allocate(pool: *Pool, size: usize, name: []const u8) !*Buffer {
-        const buf = try Buffer.allocate(pool.gpa, size, name);
-        try pool.buffers.append(pool.gpa, buf);
-        return &pool.buffers.items[pool.buffers.items.len - 1];
-    }
-
-    /// Free the pool and all its buffers.
-    pub fn deinit(pool: *Pool) void {
-        for (pool.buffers.items) |*buf| buf.deinit(pool.gpa);
-        pool.buffers.deinit(pool.gpa);
-    }
-};
-
 // --- tests ---------------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -150,25 +127,6 @@ test "gpu_memory.exportHandle returns valid fd" {
 
     const fd = buf.exportHandle();
     try testing.expect(fd >= 0);
-}
-
-test "gpu_memory.Pool allocates and manages buffers" {
-    var pool = Pool.init(testing.allocator);
-    defer pool.deinit();
-
-    const buf1 = try pool.allocate(256, "buf1");
-    const buf2 = try pool.allocate(512, "buf2");
-
-    try buf1.write(0, "abc");
-    try buf2.write(0, "xyz");
-
-    var out1: [3]u8 = undefined;
-    var out2: [3]u8 = undefined;
-    try buf1.read(0, &out1);
-    try buf2.read(0, &out2);
-
-    try testing.expectEqualSlices(u8, "abc", &out1);
-    try testing.expectEqualSlices(u8, "xyz", &out2);
 }
 
 test "gpu_memory.zero-copy slice access" {

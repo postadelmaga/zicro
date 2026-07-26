@@ -233,8 +233,7 @@ pub const Scroll = struct {
     /// Primary-button press at `(x,y)`. Grabs a thumb (or jumps it under the cursor) if the
     /// press lands on a bar. Returns true if it started a drag.
     pub fn onButtonDown(self: *Scroll, x: f32, y: f32) bool {
-        var d: u8 = 1;
-        while (true) : (d -%= 1) {
+        for ([_]u8{ 1, 0 }) |d| { // vertical bar first, then horizontal
             if (self.overBarStrip(d, x, y)) {
                 const seg = self.thumbSeg(d);
                 const p = if (d == 1) y else x;
@@ -243,7 +242,6 @@ pub const Scroll = struct {
                 self.dragTo(d, p);
                 return true;
             }
-            if (d == 0) break;
         }
         return false;
     }

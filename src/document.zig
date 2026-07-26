@@ -57,11 +57,6 @@ pub fn History(comptime S: type) type {
             deinitState(S, self.gpa, &self.present);
         }
 
-        /// The current state.
-        pub fn present_(self: *const Self) *const S {
-            return &self.present;
-        }
-
         pub fn canUndo(self: *const Self) bool {
             return self.past.items.len > 0;
         }
@@ -112,10 +107,6 @@ pub fn History(comptime S: type) type {
     };
 }
 
-/// The undo/redo verbs as a serializable action an app can route over the bus and turn
-/// into [`Doc.undo`] / [`Doc.redo`] calls. (Serializes as `"undo"` / `"redo"`.)
-pub const HistoryAction = enum { undo, redo };
-
 /// The application document: state `S` behind an undo/redo [`History`], mutated only by
 /// dispatching serializable actions `A` through a fixed reducer.
 ///
@@ -158,7 +149,7 @@ pub fn Doc(comptime S: type, comptime A: type) type {
 
         /// The current state.
         pub fn state(self: *const Self) *const S {
-            return self.history.present_();
+            return &self.history.present;
         }
 
         /// Apply an action transactionally: the reducer runs against a clone, and only a

@@ -62,11 +62,11 @@ pub const Inbox = struct {
     /// The receiver is gone — pushes are pointless; publisher prunes on sight.
     receiver_gone: bool = false,
 
-    pub fn create(gpa: Allocator, capacity: usize, initial_refs: usize, space: *SpaceSignal) Allocator.Error!*Inbox {
+    pub fn create(gpa: Allocator, capacity: usize, space: *SpaceSignal) Allocator.Error!*Inbox {
         const inbox = try gpa.create(Inbox);
         errdefer gpa.destroy(inbox);
         const items = try gpa.alloc(*Shared, @max(capacity, 1));
-        inbox.* = .{ .gpa = gpa, .refs = .init(initial_refs), .items = items, .space = space.retain() };
+        inbox.* = .{ .gpa = gpa, .refs = .init(1), .items = items, .space = space.retain() };
         return inbox;
     }
 

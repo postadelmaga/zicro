@@ -5,7 +5,9 @@
 //! usual zicro CPU path: the app draws into an RGBA buffer; here `blit` copies it into a
 //! locked `ANativeWindow` surface (respecting its stride) and posts it. Input comes from
 //! the activity's `AInputQueue` as `AInputEvent`s — touch → pointer motion/press/release,
-//! hardware/soft keys → `on_key`.
+//! hardware/soft keys → `on_key`, translated from `AKEYCODE_*` to the same evdev codes
+//! the other backends emit (`androidToEvdev`) — the cross-platform contract every
+//! `on_key` handler relies on.
 //!
 //! The Android activity lifecycle is inverted (the framework owns the loop and hands us
 //! the window asynchronously), so an app's entry is `android_main(*android_app)` from
@@ -100,6 +102,10 @@ const APP_CMD_WINDOW_RESIZED: i32 = 3;
 const APP_CMD_CONFIG_CHANGED: i32 = 8;
 
 const BTN_LEFT: u32 = 272; // touch maps to the left-button contract the toolkit expects
+
+/// Log draw/present timing to logcat every 60 frames. Off by default — flip to debug a
+/// slow rasterizer; the two extra clock reads per frame aren't worth paying always.
+const frame_log = false;
 
 /// Monotonic clock in nanoseconds (std.time lost its timestamp helpers; the syscall is
 /// right there). Used only for the frame profile.
@@ -227,6 +233,12 @@ pub const Window = struct {
         return s;
     }
 
+    /// A phone/tablet is touch-primary by definition (parity with the web backend's
+    /// `isTouch`, so cross-platform code asks one question everywhere).
+    pub fn isTouch(_: *const Window) bool {
+        return true;
+    }
+
     /// Touch coordinates arrive in DISPLAY pixels; the app draws in SURFACE pixels. When the
     /// surface is smaller, every pointer position must be scaled or the taps land off-target.
     fn touchScale(self: *const Window) f32 {
@@ -295,24 +307,27 @@ pub const Window = struct {
                 continue;
             }
             if (self.frames == 0) _ = __android_log_print(4, "zicro", "primo frame: %dx%d user=%d", self.width, self.height, @as(c_int, @intFromBool(self.opts.user != null)));
-            const t0 = nowNs();
+            const t0 = if (frame_log) nowNs() else 0;
             var canvas = paint.Canvas.initRgba8(self.backbuf[0 .. self.width * self.height], self.width, self.height);
             if (self.opts.on_draw) |draw| draw(&canvas, self.contentRect(), self.opts.user);
-            const t1 = nowNs();
+            const t1 = if (frame_log) nowNs() else 0;
             const bytes: [*]const u8 = @ptrCast(self.backbuf.ptr);
             self.presentRgba(self.width, self.height, bytes[0 .. @as(usize, self.width) * self.height * 4]);
-            const t2 = nowNs();
-            // Profilo del frame (ZICRO_FRAME_LOG): quanto costa DAVVERO disegnare e quanto
-            // postare. Senza questi due numeri, ottimizzare un rasterizzatore è tirare a
-            // indovinare; con questi, si sa subito da che parte sta il collo di bottiglia.
-            self.frame_ns += t1 - t0;
-            self.present_ns += t2 - t1;
+            // `frames` also gates the "first frame" log above, so it counts regardless of
+            // `frame_log`; only the extra clock reads and the periodic log are conditional.
             self.frames += 1;
-            if (self.frames == 60) {
-                _ = __android_log_print(4, "zicro", "frame: draw %.1f ms · present %.1f ms (%dx%d)", @as(f64, @floatFromInt(self.frame_ns)) / 60e6, @as(f64, @floatFromInt(self.present_ns)) / 60e6, self.width, self.height);
-                self.frames = 0;
-                self.frame_ns = 0;
-                self.present_ns = 0;
+            // Frame profile: how much draw vs. present really costs. Without these two
+            // numbers, optimizing a rasterizer is guesswork; with them, the bottleneck is
+            // immediately visible in logcat.
+            if (frame_log) {
+                const t2 = nowNs();
+                self.frame_ns += t1 - t0;
+                self.present_ns += t2 - t1;
+                if (self.frames % 60 == 0) {
+                    _ = __android_log_print(4, "zicro", "frame: draw %.1f ms · present %.1f ms (%dx%d)", @as(f64, @floatFromInt(self.frame_ns)) / 60e6, @as(f64, @floatFromInt(self.present_ns)) / 60e6, self.width, self.height);
+                    self.frame_ns = 0;
+                    self.present_ns = 0;
+                }
             }
         }
     }
@@ -397,10 +412,36 @@ pub const Window = struct {
                 const pressed = AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_DOWN;
                 const code: u32 = @intCast(@max(AKeyEvent_getKeyCode(event), 0));
                 self.dirty = true;
-                if (self.opts.on_key) |cb| cb(self, code, @intFromBool(pressed), self.opts.user);
+                if (self.opts.on_key) |cb| cb(self, androidToEvdev(code), @intFromBool(pressed), self.opts.user);
                 return 1;
             },
             else => return 0,
         }
     }
 };
+
+/// Android `AKEYCODE_*` → evdev, so `on_key` handlers and the shared keymap see the same
+/// codes on every OS (as Win32 translates VK codes and Wayland emits evdev natively).
+/// Covers the letters/digits/space/editing keys a soft keyboard produces; unmapped codes
+/// pass through unchanged.
+fn androidToEvdev(code: u32) u32 {
+    return switch (code) {
+        29...54 => evdev_a_table[code - 29], // A..Z (AKEYCODE_A=29); evdev letters aren't contiguous
+        7 => 11, // 0
+        8...16 => code - 8 + 2, // 1..9 → evdev 2..10
+        62 => 57, // SPACE
+        66 => 28, // ENTER
+        67 => 14, // DEL (backspace)
+        112 => 111, // FORWARD_DEL → evdev Delete
+        59, 60 => 42, // SHIFT_LEFT/RIGHT → LeftShift
+        21 => 105, // DPAD_LEFT
+        22 => 106, // DPAD_RIGHT
+        19 => 103, // DPAD_UP
+        20 => 108, // DPAD_DOWN
+        4 => 1, // BACK → Esc
+        else => code,
+    };
+}
+
+// Letters: AKEYCODE_A..Z (29..54) map to evdev by position (evdev letters aren't contiguous).
+const evdev_a_table = [26]u32{ 30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44 };

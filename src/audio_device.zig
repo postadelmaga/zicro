@@ -142,9 +142,10 @@ const NullIn = struct {
     fn close(_: *NullIn) void {}
 };
 
-// ── Windows: winmm waveOut ──────────────────────────────────────────────────
-const WaveOut = struct {
-    const HWAVEOUT = *anyopaque;
+// ── Windows: winmm shared constants/types/decls (WaveOut and WaveIn are otherwise
+// identical mirror images of each other over waveOut*/waveIn* — one home for the
+// bytes-on-the-wire shape they share). ─────────────────────────────────────────
+const winmm = struct {
     const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
     const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
     const CALLBACK_NULL: u32 = 0;
@@ -172,13 +173,28 @@ const WaveOut = struct {
         reserved: usize = 0,
     };
 
+    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+};
+
+// ── Windows: winmm waveOut ──────────────────────────────────────────────────
+const WaveOut = struct {
+    const HWAVEOUT = *anyopaque;
+    const WAVE_MAPPER = winmm.WAVE_MAPPER;
+    const WAVE_FORMAT_IEEE_FLOAT = winmm.WAVE_FORMAT_IEEE_FLOAT;
+    const CALLBACK_NULL = winmm.CALLBACK_NULL;
+    const WHDR_DONE = winmm.WHDR_DONE;
+    const WHDR_PREPARED = winmm.WHDR_PREPARED;
+    const MMSYSERR_NOERROR = winmm.MMSYSERR_NOERROR;
+    const WAVEFORMATEX = winmm.WAVEFORMATEX;
+    const WAVEHDR = winmm.WAVEHDR;
+    const Sleep = winmm.Sleep;
+
     extern "winmm" fn waveOutOpen(phwo: *HWAVEOUT, uDeviceID: u32, pwfx: *const WAVEFORMATEX, cb: usize, inst: usize, flags: u32) callconv(.winapi) u32;
     extern "winmm" fn waveOutPrepareHeader(hwo: HWAVEOUT, pwh: *WAVEHDR, cb: u32) callconv(.winapi) u32;
     extern "winmm" fn waveOutUnprepareHeader(hwo: HWAVEOUT, pwh: *WAVEHDR, cb: u32) callconv(.winapi) u32;
     extern "winmm" fn waveOutWrite(hwo: HWAVEOUT, pwh: *WAVEHDR, cb: u32) callconv(.winapi) u32;
     extern "winmm" fn waveOutReset(hwo: HWAVEOUT) callconv(.winapi) u32;
     extern "winmm" fn waveOutClose(hwo: HWAVEOUT) callconv(.winapi) u32;
-    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
     const NBUF = 8; // WAVEHDR pool: queue depth ~ NBUF × block size
 
@@ -266,16 +282,15 @@ const WaveOut = struct {
 // ── Windows: winmm waveIn (dual of WaveOut) ─────────────────────────────────
 const WaveIn = struct {
     const HWAVEIN = *anyopaque;
-    const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
-    const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
-    const CALLBACK_NULL: u32 = 0;
-    const WHDR_DONE: u32 = 0x0000_0001;
-    const WHDR_PREPARED: u32 = 0x0000_0002;
-    const MMSYSERR_NOERROR: u32 = 0;
-
-    // WAVEFORMATEX / WAVEHDR are laid out exactly as WaveOut's; reuse those declarations.
-    const WAVEFORMATEX = WaveOut.WAVEFORMATEX;
-    const WAVEHDR = WaveOut.WAVEHDR;
+    const WAVE_MAPPER = winmm.WAVE_MAPPER;
+    const WAVE_FORMAT_IEEE_FLOAT = winmm.WAVE_FORMAT_IEEE_FLOAT;
+    const CALLBACK_NULL = winmm.CALLBACK_NULL;
+    const WHDR_DONE = winmm.WHDR_DONE;
+    const WHDR_PREPARED = winmm.WHDR_PREPARED;
+    const MMSYSERR_NOERROR = winmm.MMSYSERR_NOERROR;
+    const WAVEFORMATEX = winmm.WAVEFORMATEX;
+    const WAVEHDR = winmm.WAVEHDR;
+    const Sleep = winmm.Sleep;
 
     extern "winmm" fn waveInOpen(phwi: *HWAVEIN, uDeviceID: u32, pwfx: *const WAVEFORMATEX, cb: usize, inst: usize, flags: u32) callconv(.winapi) u32;
     extern "winmm" fn waveInPrepareHeader(hwi: HWAVEIN, pwh: *WAVEHDR, cb: u32) callconv(.winapi) u32;
@@ -285,7 +300,6 @@ const WaveIn = struct {
     extern "winmm" fn waveInStop(hwi: HWAVEIN) callconv(.winapi) u32;
     extern "winmm" fn waveInReset(hwi: HWAVEIN) callconv(.winapi) u32;
     extern "winmm" fn waveInClose(hwi: HWAVEIN) callconv(.winapi) u32;
-    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
     const NBUF = 8; // WAVEHDR pool: queue depth ~ NBUF × block size
 

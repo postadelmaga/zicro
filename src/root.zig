@@ -59,7 +59,6 @@ pub const shmem = @import("shmem.zig");
 
 // -- GPU memory: autonomous, format-agnostic, API-bindable
 pub const gpu_memory = @import("gpu_memory.zig");
-pub const gpu_vulkan = @import("gpu_vulkan.zig");
 
 // -- the short names an app usually wants
 pub const Envelope = protocol.Envelope;
@@ -75,6 +74,16 @@ pub const WorldModule = app.WorldModule;
 
 /// The golden ratio, φ — the substrate's default proportion (see `proportion`).
 pub const phi = proportion.phi;
+
+/// The target-portable substrate surface: every name listed here must also be
+/// re-exported by `web_root.zig` and `android_root.zig`. Those files carry a comptime
+/// guard over this list, so forgetting a re-export fails the web/android build in this
+/// repo instead of surfacing as a missing symbol in a downstream app.
+pub const substrate_decls = [_][]const u8{
+    "paint",  "paint_gl", "text",       "theme",     "anim", "keymap",
+    "scroll", "widget",   "gesture",    "proportion", "phi", "clipboard",
+    "wl",     "window",
+};
 
 const sync = @import("sync.zig");
 
@@ -104,7 +113,6 @@ test {
     _ = ipc;
     _ = shmem;
     _ = gpu_memory;
-    _ = gpu_vulkan;
     _ = text;
     _ = paint;
     _ = widget;
@@ -112,4 +120,7 @@ test {
     _ = window;
     _ = gesture;
     _ = proportion;
+    _ = clipboard;
+    _ = theme;
+    _ = paint_gl;
 }

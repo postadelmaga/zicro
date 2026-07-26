@@ -14,8 +14,8 @@
 //!
 //! ## Why `@cImport` and not a hand-rolled FFI
 //!
-//! `gpu_vulkan.zig` next door is hand-written, because Vulkan's real header is a
-//! hundred thousand generated lines and we use a few dozen of them. `webgpu.h` is the
+//! A hand-written FFI makes sense when the real header is a hundred thousand generated
+//! lines and only a few dozen are used. `webgpu.h` is the
 //! opposite animal: 6,700 lines describing a small, stable, deliberately C-shaped ABI,
 //! most of it chained structs whose layout must be exact. Retyping those by hand is a
 //! bug farm with no upside — translate-c gets them right for free, and gets them right

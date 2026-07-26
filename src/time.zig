@@ -15,10 +15,45 @@
 //! the bus.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const sync = @import("sync.zig");
 const core = @import("core.zig");
+
+/// Monotonic milliseconds straight from the OS, no `std.Io` (0.16 keeps the ambient
+/// clocks behind `Io`; UI pacing — caret blink, key repeat, animations — only needs a
+/// raw monotonic read). This is the one shared OS clock: widget.nowMs and the window
+/// backends delegate here instead of each hand-declaring its own. Wasm has no OS clock
+/// and never calls this — the web backend feeds the browser's rAF timestamp through
+/// `widget.web_now_ms`.
+pub fn monotonicMs() i64 {
+    switch (builtin.os.tag) {
+        .windows => {
+            // Hand-declared: this std fork's kernel32 has no GetTickCount64.
+            const k32 = struct {
+                extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+            };
+            return @intCast(k32.GetTickCount64());
+        },
+        .macos => {
+            // Raw libc; Darwin's CLOCK_MONOTONIC is id 6.
+            const c = struct {
+                const Timespec = extern struct { sec: i64, nsec: i64 };
+                const CLOCK_MONOTONIC: c_int = 6;
+                extern "c" fn clock_gettime(clockid: c_int, tp: *Timespec) c_int;
+            };
+            var ts: c.Timespec = undefined;
+            if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+            return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
+        },
+        else => {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+            return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+        },
+    }
+}
 
 /// The longest a `Clock` will sleep in one go, so it can observe shutdown promptly even
 /// at very low tick rates.

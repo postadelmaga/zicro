@@ -18,75 +18,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // stb_truetype FONT RASTERIZER (Hack regular+bold fonts embedded)
-    zicro.addIncludePath(b.path("vendor/stb"));
-    zicro.addCSourceFile(.{
-        .file = b.path("vendor/stb/stb_truetype_impl.c"),
-        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-    });
-
-    // Linux-specific Wayland support
-    if (target.result.os.tag == .linux) {
-        zicro.linkSystemLibrary("wayland-client", .{});
-        zicro.linkSystemLibrary("asound", .{}); // ALSA: backend audio (audio_device.zig)
-
-        // PipeWire: low-latency audio backend, preferred over ALSA at runtime when a
-        // PipeWire graph is reachable. The pull-model pw_stream is bridged to zicro's
-        // blocking device contract by the audio_pw.c shim (SPA format PODs live in C).
-        zicro.linkSystemLibrary("libpipewire-0.3", .{}); // pkg-config: adds the include dirs too
-        zicro.addCSourceFile(.{
-            .file = b.path("src/audio_pw.c"),
-            .flags = &.{ "-O2", "-D_REENTRANT", "-fno-sanitize=undefined" },
-        });
-
-        // We only need the xdg-shell stable protocol for basic windowing
-        const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
-        const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        scan.addFileArg(.{ .cwd_relative = xml });
-        const c_file = scan.addOutputFileArg("protocol.c");
-        zicro.addCSourceFile(.{ .file = c_file });
-        // xdg-decoration: server-side window frames (title bar, close/min/max
-        // from the compositor) for windows that opt in via Options.decorations.
-        const deco_xml = "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml";
-        const deco_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        deco_scan.addFileArg(.{ .cwd_relative = deco_xml });
-        const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
-        zicro.addCSourceFile(.{ .file = deco_c });
-        // cursor-shape-v1: server-driven cursor themes (wl.zig/window_wayland.zig).
-        // Its get_tablet_tool_v2 request pulls in zwp_tablet_tool_v2_interface, so
-        // tablet-v2's private-code must be linked too even though we only drive the
-        // wl_pointer path — otherwise that interface symbol stays undefined.
-        const cursor_xml = "/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml";
-        const cursor_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        cursor_scan.addFileArg(.{ .cwd_relative = cursor_xml });
-        const cursor_c = cursor_scan.addOutputFileArg("cursor-shape-v1.c");
-        zicro.addCSourceFile(.{ .file = cursor_c });
-        const tablet_xml = "/usr/share/wayland-protocols/stable/tablet/tablet-v2.xml";
-        const tablet_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        tablet_scan.addFileArg(.{ .cwd_relative = tablet_xml });
-        const tablet_c = tablet_scan.addOutputFileArg("tablet-v2.c");
-        zicro.addCSourceFile(.{ .file = tablet_c });
-
-        const appmenu_xml = "/usr/share/qt6/wayland/protocols/appmenu/appmenu.xml";
-        const appmenu_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        appmenu_scan.addFileArg(.{ .cwd_relative = appmenu_xml });
-        const appmenu_c = appmenu_scan.addOutputFileArg("appmenu.c");
-        zicro.addCSourceFile(.{ .file = appmenu_c });
-    }
-    // winmm: backend audio waveOut (audio_device.zig) su Windows.
-    if (target.result.os.tag == .windows) zicro.linkSystemLibrary("winmm", .{});
-
-    // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
-    // Only libobjc and the CG functions are needed at LINK time — AppKit classes resolve
-    // by name at runtime (objc_getClass), Cocoa is linked for its load command alone.
-    // Without a sysroot the vendored .tbd stubs make the link SDK-free (the zig way:
-    // zig itself links libSystem from a bundled stub).
-    if (target.result.os.tag == .macos) addMacosLinks(b, zicro, macos_sysroot);
+    addNativeDeps(b, zicro, target, macos_sysroot);
 
     // The WebGPU device — its OWN module, not part of `zicro`.
     //
     // zicro owns the device and the window; whoever is drawing owns the frame. So the
-    // wgpu binding lives here, next to `gpu_vulkan.zig` and the four window backends
+    // wgpu binding lives here, next to the window backends —
     // that are the only things in the stack that know what a surface is made of. It is
     // a separate module because the prebuilt library is ~50 MB and nothing that does
     // not ask for a wgpu device should link a byte of it.
@@ -151,45 +88,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
-    zicro_fast.addIncludePath(b.path("vendor/stb"));
-    zicro_fast.addCSourceFile(.{
-        .file = b.path("vendor/stb/stb_truetype_impl.c"),
-        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-    });
-    if (target.result.os.tag == .linux) {
-        zicro_fast.linkSystemLibrary("wayland-client", .{});
-        zicro_fast.linkSystemLibrary("asound", .{});
-        const xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
-        const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        scan.addFileArg(.{ .cwd_relative = xml });
-        const c_file = scan.addOutputFileArg("protocol.c");
-        zicro_fast.addCSourceFile(.{ .file = c_file });
-        const deco_xml = "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml";
-        const deco_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        deco_scan.addFileArg(.{ .cwd_relative = deco_xml });
-        const deco_c = deco_scan.addOutputFileArg("xdg-decoration.c");
-        zicro_fast.addCSourceFile(.{ .file = deco_c });
-        // cursor-shape-v1 (+ tablet-v2 for zwp_tablet_tool_v2_interface); see the
-        // Debug block above for why both are needed.
-        const cursor_xml = "/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml";
-        const cursor_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        cursor_scan.addFileArg(.{ .cwd_relative = cursor_xml });
-        const cursor_c = cursor_scan.addOutputFileArg("cursor-shape-v1.c");
-        zicro_fast.addCSourceFile(.{ .file = cursor_c });
-        const tablet_xml = "/usr/share/wayland-protocols/stable/tablet/tablet-v2.xml";
-        const tablet_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        tablet_scan.addFileArg(.{ .cwd_relative = tablet_xml });
-        const tablet_c = tablet_scan.addOutputFileArg("tablet-v2.c");
-        zicro_fast.addCSourceFile(.{ .file = tablet_c });
-
-        const appmenu_xml = "/usr/share/qt6/wayland/protocols/appmenu/appmenu.xml";
-        const appmenu_scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        appmenu_scan.addFileArg(.{ .cwd_relative = appmenu_xml });
-        const appmenu_c = appmenu_scan.addOutputFileArg("appmenu.c");
-        zicro_fast.addCSourceFile(.{ .file = appmenu_c });
-    }
-    if (target.result.os.tag == .windows) zicro_fast.linkSystemLibrary("winmm", .{});
-    if (target.result.os.tag == .macos) addMacosLinks(b, zicro_fast, macos_sysroot);
+    addNativeDeps(b, zicro_fast, target, macos_sysroot);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
@@ -293,6 +192,73 @@ pub fn build(b: *std.Build) void {
         .file = b.path("vendor/stb/stb_truetype_impl.c"),
         .flags = &.{ "-O2", "-fno-sanitize=undefined" },
     });
+}
+
+/// Everything a NATIVE zicro module links: the stb rasterizer plus the per-OS platform
+/// set. One function on purpose — the Debug `zicro` module and the bench's ReleaseFast
+/// twin call the same code, so they cannot drift apart (the bench once silently lost
+/// the PipeWire backend this way).
+fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, macos_sysroot: ?[]const u8) void {
+    // stb_truetype FONT RASTERIZER (Hack regular+bold fonts embedded)
+    mod.addIncludePath(b.path("vendor/stb"));
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_truetype_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
+
+    if (target.result.os.tag == .linux) {
+        mod.linkSystemLibrary("wayland-client", .{});
+        mod.linkSystemLibrary("asound", .{}); // ALSA: backend audio (audio_device.zig)
+
+        // PipeWire: low-latency audio backend, preferred over ALSA at runtime when a
+        // PipeWire graph is reachable. The pull-model pw_stream is bridged to zicro's
+        // blocking device contract by the audio_pw.c shim (SPA format PODs live in C).
+        mod.linkSystemLibrary("libpipewire-0.3", .{}); // pkg-config: adds the include dirs too
+        mod.addCSourceFile(.{
+            .file = b.path("src/audio_pw.c"),
+            .flags = &.{ "-O2", "-D_REENTRANT", "-fno-sanitize=undefined" },
+        });
+
+        // Wayland protocol glue, generated from the XMLs vendored in
+        // vendor/wayland-protocols/ (MIT; system paths vary per distro — the appmenu
+        // XML even required Qt6 dev files to be installed).
+        //   xdg-shell        — basic windowing
+        //   xdg-decoration   — server-side frames for windows that opt in (Options.decorations)
+        //   cursor-shape-v1  — server-driven cursor themes; its get_tablet_tool_v2 request
+        //                      pulls in zwp_tablet_tool_v2_interface, so tablet-v2 must be
+        //                      generated too even though only the wl_pointer path is driven
+        //   appmenu          — org_kde_kwin_appmenu (KDE global menu)
+        // The last four are consumed by zrame's backend (compositor blur, dmabuf video,
+        // HiDPI viewport/fractional scale): ALL interface tables are generated here, in
+        // one repo, because zrame links this module's C objects — a table generated in
+        // both repos collides at link time.
+        const protocols = [_][2][]const u8{
+            .{ "xdg-shell.xml", "xdg-shell.c" },
+            .{ "xdg-decoration-unstable-v1.xml", "xdg-decoration.c" },
+            .{ "cursor-shape-v1.xml", "cursor-shape-v1.c" },
+            .{ "tablet-v2.xml", "tablet-v2.c" },
+            .{ "appmenu.xml", "appmenu.c" },
+            .{ "ext-background-effect-v1.xml", "ext-background-effect-v1.c" },
+            .{ "linux-dmabuf-v1.xml", "linux-dmabuf-v1.c" },
+            .{ "viewporter.xml", "viewporter.c" },
+            .{ "fractional-scale-v1.xml", "fractional-scale-v1.c" },
+        };
+        for (protocols) |p| {
+            const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+            scan.addFileArg(b.path(b.pathJoin(&.{ "vendor", "wayland-protocols", p[0] })));
+            mod.addCSourceFile(.{ .file = scan.addOutputFileArg(p[1]) });
+        }
+    }
+
+    // winmm: backend audio waveOut (audio_device.zig) on Windows.
+    if (target.result.os.tag == .windows) mod.linkSystemLibrary("winmm", .{});
+
+    // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
+    // Only libobjc and the CG functions are needed at LINK time — AppKit classes resolve
+    // by name at runtime (objc_getClass), Cocoa is linked for its load command alone.
+    // Without a sysroot the vendored .tbd stubs make the link SDK-free (the zig way:
+    // zig itself links libSystem from a bundled stub).
+    if (target.result.os.tag == .macos) addMacosLinks(b, mod, macos_sysroot);
 }
 
 /// The macOS link set for a module: libobjc + Cocoa (load command) + CoreGraphics.

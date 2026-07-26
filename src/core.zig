@@ -160,13 +160,6 @@ pub const ModuleCtx = struct {
         return ctx.bus_ptr.publishMsg(ctx.id, channel, msg);
     }
 
-    /// Publish a typed message on a [`Topic`] — the compiler-checked form of
-    /// [`publishMsg`](ModuleCtx.publishMsg): the topic fixes both the channel *and* the
-    /// payload type, so a producer can't send the wrong shape on the wrong channel.
-    pub fn publishOn(ctx: *ModuleCtx, topic: anytype, msg: @TypeOf(topic).Payload) BusError!void {
-        return ctx.bus_ptr.publishMsg(ctx.id, topic.channel, msg);
-    }
-
     /// Block for the next envelope on a subscribed channel (`error.Disconnected` once the
     /// bus closes).
     pub fn recv(ctx: *ModuleCtx) BusError!Msg {

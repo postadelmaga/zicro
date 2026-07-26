@@ -27,6 +27,11 @@ pub const AudioBlock = media.AudioBlock;
 pub const AudioOut = struct {
     ptr: *anyopaque,
     playFn: *const fn (*anyopaque, *const AudioBlock) void,
+    /// Set by `of()` only when `T` has `pub fn playRaw(self: *T, samples: []const f32) void`
+    /// (e.g. `audio_device.DeviceOut`) — an allocation-free submit path for a caller that
+    /// already owns its scratch buffer (see `playRaw` below). `null` for sinks without one
+    /// (e.g. the test `Recorder`), which only ever go through `play`'s `AudioBlock`.
+    playRawFn: ?*const fn (*anyopaque, []const f32) void = null,
 
     /// Wrap any type with `pub fn play(self: *T, block: *const AudioBlock) void`.
     pub fn of(comptime T: type, instance: *T) AudioOut {
@@ -35,12 +40,29 @@ pub const AudioOut = struct {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 self.play(block);
             }
+            fn playRaw(ptr: *anyopaque, samples: []const f32) void {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                self.playRaw(samples);
+            }
         };
-        return .{ .ptr = instance, .playFn = Impl.play };
+        return .{
+            .ptr = instance,
+            .playFn = Impl.play,
+            .playRawFn = if (@hasDecl(T, "playRaw")) Impl.playRaw else null,
+        };
     }
 
     pub fn play(out: AudioOut, block: *const AudioBlock) void {
         out.playFn(out.ptr, block);
+    }
+
+    /// Submit raw interleaved samples with no `AudioBlock` allocation, if the wrapped
+    /// device supports it. Returns `false` (submits nothing) when it doesn't — the caller
+    /// falls back to wrapping the samples in a block and calling `play`.
+    pub fn playRaw(out: AudioOut, samples: []const f32) bool {
+        const f = out.playRawFn orelse return false;
+        f(out.ptr, samples);
+        return true;
     }
 };
 

@@ -91,10 +91,16 @@ pub const AudioPipeline = struct {
             const used = scratch[0 .. frames * ch];
             // The whole chain runs inline, on this thread — no bus, no per-stage channel.
             for (self.processors) |p| p.process(used, self.channels);
-            // Wrap once for the device contract (AudioOut borrows the block).
-            var block = try AudioBlock.init(ctx.gpa, self.rate, self.channels, used);
-            defer block.deinit();
-            self.out.play(&block);
+            // The hot path: submit straight from `scratch`, no `AudioBlock` alloc+copy+rc
+            // (this loop already promised "no allocation, no ref-counting, no
+            // serialization per stage" — `play`'s block wrapping broke that promise for
+            // every device that doesn't need it). Falls back to `play` only for a sink
+            // with no `playRaw` (e.g. the test `Recorder`).
+            if (!self.out.playRaw(used)) {
+                var block = try AudioBlock.init(ctx.gpa, self.rate, self.channels, used);
+                defer block.deinit();
+                self.out.play(&block);
+            }
         }
     }
 };

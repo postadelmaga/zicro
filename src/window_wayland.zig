@@ -520,44 +520,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         sync.unlock(&self.mutex, self.io);
 
         if (self.front.width > 0) {
+            // Centered source-over blit of the staged straight-RGBA frame; paint.zig
+            // owns the blend (the canvas is premultiplied ARGB).
             const fw = @min(self.front.width, bw);
             const fh = @min(self.front.height, bh);
-            const dx = (bw - fw) / 2;
-            const dy = (bh - fh) / 2;
-            // Simplified blit: directly copy or blend pixels
-            var y: u32 = 0;
-            while (y < fh) : (y += 1) {
-                const src_row = self.front.pixels.items[y * self.front.width * 4 ..][0 .. fw * 4];
-                const dst_row = slot.pixels[(dy + y) * bw + dx ..][0..fw];
-                for (dst_row, 0..) |*dst, x| {
-                    const sa = src_row[x * 4 + 3];
-                    if (sa == 255) {
-                        const r = src_row[x * 4 + 0];
-                        const g = src_row[x * 4 + 1];
-                        const b = src_row[x * 4 + 2];
-                        dst.* = (@as(u32, sa) << 24) | (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
-                    } else if (sa > 0) {
-                        // Simple alpha blending
-                        const alpha = @as(f32, @floatFromInt(sa)) / 255.0;
-                        const inv_alpha = 1.0 - alpha;
-                        const r_src = @as(f32, @floatFromInt(src_row[x * 4 + 0]));
-                        const g_src = @as(f32, @floatFromInt(src_row[x * 4 + 1]));
-                        const b_src = @as(f32, @floatFromInt(src_row[x * 4 + 2]));
-
-                        const dst_val = dst.*;
-                        const r_dst = @as(f32, @floatFromInt((dst_val >> 16) & 0xFF));
-                        const g_dst = @as(f32, @floatFromInt((dst_val >> 8) & 0xFF));
-                        const b_dst = @as(f32, @floatFromInt(dst_val & 0xFF));
-                        const a_dst = @as(f32, @floatFromInt((dst_val >> 24) & 0xFF));
-
-                        const r_out = @as(u32, @intFromFloat(r_src * alpha + r_dst * inv_alpha));
-                        const g_out = @as(u32, @intFromFloat(g_src * alpha + g_dst * inv_alpha));
-                        const b_out = @as(u32, @intFromFloat(b_src * alpha + b_dst * inv_alpha));
-                        const a_out = @as(u32, @intFromFloat(255.0 * alpha + a_dst * inv_alpha));
-                        dst.* = (a_out << 24) | (r_out << 16) | (g_out << 8) | b_out;
-                    }
-                }
-            }
+            const dx: i32 = @intCast((bw - fw) / 2);
+            const dy: i32 = @intCast((bh - fh) / 2);
+            canvas.blitImage(dx, dy, fw, fh, self.front.pixels.items, self.front.width, self.front.height);
         }
 
         const surface = self.surface.?;
@@ -776,12 +745,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.repeat_down = false; // focus gone: the release will never arrive
     }
 
-    /// Monotonic milliseconds (std.time.milliTimestamp lives behind std.Io
-    /// in Zig 0.16; the repeat pacing only needs a raw monotonic clock).
+    /// Monotonic milliseconds for the repeat pacing (the shared OS clock).
     fn nowMs() i64 {
-        var ts: linux.timespec = undefined;
-        _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
-        return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+        return @import("time.zig").monotonicMs();
     }
 
     /// Modifiers hold state rather than produce input: never auto-repeated
@@ -894,37 +860,17 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.pointer_serial = serial;
         const target = self.pointer_target orelse self;
 
-        var handled = false;
-        if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and !target.fullscreen) {
-            const w = @as(f32, @floatFromInt(target.width));
-            const h = @as(f32, @floatFromInt(target.height));
-            const border: f32 = 8.0;
-
-            const px = self.pointer_x;
-            const py = self.pointer_y;
-            
-            var edge: u32 = wl.RESIZE_EDGE_NONE;
-            if (px < border) {
-                if (py < border) { edge = wl.RESIZE_EDGE_TOP_LEFT; }
-                else if (py > h - border) { edge = wl.RESIZE_EDGE_BOTTOM_LEFT; }
-                else { edge = wl.RESIZE_EDGE_LEFT; }
-            } else if (px > w - border) {
-                if (py < border) { edge = wl.RESIZE_EDGE_TOP_RIGHT; }
-                else if (py > h - border) { edge = wl.RESIZE_EDGE_BOTTOM_RIGHT; }
-                else { edge = wl.RESIZE_EDGE_RIGHT; }
-            } else if (py < border) {
-                edge = wl.RESIZE_EDGE_TOP;
-            } else if (py > h - border) {
-                edge = wl.RESIZE_EDGE_BOTTOM;
-            }
-            
+        // Client-side edge resize only for borderless windows (same guard as the
+        // motion path's resize cursors — server-decorated windows own their frame).
+        if (button == 272 and state == wl.KEYBOARD_KEY_STATE_PRESSED and
+            !target.fullscreen and !target.opts.decorations)
+        {
+            const edge = target.resizeEdgeAt(self.pointer_x, self.pointer_y);
             if (edge != wl.RESIZE_EDGE_NONE) {
-                if (self.seat) |seat| { target.toplevel.?.resize(seat, serial, edge); }
-                handled = true;
+                if (self.seat) |seat| target.toplevel.?.resize(seat, serial, edge);
+                return;
             }
         }
-
-        if (handled) return;
 
         if (target.opts.on_mouse) |cb| {
             const kind: window.MouseEvent.Kind = if (state == wl.KEYBOARD_KEY_STATE_PRESSED) .press else .release;

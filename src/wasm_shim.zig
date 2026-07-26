@@ -17,7 +17,8 @@ const std = @import("std");
 // window that draws every shape and not one letter. So on emscripten these shims defer
 // to the libc that is actually present. (This file's header says native builds link real
 // libc and never see it; emscripten links real libc AND sees it, which is the gap.)
-const gpa = if (@import("builtin").os.tag == .emscripten)
+/// The one wasm heap, shared with the rest of the web build (window_web's framebuffer).
+pub const gpa = if (@import("builtin").os.tag == .emscripten)
     std.heap.c_allocator
 else
     std.heap.wasm_allocator;

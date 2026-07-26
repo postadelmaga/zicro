@@ -227,22 +227,9 @@ pub const Font = struct {
 
     /// Width in pixels of `s` (sum of advances + kerning), for centering/aligning.
     pub fn measure(self: *Font, px: u16, style: Style, s: []const u8) i32 {
-        var width: f32 = 0.0;
-        var prev_cp: ?u32 = null;
-        var i: usize = 0;
-        while (i < s.len) {
-            const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-            const end = @min(i + seq, s.len);
-            const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
-            i = end;
-            const g = self.getGlyph(px, style, 0, cp) catch continue;
-            if (prev_cp) |prev| {
-                width += self.getKernAdvance(style, px, prev, cp);
-            }
-            width += g.advance;
-            prev_cp = cp;
-        }
-        return @intFromFloat(@round(width));
+        var w: GlyphWalker = .init(self, px, style, s);
+        while (w.next()) |_| {}
+        return @intFromFloat(@round(w.pen_x));
     }
 
     pub fn deinit(self: *Font) void {
@@ -253,6 +240,55 @@ pub const Font = struct {
         }
         for (self.fallbacks.items) |f| if (f.owned) |b| self.gpa.free(b);
         self.fallbacks.deinit(self.gpa);
+    }
+};
+
+/// Walks a string glyph by glyph, advancing the pen with kerning and (optionally)
+/// subpixel-quantized positioning — the exact math `Canvas.drawText` (CPU and GL) and
+/// `Font.measure` all need, so it lives once here instead of three times.
+pub const GlyphWalker = struct {
+    font: *Font,
+    px: u16,
+    style: Style,
+    s: []const u8,
+    i: usize = 0,
+    /// Left edge of the pen, updated as glyphs are consumed.
+    pen_x: f32 = 0,
+    prev_cp: ?u32 = null,
+    /// Quantize `pen_x`'s fraction into `glyph.sub_x` (crisp small text at fixed pixel
+    /// sizes); off for `measure`, which only wants the total advance.
+    subpixel: bool = false,
+
+    pub fn init(font: *Font, px: u16, style: Style, s: []const u8) GlyphWalker {
+        return .{ .font = font, .px = px, .style = style, .s = s };
+    }
+
+    pub fn initAt(font: *Font, px: u16, style: Style, s: []const u8, pen_x: f32) GlyphWalker {
+        return .{ .font = font, .px = px, .style = style, .s = s, .pen_x = pen_x, .subpixel = true };
+    }
+
+    /// One glyph and the pen position (rounded, pixel) to draw it at. `null` at end of
+    /// string; advances `pen_x` by the glyph's width so the next call continues the run.
+    pub fn next(w: *GlyphWalker) ?struct { glyph: *const Glyph, pen_x: i32 } {
+        if (w.i >= w.s.len) return null;
+        const seq = std.unicode.utf8ByteSequenceLength(w.s[w.i]) catch 1;
+        const end = @min(w.i + seq, w.s.len);
+        const cp: u32 = std.unicode.utf8Decode(w.s[w.i..end]) catch w.s[w.i];
+        w.i = end;
+
+        if (w.prev_cp) |prev| w.pen_x += w.font.getKernAdvance(w.style, w.px, prev, cp);
+        w.prev_cp = cp;
+
+        const sub_x: u2 = if (w.subpixel)
+            @intCast(@as(i32, @intFromFloat(@round((w.pen_x - @floor(w.pen_x)) * 4.0))) & 3)
+        else
+            0;
+        const glyph = w.font.getGlyph(w.px, w.style, sub_x, cp) catch {
+            return w.next(); // skip a glyph the font can't rasterize; keep walking
+        };
+        const ipen_x: i32 = @intFromFloat(@floor(w.pen_x + 0.5));
+        w.pen_x += glyph.advance;
+        return .{ .glyph = glyph, .pen_x = ipen_x };
     }
 };
 

@@ -53,7 +53,17 @@ pub const Vertex = extern struct {
     tex: f32 = 0,
 };
 
-const Slot = struct { x: u32, y: u32, w: u32, h: u32 };
+const Slot = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    /// Debug-only fingerprint of the bytes copied in for this slot (see `ensureSlot`'s
+    /// doc: the atlas key is a raw pointer, so this catches a freed-and-reallocated
+    /// source silently serving stale pixels — a `std.debug.assert`, compiled out in
+    /// ReleaseFast/ReleaseSmall).
+    fingerprint: if (std.debug.runtime_safety) u64 else void = if (std.debug.runtime_safety) 0 else {},
+};
 const Ensured = struct { slot: Slot, is_new: bool };
 
 pub const GlRecorder = struct {
@@ -122,10 +132,24 @@ pub const GlRecorder = struct {
         if (y0 < self.dirty_lo) self.dirty_lo = y0;
         if (y1 > self.dirty_hi) self.dirty_hi = y1;
     }
-    /// Slot per un bitmap (chiave = puntatore sorgente, statico per glifi/icone baked).
+    /// Slot per un bitmap. CONTRATTO: la chiave è il puntatore sorgente, non il contenuto
+    /// — corretto per bitmap STATICHE la cui vita eguaglia quella dell'atlante (i glifi
+    /// della font cache, le icone baked nel binario): il puntatore è stabile e univoco
+    /// per l'intera sessione. Una sorgente DINAMICA (un frame video, una thumbnail
+    /// rigenerata) NON va passata a `blitImage`/`blitImageRot`/`blitMask` su questo
+    /// backend: un buffer liberato e riallocato allo stesso indirizzo servirebbe i pixel
+    /// di un'altra immagine, e l'atlante non fa mai eviction. In Debug/ReleaseSafe un
+    /// fingerprint di `src` viene confrontato ad ogni cache-hit (vedi `Slot`) — una
+    /// violazione del contratto fallisce forte invece di servire pixel sbagliati.
     /// Alloca a scaffali; null se l'atlante è pieno. `is_new` → il chiamante copia i pixel.
-    fn ensureSlot(self: *GlRecorder, key: usize, w: u32, h: u32) ?Ensured {
-        if (self.slots.get(key)) |s| return .{ .slot = s, .is_new = false };
+    fn ensureSlot(self: *GlRecorder, key: usize, w: u32, h: u32, src: []const u8) ?Ensured {
+        const fp: if (std.debug.runtime_safety) u64 else void = if (std.debug.runtime_safety)
+            std.hash.Wyhash.hash(@intCast(w ^ h), src)
+        else {};
+        if (self.slots.get(key)) |s| {
+            if (std.debug.runtime_safety) std.debug.assert(s.fingerprint == fp);
+            return .{ .slot = s, .is_new = false };
+        }
         if (!self.ensureAtlas()) return null;
         if (w == 0 or h == 0 or w > atlas_dim or h > atlas_dim) return null;
         if (self.shelf_x + w + 1 > atlas_dim) {
@@ -134,7 +158,7 @@ pub const GlRecorder = struct {
             self.shelf_h = 0;
         }
         if (self.shelf_y + h + 1 > atlas_dim) return null; // atlante pieno
-        const s = Slot{ .x = self.shelf_x, .y = self.shelf_y, .w = w, .h = h };
+        const s = Slot{ .x = self.shelf_x, .y = self.shelf_y, .w = w, .h = h, .fingerprint = fp };
         self.shelf_x += w + 1;
         if (h + 1 > self.shelf_h) self.shelf_h = h + 1;
         self.slots.put(self.gpa, key, s) catch return null;
@@ -196,6 +220,10 @@ pub const GlRecorder = struct {
     }
 
     fn quad(self: *GlRecorder, x: f32, y: f32, w: f32, h: f32, proto: Vertex, tl: Color, bl: Color) void {
+        // Reserve all 6 vertices before appending any: on OOM this drops the whole quad
+        // instead of stranding a partial triangle (a stray corner of the ubershader's
+        // wrong mode/color on screen).
+        self.verts.ensureUnusedCapacity(self.gpa, 6) catch return;
         const pad: f32 = 1;
         const cs = [4][2]f32{ .{ x - pad, y - pad }, .{ x + w + pad, y - pad }, .{ x + w + pad, y + h + pad }, .{ x - pad, y + h + pad } };
         const cols = [4]Color{ tl, tl, bl, bl };
@@ -207,13 +235,14 @@ pub const GlRecorder = struct {
             v.g = cols[i].g;
             v.b = cols[i].b;
             v.a = cols[i].a;
-            self.verts.append(self.gpa, v) catch return;
+            self.verts.appendAssumeCapacity(v);
         }
     }
 
     /// Quad texturato con UV relative all'ATLANTE (dallo slot), 4 posizioni in ordine
     /// tl,tr,br,bl, tinta `col`, `mode` (2 full-color / 4 coverage).
     fn atlasQuad(self: *GlRecorder, pos: [4][2]f32, s: Slot, col: Color, mode: f32, clip: ?Clip) void {
+        self.verts.ensureUnusedCapacity(self.gpa, 6) catch return; // see `quad`'s rationale
         const cl = clipTuple(clip);
         const inv: f32 = 1.0 / @as(f32, @floatFromInt(atlas_dim));
         const ua = @as(f32, @floatFromInt(s.x)) * inv;
@@ -231,7 +260,7 @@ pub const GlRecorder = struct {
             vv.y = pos[i][1];
             vv.u = uv[i][0];
             vv.v = uv[i][1];
-            self.verts.append(self.gpa, vv) catch return;
+            self.verts.appendAssumeCapacity(vv);
         }
     }
 
@@ -249,6 +278,11 @@ pub const GlRecorder = struct {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
         self.quad(x, y, w, h, shapeProto(x, y, w, h, Corners.all(radius), 0, 0, clip), top, bottom);
     }
+    // APPROXIMATION: the ubershader has no "outside a circle" mode (only rounded-corner
+    // distance, `rnw/rne/rse/rsw`), so this draws a plain square instead of the CPU
+    // path's concave fillet — the Chrome-tab flare loses its curve on the GL backend
+    // until the shader grows a fifth mode for it. `cx`/`cy` (the arc center) are
+    // therefore unused here; kept in the signature to match `paint.GlBackend`.
     fn fillConcaveCorner(ptr: *anyopaque, x: f32, y: f32, size: f32, cx: f32, cy: f32, color: Color, clip: ?Clip) void {
         _ = cx;
         _ = cy;
@@ -263,6 +297,7 @@ pub const GlRecorder = struct {
         if (len < 1e-4) return;
         const nx = -dy / len * (width / 2);
         const ny = dx / len * (width / 2);
+        self.verts.ensureUnusedCapacity(self.gpa, 6) catch return; // see `quad`'s rationale
         const cl = clipTuple(clip);
         var v: Vertex = .{
             .r = color.r, .g = color.g, .b = color.b, .a = color.a,
@@ -273,7 +308,7 @@ pub const GlRecorder = struct {
         for ([6]usize{ 0, 1, 2, 0, 2, 3 }) |i| {
             v.x = p[i][0];
             v.y = p[i][1];
-            self.verts.append(self.gpa, v) catch return;
+            self.verts.appendAssumeCapacity(v);
         }
     }
     fn strokeRoundedRect(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: Color, clip: ?Clip) void {
@@ -283,7 +318,7 @@ pub const GlRecorder = struct {
     fn blitImage(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
         if (src.len == 0 or src_w == 0 or src_h == 0) return;
-        const e = self.ensureSlot(@intFromPtr(src.ptr), src_w, src_h) orelse return;
+        const e = self.ensureSlot(@intFromPtr(src.ptr), src_w, src_h, src) orelse return;
         if (e.is_new) self.copyRgba(e.slot, src);
         const x0: f32 = @floatFromInt(dst_x);
         const y0: f32 = @floatFromInt(dst_y);
@@ -294,7 +329,7 @@ pub const GlRecorder = struct {
     fn blitMask(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, tint: Color, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
         if (src.len == 0 or src_w == 0 or src_h == 0) return;
-        const e = self.ensureSlot(@intFromPtr(src.ptr), src_w, src_h) orelse return;
+        const e = self.ensureSlot(@intFromPtr(src.ptr), src_w, src_h, src) orelse return;
         if (e.is_new) self.copyCoverage(e.slot, src, 4, 3); // RGBA: coverage = canale alpha
         const x0: f32 = @floatFromInt(dst_x);
         const y0: f32 = @floatFromInt(dst_y);
@@ -305,7 +340,7 @@ pub const GlRecorder = struct {
     fn blitImageRot(ptr: *anyopaque, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
         if (src.len == 0 or src_w == 0 or src_h == 0) return;
-        const e = self.ensureSlot(@intFromPtr(src.ptr), src_w, src_h) orelse return;
+        const e = self.ensureSlot(@intFromPtr(src.ptr), src_w, src_h, src) orelse return;
         if (e.is_new) self.copyRgba(e.slot, src);
         const c = @cos(angle);
         const s = @sin(angle);
@@ -318,32 +353,18 @@ pub const GlRecorder = struct {
     }
     fn drawText(ptr: *anyopaque, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
-        var pen_x: f32 = @floatFromInt(x);
-        var prev_cp: ?u32 = null;
-        var i: usize = 0;
-        while (i < s.len) {
-            const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-            const end = @min(i + seq, s.len);
-            const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
-            i = end;
-            if (prev_cp) |prev| pen_x += font.getKernAdvance(opts.style, opts.size, prev, cp);
-            const frac = pen_x - @floor(pen_x);
-            const sub_x: u2 = @intCast(@as(i32, @intFromFloat(@round(frac * 4.0))) & 3);
-            const g = font.getGlyph(opts.size, opts.style, sub_x, cp) catch continue;
-            const ipen_x: f32 = @floor(pen_x + 0.5);
-            if (g.bitmap.len != 0 and g.w > 0 and g.h > 0) {
-                // chiave glifo: puntatore bitmap (stabile nella cache font). R8 coverage.
-                if (self.ensureSlot(@intFromPtr(g.bitmap.ptr), @intCast(g.w), @intCast(g.h))) |e| {
-                    if (e.is_new) self.copyCoverage(e.slot, g.bitmap, 1, 0);
-                    const x0 = ipen_x + @as(f32, @floatFromInt(g.xoff));
-                    const y0: f32 = @floatFromInt(baseline_y + g.yoff);
-                    const x1 = x0 + @as(f32, @floatFromInt(g.w));
-                    const y1 = y0 + @as(f32, @floatFromInt(g.h));
-                    self.atlasQuad(.{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } }, e.slot, opts.color, 4, clip);
-                }
-            }
-            pen_x += g.advance;
-            prev_cp = cp;
+        var w: text.GlyphWalker = .initAt(font, opts.size, opts.style, s, @floatFromInt(x));
+        while (w.next()) |gp| {
+            const g = gp.glyph;
+            if (g.bitmap.len == 0 or g.w <= 0 or g.h <= 0) continue;
+            // chiave glifo: puntatore bitmap (stabile nella cache font). R8 coverage.
+            const e = self.ensureSlot(@intFromPtr(g.bitmap.ptr), @intCast(g.w), @intCast(g.h), g.bitmap) orelse continue;
+            if (e.is_new) self.copyCoverage(e.slot, g.bitmap, 1, 0);
+            const x0 = @as(f32, @floatFromInt(gp.pen_x)) + @as(f32, @floatFromInt(g.xoff));
+            const y0: f32 = @floatFromInt(baseline_y + g.yoff);
+            const x1 = x0 + @as(f32, @floatFromInt(g.w));
+            const y1 = y0 + @as(f32, @floatFromInt(g.h));
+            self.atlasQuad(.{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } }, e.slot, opts.color, 4, clip);
         }
     }
 

@@ -62,29 +62,10 @@ pub const supported = backend.supported;
 /// backends have nothing to enumerate/leak and return 0); `error.Unsupported` off a backend.
 pub const sweepOrphans = backend.sweepOrphans;
 
-/// Env var carrying the slot's identifier from writer to reader. The writer sets it
-/// before spawning the reader; the child inherits and opens it.
+/// Env var carrying the slot's identifier from writer to reader (part of the Micro
+/// interop contract: a Rust sidecar reads the same name). The writer sets it before
+/// spawning the reader; the child inherits and opens it.
 pub const shmem_id_env = "MICRO_STATE_SHMEM_ID";
-
-/// Env var that toggles the shared-memory state path. Default **on**; set to `0`/`false`/
-/// `off`/`no` to force the caller's fallback transport (the safe escape hatch if shmem
-/// setup fails or misbehaves on a host).
-///
-/// Zig 0.16 has no ambient `getenv` (the environment flows through
-/// `std.process.Environ`), so fetch the variable yourself and parse it with
-/// [`shmemEnabledFromEnv`]; same for `MICRO_BUS_CAP_BYTES` and [`capFromEnv`].
-pub const shmem_toggle_env = "MICRO_STATE_SHMEM";
-
-/// Parse the value of [`shmem_toggle_env`] (pass `null` when unset). Absent or anything
-/// but a falsey value ⇒ enabled.
-pub fn shmemEnabledFromEnv(value: ?[]const u8) bool {
-    const v = value orelse return true;
-    const trimmed = std.mem.trim(u8, v, " \t");
-    inline for (.{ "0", "false", "off", "no" }) |falsey| {
-        if (std.ascii.eqlIgnoreCase(trimmed, falsey)) return false;
-    }
-    return true;
-}
 
 // --- slot layout ---------------------------------------------------------------
 //
@@ -101,19 +82,9 @@ const header: usize = 16;
 /// payload uses a few hundred bytes).
 pub const default_cap: usize = 128 * 1024 * 1024;
 
-/// Parse a `MICRO_BUS_CAP_BYTES` value into a payload ceiling (pass `null` when unset).
-/// Writer and reader must agree on it: the reader is typically spawned as a child of the
-/// writer and inherits its environment, so both observe the same value — and the default
-/// covers the case where neither sets it.
-pub fn capFromEnv(value: ?[]const u8) usize {
-    const v = value orelse return default_cap;
-    const parsed = std.fmt.parseInt(usize, v, 10) catch return default_cap;
-    return if (parsed >= 4096) parsed else default_cap;
-}
-
 /// Options for [`StateWriter.create`] / [`StateReader.open`].
 pub const Options = struct {
-    /// Payload ceiling in bytes — both ends must agree (see [`capFromEnv`]).
+    /// Payload ceiling in bytes — writer and reader must agree on it.
     cap: usize = default_cap,
 };
 

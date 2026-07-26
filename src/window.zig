@@ -70,14 +70,14 @@ pub const Window = switch (builtin.os.tag) {
         @import("window_wayland.zig").Window,
     .windows => @import("window_win32.zig").Window,
     .macos => @import("window_cocoa.zig").Window,
-    // Z-Scenic (Z#76 phase 2): Z's freestanding userspace target. Zicro
-    // itself never natively targets `.freestanding` (its own build.zig has
-    // no such target), so this branch is only ever selected when Z's
-    // build.zig cross-compiles Zicro code with -Dzicro-src — and that build
-    // always wires the "zrt"/"scenic_protocol" modules window_z.zig needs,
-    // the same way Zisky's build.zig always wires "zrt"/"gfx_config" for
-    // its own freestanding programs.
-    .freestanding => @import("window_z.zig").Window,
+    // wasm (freestanding or emscripten) → the browser canvas backend; non-wasm
+    // freestanding → Z-Scenic (Z#76 phase 2), Z's userspace target, selected only when
+    // Z's build.zig cross-compiles Zicro with -Dzicro-src and wires the
+    // "zrt"/"scenic_protocol" modules window_z.zig needs.
+    .freestanding, .emscripten => if (builtin.cpu.arch.isWasm())
+        @import("window_web.zig").Window
+    else
+        @import("window_z.zig").Window,
     else => struct {
         gpa: std.mem.Allocator,
         pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*@This() {
@@ -96,11 +96,28 @@ pub const Window = switch (builtin.os.tag) {
         pub fn presentRgba(self: *@This(), w: u32, h: u32, rgba: []const u8) void {
             _ = self; _ = w; _ = h; _ = rgba;
         }
+        pub fn requestRedraw(self: *@This()) void {
+            _ = self;
+        }
+        pub fn requestClose(self: *@This()) void {
+            _ = self;
+        }
         pub fn toggleFullscreen(self: *@This()) void {
             _ = self;
         }
         pub fn setMinimized(self: *@This()) void {
             _ = self;
+        }
+        pub fn setTitle(self: *@This(), title: [*:0]const u8) void {
+            _ = self; _ = title;
+        }
+        pub fn scaleFactor(self: *const @This()) f32 {
+            _ = self;
+            return 1;
+        }
+        pub fn isTouch(self: *const @This()) bool {
+            _ = self;
+            return false;
         }
     },
 };

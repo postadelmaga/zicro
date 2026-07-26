@@ -23,16 +23,6 @@ pub const ModuleId = []const u8;
 /// just using a new name — no transport code changes.
 pub const Channel = []const u8;
 
-/// How a channel behaves for a *fresh* subscriber. The bus uses this to decide whether a
-/// channel's last message may be **replayed** to a new subscriber: replaying durable state
-/// re-syncs the joiner; replaying a transient event would spuriously re-fire it.
-pub const ChannelKind = enum {
-    /// The latest value *is* the truth; replaying it re-syncs a fresh module (e.g. a count).
-    state,
-    /// One-shot occurrences; replaying repeats them wrongly (e.g. a tick, a shutdown).
-    event,
-};
-
 /// An addressed message on the bus: who sent it, on which channel, and the payload (JSON
 /// text). The channel tells the receiver how to interpret `payload`.
 ///
@@ -109,9 +99,8 @@ pub fn parseEnvelopeJson(gpa: Allocator, bytes: []const u8) !OwnedEnvelope {
 
 /// A **typed** view of a channel: a channel name bound, at the type level, to the payload
 /// type `T` that rides on it. It carries no data of `T` (just a name), so it is trivially
-/// copyable, and it makes the bus contract checkable by the compiler: [`Topic.encode`]
-/// only accepts a `T`, [`Topic.decode`] only yields a `T`, so a producer and a consumer
-/// that share a `Topic(T)` can never disagree on the shape.
+/// copyable; a producer and a consumer that share a `Topic(T)` can never disagree on the
+/// payload shape (encode with [`encodePayload`], decode with `Envelope.decode(T, …)`).
 ///
 /// The bus stays string-routed underneath — `Topic(T)` is a zero-cost ergonomic skin, not
 /// a new transport.
@@ -119,28 +108,12 @@ pub fn Topic(comptime T: type) type {
     return struct {
         channel: Channel,
 
-        /// The payload type this topic carries — lets generic code (`publishOn`) name it.
+        /// The payload type this topic carries.
         pub const Payload = T;
 
-        const Self = @This();
-
         /// Bind a channel name to the payload type `T`.
-        pub fn init(channel: Channel) Self {
+        pub fn init(channel: Channel) @This() {
             return .{ .channel = channel };
-        }
-
-        /// Serialize a `T` for this topic's channel (caller owns the returned text).
-        pub fn encode(self: Self, gpa: Allocator, msg: T) Allocator.Error![]u8 {
-            _ = self;
-            return encodePayload(gpa, msg);
-        }
-
-        /// Decode an envelope's payload as this topic's `T`. (The caller is expected to
-        /// only pass envelopes from this topic's channel; the type is what the topic
-        /// guarantees.)
-        pub fn decode(self: Self, gpa: Allocator, env: *const Envelope) !std.json.Parsed(T) {
-            _ = self;
-            return env.decode(T, gpa);
         }
     };
 }
@@ -165,17 +138,16 @@ test "payload round-trips a typed message" {
     } else |_| {}
 }
 
-test "topic round-trips and targets its channel" {
+test "topic binds a channel name to its payload type" {
     const gpa = std.testing.allocator;
     const Tick = struct { n: i64 };
     const tick: Topic(Tick) = .init("tick");
-
-    const payload = try tick.encode(gpa, .{ .n = 7 });
-    defer gpa.free(payload);
     try std.testing.expectEqualStrings("tick", tick.channel);
 
+    const payload = try encodePayload(gpa, Tick{ .n = 7 });
+    defer gpa.free(payload);
     const env: Envelope = .{ .from = "clock", .channel = tick.channel, .payload = payload };
-    const back = try tick.decode(gpa, &env);
+    const back = try env.decode(Topic(Tick).Payload, gpa);
     defer back.deinit();
     try std.testing.expectEqual(@as(i64, 7), back.value.n);
 }

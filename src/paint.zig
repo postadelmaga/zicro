@@ -314,6 +314,32 @@ pub const Style = struct {
         return s;
     }
 
+    /// Collapse the style to a plain content-filling fill: every field that carves out
+    /// a gutter/panel/border/shadow zeroed, so `drawChrome`/`blitRgba` degrade to a flat
+    /// fill instead of a glass panel with nothing behind it to shine through. For a
+    /// fullscreen host with no compositor blur to frost against (a browser `<canvas>`,
+    /// an Android surface) — a translucent "glass" there is just a grey ring and a veil
+    /// over the app's own background.
+    ///
+    /// The one thing this does NOT flatten is `glass.a`: an alpha of exactly 0 stays 0
+    /// (a deliberate HOLE — something else is drawn behind this window, e.g. a software
+    /// HUD stacked over a WebGPU canvas); any other alpha collapses to fully opaque.
+    pub fn contentFill(self: Style) Style {
+        var s = self;
+        s.margin = 0;
+        s.corner_radius = 0;
+        s.content_radius = 0;
+        s.content_fade_width = 0;
+        s.border_anim_width = 0;
+        s.border_alpha = 0;
+        s.shadow_alpha = 0;
+        s.glass_fade_width = 0;
+        s.sheen = 0;
+        s.specular = 0;
+        if (s.glass.a != 0.0) s.glass.a = 1.0;
+        return s;
+    }
+
     /// Preset: Apple macOS Vision Pro Glassmorphism
     pub fn macos() Style {
         return .{
@@ -405,11 +431,18 @@ pub const Format = enum {
 };
 
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.
-/// Backend 2D GPU (GLES3/WebGL2) intercambiabile col raster CPU: quando un [`Canvas`]
-/// ne ha uno, ogni primitivo delega a questa vtable invece di scrivere pixel. `paint.zig`
-/// resta **agnostico** — conosce solo l'interfaccia, non l'impl (che vive in `paint_gl`).
-/// Ogni op è in coord pixel del canvas; `clip` = scissor corrente (null = intero canvas).
-/// I widget rari (arc/spinner/progress/chrome) restano CPU-only per ora.
+/// An interchangeable 2D GPU backend (GLES3/WebGL2): when a [`Canvas`] has one, every
+/// primitive in this vtable delegates to it instead of writing pixels. `paint.zig` stays
+/// **agnostic** — it knows only the interface, not the implementation (which lives in
+/// `paint_gl`). Every op is in canvas pixel coordinates; `clip` is the current scissor
+/// (`null` = the whole canvas).
+///
+/// NOT every `Canvas` primitive is in this vtable — `drawChrome`, `blitRgba`,
+/// `blitImageRounded`, `dropShadowRoundedRect`, `drawArc`/`drawSpinner` have no GL path
+/// yet and stay CPU-only. Each of those asserts `self.gl == null` in debug builds: with
+/// a GL canvas they would rasterize into `Canvas.pixels`, which the GL backend never
+/// presents, so the shape would simply not appear — the assert turns that into a loud
+/// failure instead of a silent one.
 pub const GlBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -536,6 +569,7 @@ pub const Canvas = struct {
     /// Paint the full window chrome: transparent gutter, drop shadow, glass panel,
     /// highlight ring. The panel occupies the canvas minus `style.margin` on each side.
     pub fn drawChrome(self: *Canvas, style: Style) void {
+        std.debug.assert(self.gl == null); // no GL path yet — see `GlBackend`'s doc
         const m: f32 = @floatFromInt(style.margin);
         const pw = @as(f32, @floatFromInt(self.width)) - 2.0 * m;
         const ph = @as(f32, @floatFromInt(self.height)) - 2.0 * m;
@@ -651,6 +685,7 @@ pub const Canvas = struct {
         src_h: u32,
         style: Style,
     ) void {
+        std.debug.assert(self.gl == null); // no GL path yet — see `GlBackend`'s doc
         const m: f32 = @floatFromInt(style.margin);
         const pw = @as(f32, @floatFromInt(self.width)) - 2.0 * m;
         const ph = @as(f32, @floatFromInt(self.height)) - 2.0 * m;
@@ -820,6 +855,7 @@ pub const Canvas = struct {
     pub fn blitImageRounded(self: *Canvas, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, radius: f32) void {
         if (dst_w == 0 or dst_h == 0 or src_w == 0 or src_h == 0) return;
         if (radius <= 0.5) return self.blitImage(dst_x, dst_y, dst_w, dst_h, src, src_w, src_h);
+        std.debug.assert(self.gl == null); // no GL path yet — see `GlBackend`'s doc
         const bx0: u32 = @intCast(@max(0, dst_x));
         const by0: u32 = @intCast(@max(0, dst_y));
         const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, dst_x + @as(i32, @intCast(dst_w))))));
@@ -1119,6 +1155,7 @@ pub const Canvas = struct {
     /// shape share one silhouette. `color.a` is the peak opacity. Honors [`Format`].
     pub fn dropShadowRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, blur: f32, offset_y: f32, color: Color) void {
         if (color.a <= 0.0) return;
+        std.debug.assert(self.gl == null); // no GL path yet — see `GlBackend`'s doc
         const b = @max(blur, 0.5);
         const sy = y + offset_y;
         const pad = b + 1.0;
@@ -1149,6 +1186,7 @@ pub const Canvas = struct {
     /// is composited with a single coverage per pixel (min distance over the segments), so
     /// the joints never darken from double-blending. Honors the canvas [`Format`].
     pub fn drawArc(self: *Canvas, cx: f32, cy: f32, radius: f32, width: f32, a0: f32, a1: f32, color: Color) void {
+        std.debug.assert(self.gl == null); // no GL path yet — see `GlBackend`'s doc
         const max_pts = 33;
         // One segment per ~12°, clamped to the buffer we have; at least a couple.
         const span = @abs(a1 - a0);
@@ -1302,29 +1340,8 @@ pub const Canvas = struct {
     /// a top edge into a baseline if needed.
     pub fn drawText(self: *Canvas, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts) void {
         if (self.gl) |g| return g.vtable.drawText(g.ptr, font, x, baseline_y, s, opts, self.clip);
-        var pen_x: f32 = @floatFromInt(x);
-        var prev_cp: ?u32 = null;
-        var i: usize = 0;
-        while (i < s.len) {
-            const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-            const end = @min(i + seq, s.len);
-            const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
-            i = end;
-
-            if (prev_cp) |prev| {
-                pen_x += font.getKernAdvance(opts.style, opts.size, prev, cp);
-            }
-
-            const frac = pen_x - @floor(pen_x);
-            const sub_x_i = @as(i32, @intFromFloat(@round(frac * 4.0)));
-            const sub_x: u2 = @intCast(sub_x_i & 3);
-            const g = font.getGlyph(opts.size, opts.style, sub_x, cp) catch continue;
-            const ipen_x = @as(i32, @intFromFloat(@floor(pen_x + 0.5)));
-
-            self.blitGlyph(g, ipen_x, baseline_y, opts.color);
-            pen_x += g.advance;
-            prev_cp = cp;
-        }
+        var w: text.GlyphWalker = .initAt(font, opts.size, opts.style, s, @floatFromInt(x));
+        while (w.next()) |gp| self.blitGlyph(gp.glyph, gp.pen_x, baseline_y, opts.color);
     }
 
     /// Blends a glyph's coverage (straight color) onto the premultiplied canvas.

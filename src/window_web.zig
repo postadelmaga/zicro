@@ -12,56 +12,36 @@
 //! those dispatch to the single active window's callbacks. `run()` just arms it and
 //! returns. `on_draw` gets a `Canvas` over the window's straight-RGBA buffer (exactly a
 //! browser `ImageData`), which the JS glue blits with one `putImageData`.
-//!
-//! The types below mirror `window.zig` field-for-field on purpose — kept separate so the
-//! web build never evaluates that file's native-backend `switch` (which would pull in a
-//! Wayland/Z backend that can't exist on a wasm page).
 
 const std = @import("std");
+const window = @import("window.zig");
 const paint = @import("paint.zig");
 const widget = @import("widget.zig");
 const gesture = @import("gesture.zig");
 
-pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+pub const Rect = window.Rect;
+pub const MouseEvent = window.MouseEvent;
+pub const Options = window.Options;
 
-/// A pointer event in content coordinates, y growing downward (mirrors `window.MouseEvent`).
-pub const MouseEvent = struct {
-    kind: Kind,
-    x: f32,
-    y: f32,
-    button: u32 = 0,
-    scroll_dy: f32 = 0,
-    pub const Kind = enum { motion, press, release, scroll };
-};
+// One straight-RGBA8888 framebuffer (a browser page is single-window, single-threaded),
+// allocated at the window's actual size and grown on resize — a phone page must not pay
+// for a 4K reservation. Grow-only: resizes are rare and shrinking would only churn the
+// wasm heap.
+const MAX_DIM: u32 = 8192;
+var backbuf: []u32 = &.{};
 
-pub const Options = struct {
-    title: [:0]const u8 = "zicro-web",
-    width: u32 = 1000,
-    height: u32 = 720,
-    on_draw: ?*const fn (canvas: *paint.Canvas, content: Rect, user: ?*anyopaque) void = null,
-    on_key: ?*const fn (window: *Window, key: u32, state: u32, user: ?*anyopaque) void = null,
-    on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) void = null,
-    /// Gesto multi-touch (pinch, …) dal recognizer condiviso `gesture.zig`.
-    on_gesture: ?*const fn (window: *Window, g: gesture.Gesture, user: ?*anyopaque) void = null,
-    on_tick: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
-    tick_ms: u32 = 0,
-    decorations: bool = false,
-    on_close: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
-    user: ?*anyopaque = null,
-};
-
-// One straight-RGBA8888 framebuffer (a browser page is single-window, single-threaded).
-// Sized for a 4K drawable so a HiDPI (devicePixelRatio 2) window still renders at native
-// physical pixels; JS clamps to whatever `zicroWidth/Height` report if it ever overflows.
-const MAX_W: u32 = 3840;
-const MAX_H: u32 = 2160;
-var backbuf: [MAX_W * MAX_H]u32 = undefined;
+/// Grow the framebuffer to at least `pixels`; false (buffer unchanged) on OOM.
+fn ensureBackbuf(pixels: usize) bool {
+    if (backbuf.len >= pixels) return true;
+    const gpa = @import("wasm_shim.zig").gpa;
+    const grown = gpa.alloc(u32, pixels) catch return false;
+    if (backbuf.len > 0) gpa.free(backbuf);
+    backbuf = grown;
+    return true;
+}
 
 /// The window JS is currently driving. Set by `init`/`run`, read by the exported ABI.
 var active: ?*Window = null;
-/// The latest frame timestamp (ms) JS passed to `zicroFrame` — the browser clock the app
-/// reads via `nowMs()` (wasm freestanding has no `std.os` clock).
-var frame_now_ms: i64 = 0;
 /// The compositor/display scale: `window.devicePixelRatio`. The framebuffer is sized in
 /// physical pixels; an app reads this via `scaleFactor()` and passes it to
 /// `Theme.scaled(f)` so widgets keep their visual size while rendering crisp at native res.
@@ -74,23 +54,6 @@ var last_x: f32 = -1;
 var last_y: f32 = -1;
 var singleton: Window = undefined;
 
-/// Display scale (HiDPI): `devicePixelRatio`, 1 on a standard-density screen.
-pub fn scaleFactor() f32 {
-    return frame_scale;
-}
-
-/// True on touch-primary devices (phones/tablets). Read by the responsive layer.
-pub fn isTouch() bool {
-    return frame_touch;
-}
-
-/// Monotonic milliseconds for the app's UI (caret blink, animation): the last value JS
-/// handed to `zicroFrame` (i.e. `performance.now()`). The web analogue of the native
-/// `widget.nowMs()`, which can't read a clock on wasm freestanding.
-pub fn nowMs() i64 {
-    return frame_now_ms;
-}
-
 pub const Window = struct {
     opts: Options,
     width: u32,
@@ -99,6 +62,7 @@ pub const Window = struct {
 
     pub fn init(_: std.mem.Allocator, _: std.Io, opts: Options) !*Window {
         const self = &singleton; // one canvas per page → a fixed slot, stable pointer
+        if (!ensureBackbuf(@as(usize, opts.width) * opts.height)) return error.OutOfMemory;
         self.* = .{ .opts = opts, .width = opts.width, .height = opts.height };
         active = self;
         return self;
@@ -127,10 +91,20 @@ pub const Window = struct {
     /// directly through the `Canvas` they're handed.
     pub fn presentRgba(self: *Window, w: u32, h: u32, rgba: []const u8) void {
         const need = @as(usize, w) * @as(usize, h) * 4;
-        if (rgba.len < need or need > backbuf.len * 4) return;
+        if (rgba.len < need or !ensureBackbuf(@as(usize, w) * h)) return;
         self.width = w;
         self.height = h;
-        @memcpy(@as([*]u8, @ptrCast(&backbuf))[0..need], rgba[0..need]);
+        @memcpy(@as([*]u8, @ptrCast(backbuf.ptr))[0..need], rgba[0..need]);
+    }
+
+    /// Display scale (HiDPI): `devicePixelRatio`, 1 on a standard-density screen.
+    pub fn scaleFactor(_: *const Window) f32 {
+        return frame_scale;
+    }
+
+    /// True on touch-primary devices (phones/tablets). Read by the responsive layer.
+    pub fn isTouch(_: *const Window) bool {
+        return frame_touch;
     }
 
     // Desktop-only surfaces degrade to no-ops (no compositor to ask).
@@ -156,7 +130,7 @@ pub const Window = struct {
 // --- the exported ABI the JS glue drives ------------------------------------------
 
 export fn zicroPixels() [*]u8 {
-    return @ptrCast(&backbuf);
+    return @ptrCast(backbuf.ptr);
 }
 export fn zicroWidth() u32 {
     return if (active) |w| w.width else 0;
@@ -165,10 +139,15 @@ export fn zicroHeight() u32 {
     return if (active) |w| w.height else 0;
 }
 /// `w`/`h` are PHYSICAL pixels (CSS size × devicePixelRatio); `scale` is that ratio.
+/// The new size is committed only if the framebuffer could grow to fit it.
 export fn zicroResize(w: u32, h: u32, scale: f32) void {
     const win = active orelse return;
-    win.width = std.math.clamp(w, 1, MAX_W);
-    win.height = std.math.clamp(h, 1, MAX_H);
+    const nw = std.math.clamp(w, 1, MAX_DIM);
+    const nh = std.math.clamp(h, 1, MAX_DIM);
+    if (ensureBackbuf(@as(usize, nw) * nh)) {
+        win.width = nw;
+        win.height = nh;
+    }
     frame_scale = if (scale > 0) scale else 1;
 }
 
@@ -180,8 +159,7 @@ export fn zicroSetTouch(touch: u32) void {
 /// One frame: tick, then draw into the window's buffer (which JS blits).
 export fn zicroFrame(now_ms: f64) void {
     const win = active orelse return;
-    frame_now_ms = @intFromFloat(now_ms);
-    widget.web_now_ms = frame_now_ms; // so `widget.nowMs()` (Ui.begin) sees the browser clock
+    widget.web_now_ms = @intFromFloat(now_ms); // so `widget.nowMs()` sees the browser clock
     if (win.opts.on_tick) |tick| tick(win, win.opts.user);
     if (win.opts.on_draw) |draw| {
         var canvas = paint.Canvas.initRgba8(win.buffer(), win.width, win.height);

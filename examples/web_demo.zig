@@ -34,6 +34,7 @@ const presets = [_]Preset{
 const AppState = struct {
     font: text.Font,
     store: widget.Store,
+    win: *window.Window = undefined,
     queue: widget.InputQueue = .{},
     theme_idx: usize = 0,
     active_tab: usize = 0,
@@ -62,7 +63,7 @@ export fn zicroBoot() void {
         .store = widget.Store.init(gpa),
     };
     state.name_buf.appendSlice(gpa, "zicro web") catch {};
-    _ = window.Window.init(gpa, undefined, .{
+    state.win = window.Window.init(gpa, undefined, .{
         .title = "zicro-web-demo",
         .width = 1000,
         .height = 720,
@@ -110,8 +111,8 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     // HiDPI: the buffer is physical pixels, so scale the theme (and the layout literals
     // below, via `ui.theme.s`) by devicePixelRatio — widgets keep their visual size and
     // render crisp at native resolution.
-    const theme = preset.make().scaled(window.scaleFactor());
-    var ui = widget.Ui.begin(&s.store, canvas, &s.font, theme, bounds, window.nowMs(), s.queue.take());
+    const theme = preset.make().scaled(s.win.scaleFactor());
+    var ui = widget.Ui.begin(&s.store, canvas, &s.font, theme, bounds, widget.nowMs(), s.queue.take());
 
     ui.beginCard(ui.theme.s(64));
     ui.beginRow();

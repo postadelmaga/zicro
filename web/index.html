@@ -44,12 +44,18 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 canvas.focus();
+if (x.zicroSetTouch) x.zicroSetTouch((navigator.maxTouchPoints > 0 || "ontouchstart" in window) ? 1 : 0);
 
 // --- pointer (CSS px → physical px) ---
+// A touch pointer goes to the shared gesture recognizer (zicroTouch: 0=down 1=move
+// 2=up/cancel) instead of the mouse ABI — one finger still drives on_mouse (the
+// recognizer forwards it), two fingers become a pinch (on_gesture).
 const pos = (e) => { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) * dpr, (e.clientY - r.top) * dpr]; };
-canvas.addEventListener("pointermove", (e) => { const [px, py] = pos(e); x.zicroPointerMove(px, py); });
-canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); canvas.focus(); const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 1); });
-canvas.addEventListener("pointerup",   (e) => { const [px, py] = pos(e); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 0); });
+const isTouch = (e) => e.pointerType === "touch" && x.zicroTouch;
+canvas.addEventListener("pointermove", (e) => { const [px, py] = pos(e); if (isTouch(e)) { x.zicroTouch(e.pointerId, 1, px, py); return; } x.zicroPointerMove(px, py); });
+canvas.addEventListener("pointerdown", (e) => { canvas.focus(); const [px, py] = pos(e); if (isTouch(e)) { x.zicroTouch(e.pointerId, 0, px, py); return; } canvas.setPointerCapture(e.pointerId); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 1); });
+canvas.addEventListener("pointerup",   (e) => { const [px, py] = pos(e); if (isTouch(e)) { x.zicroTouch(e.pointerId, 2, px, py); return; } x.zicroPointerMove(px, py); x.zicroPointerButton(272, 0); });
+canvas.addEventListener("pointercancel", (e) => { if (isTouch(e)) { const [px, py] = pos(e); x.zicroTouch(e.pointerId, 2, px, py); } });
 canvas.addEventListener("wheel", (e) => { e.preventDefault(); x.zicroScroll(-e.deltaY * dpr); }, { passive: false });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 

@@ -52,27 +52,13 @@ pub var web_now_ms: i64 = 0;
 /// caret blink and animations (0.16 has no ambient `std.time` clock; tests pass explicit
 /// timestamps instead and stay pure).
 pub fn nowMs() i64 {
-    switch (@import("builtin").os.tag) {
-        .windows => {
-            // Hand-declared: this std fork's kernel32 has no GetTickCount64.
-            const k32 = struct {
-                extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
-            };
-            return @intCast(k32.GetTickCount64());
-        },
-        // wasm: no OS clock — the browser feeds the time via `web_now_ms`.
-        //
-        // emscripten belongs here too, and not as a courtesy: it is a browser, the page
-        // calls the same `zicroFrame(now_ms)` that sets `web_now_ms`, and there is no
-        // clock to read. Left in the `else` branch it reached for `std.os.linux`, which
-        // on this target does not compile — a tab was being asked for a VDSO.
-        .freestanding, .emscripten => return web_now_ms,
-        else => {
-            var ts: std.os.linux.timespec = undefined;
-            _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-            return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
-        },
-    }
+    return switch (@import("builtin").os.tag) {
+        // wasm: no OS clock — the browser feeds the time via `web_now_ms`. emscripten
+        // belongs here too: it is a browser, the page calls the same `zicroFrame(now_ms)`
+        // that sets `web_now_ms`, and there is no VDSO to ask.
+        .freestanding, .emscripten => web_now_ms,
+        else => @import("time.zig").monotonicMs(),
+    };
 }
 
 /// Widget identity: 0 = none, 1 = the "ground" (a press that hit no widget).
@@ -121,7 +107,7 @@ pub const InputQueue = struct {
     len: usize = 0,
 
     pub fn push(q: *InputQueue, e: InputEvent) void {
-        if (q.len == q.events.len) return; // overflow: drop oldest-frame extras
+        if (q.len == q.events.len) return; // overflow: drop this (the newest) event
         q.events[q.len] = e;
         q.len += 1;
     }
@@ -398,7 +384,6 @@ const AnimEntry = struct { v: f32, gen: u64 };
 /// Everything that must survive between frames. One per UI surface (window/panel).
 pub const Store = struct {
     gpa: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
 
     // pointer state
     mouse_x: f32 = -1e9,
@@ -477,7 +462,7 @@ pub const Store = struct {
     last_now_ms: i64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Store {
-        return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+        return .{ .gpa = gpa };
     }
 
     pub fn deinit(s: *Store) void {
@@ -485,7 +470,6 @@ pub const Store = struct {
         s.dd_rects.deinit(s.gpa);
         s.anims.deinit(s.gpa);
         s.scrolls.deinit(s.gpa);
-        s.arena.deinit();
     }
 
     /// True while a text field/area owns the keyboard — apps should skip their
@@ -653,7 +637,8 @@ pub const Ui = struct {
                 }
             },
             .text => |tx| {
-                store.saw_text_events = true;
+                // saw_text_events is already true here — the pre-pass above set it the
+                // moment it saw the first `.text` in this same batch.
                 for (tx.bytes[0..@min(tx.len, 4)]) |b| {
                     if (store.text_ops_len < store.text_ops.len) {
                         store.text_ops[store.text_ops_len] = .{ .char = b };
@@ -830,8 +815,6 @@ pub const Ui = struct {
             }
             for (stale[0..n]) |k| _ = ui.store.anims.remove(k);
         }
-
-        _ = ui.store.arena.reset(.retain_capacity);
 
         const busy = ui.animating or ui.store.focus != 0 or (ui.store.active > ground_id) or ui.store.dd_open != 0;
         return .{ .needs_repaint = busy, .content_h = ui.cursors[0].y - ui.cursors[0].start_y };
@@ -1658,13 +1641,23 @@ pub const Ui = struct {
 
         // Thin scrollbar like the scroll area's.
         if (max_off > 0) {
-            const track_h = r.h - t.s(4);
             const content_h = n_lines * line_h + 2 * pad_y;
-            const thumb_h = @max(t.scrollbar_thumb_min, track_h * r.h / content_h);
-            const ty = r.y + t.s(2) + (track_h - thumb_h) * (off / max_off);
-            ui.canvas.fillRoundedRect(r.x + r.w - t.scrollbar_w, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, if (sig.hovered) 0.35 else 0.18));
+            ui.drawThinScrollbar(r.x + r.w - t.scrollbar_w, r.y, r.h, content_h, off, if (sig.hovered) 0.35 else 0.18);
         }
         return result;
+    }
+
+    /// Thin scrollbar thumb, the shape shared by `textArea`, the dropdown overlay and
+    /// `endScroll`: a `4`-wide rounded track at `x`, spanning `span` pixels starting at
+    /// `y`, sized against `content_h` and positioned by `off` (0..`content_h - span`).
+    /// Callers guard the zero-scroll case themselves (skip the call when nothing scrolls).
+    fn drawThinScrollbar(ui: *Ui, x: f32, y: f32, span: f32, content_h: f32, off: f32, alpha: f32) void {
+        const t = ui.theme;
+        const track_h = span - t.s(4);
+        const thumb_h = @max(t.scrollbar_thumb_min, track_h * span / content_h);
+        const max_off = @max(1, content_h - span); // guard: callers only call when > 0
+        const ty = y + t.s(2) + (track_h - thumb_h) * (off / max_off);
+        ui.canvas.fillRoundedRect(x, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, alpha));
     }
 
     /// Byte offset for a click at content-space `(x, y)` (y includes the scroll).
@@ -2043,11 +2036,7 @@ pub const Ui = struct {
 
         // Thin scrollbar, same look as endScroll's.
         if (dd.content_h > dd.rect.h) {
-            const max_off = dd.content_h - dd.rect.h;
-            const track_h = dd.rect.h - t.s(4);
-            const thumb_h = @max(t.scrollbar_thumb_min, track_h * dd.rect.h / dd.content_h);
-            const ty = dd.rect.y + t.s(2) + (track_h - thumb_h) * (ui.store.dd_scroll / max_off);
-            ui.canvas.fillRoundedRect(dd.rect.x + dd.rect.w - t.scrollbar_w, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, 0.25));
+            ui.drawThinScrollbar(dd.rect.x + dd.rect.w - t.scrollbar_w, dd.rect.y, dd.rect.h, dd.content_h, ui.store.dd_scroll, 0.25);
         }
     }
 
@@ -2196,11 +2185,7 @@ pub const Ui = struct {
 
         // thin scrollbar
         if (max_off > 0) {
-            const track_h = viewport_h - t.s(4);
-            const thumb_h = @max(t.scrollbar_thumb_min, track_h * viewport_h / content_h);
-            const ty = vp_top + t.s(2) + (track_h - thumb_h) * (off / max_off);
-            const tx = vp.x + vp.w - t.scrollbar_w;
-            ui.canvas.fillRoundedRect(tx, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, if (hovered) 0.35 else 0.18));
+            ui.drawThinScrollbar(vp.x + vp.w - t.scrollbar_w, vp_top, viewport_h, content_h, off, if (hovered) 0.35 else 0.18);
         }
 
         // restore clip and advance the parent cursor past the viewport

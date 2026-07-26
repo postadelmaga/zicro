@@ -83,24 +83,30 @@ pub const ChannelMetrics = struct {
 
 const SubList = std.ArrayListUnmanaged(*Inbox);
 
+/// Everything the broker knows about one channel — a single hash lookup per publish,
+/// one owned key, one deinit loop.
+const ChannelState = struct {
+    /// The live subscriber inboxes.
+    subs: SubList = .empty,
+    /// The last envelope, kept only while `stateful` (replayed to new subscribers).
+    retained: ?*Shared = null,
+    /// Marked by [`LocalBus.retain`]: keep + replay the last value.
+    stateful: bool = false,
+    /// What a publish does when a subscriber's inbox is full.
+    overflow: Overflow = .drop,
+    published: u64 = 0,
+    dropped: u64 = 0,
+};
+
 /// In-process pub/sub broker. Share a `*LocalBus` freely across threads; all methods take
 /// `*LocalBus` and lock internally.
 pub const LocalBus = struct {
     gpa: Allocator,
     io: Io,
     mutex: Io.Mutex = .init,
-    /// channel name → the live subscriber inboxes on it. Keys owned.
-    subs: std.StringHashMapUnmanaged(SubList) = .empty,
-    /// channel name → its last envelope, for channels marked stateful. Keys owned.
-    retained: std.StringHashMapUnmanaged(*Shared) = .empty,
-    /// channels whose last value is kept and replayed to new subscribers. Keys owned.
-    stateful: std.StringHashMapUnmanaged(void) = .empty,
-    /// channel name → its overflow policy. Absent ⇒ `.drop`. Keys owned.
-    overflow: std.StringHashMapUnmanaged(Overflow) = .empty,
-    /// channel name → (published, dropped) counters. Keys owned.
-    counters: std.StringHashMapUnmanaged(struct { published: u64, dropped: u64 }) = .empty,
-    /// total envelopes dropped because a subscriber inbox was full (observability).
-    dropped_total: u64 = 0,
+    /// channel name → its whole state (subscribers, retained value, policy, counters).
+    /// Keys owned.
+    channels: std.StringHashMapUnmanaged(ChannelState) = .empty,
     /// The shared "space freed" eventcount `.block` publishers wait on. Created with the
     /// first inbox (init cannot allocate); every inbox holds a reference.
     space: ?*SpaceSignal = null,
@@ -117,44 +123,43 @@ pub const LocalBus = struct {
     pub fn notifyAllInboxes(bus: *LocalBus) void {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        var subs_it = bus.subs.iterator();
-        while (subs_it.next()) |entry| {
-            for (entry.value_ptr.items) |inbox| {
-                inbox.changed.notifyAll(bus.io);
-            }
+        var it = bus.channels.valueIterator();
+        while (it.next()) |st| {
+            for (st.subs.items) |inbox| inbox.changed.notifyAll(bus.io);
         }
     }
 
     pub fn deinit(bus: *LocalBus) void {
         sync.lock(&bus.mutex, bus.io);
-        var subs_it = bus.subs.iterator();
-        while (subs_it.next()) |entry| {
-            for (entry.value_ptr.items) |inbox| {
+        var it = bus.channels.iterator();
+        while (it.next()) |entry| {
+            const st = entry.value_ptr;
+            for (st.subs.items) |inbox| {
                 inbox.markClosed(bus.io);
                 inbox.release(bus.io);
             }
-            entry.value_ptr.deinit(bus.gpa);
+            st.subs.deinit(bus.gpa);
+            if (st.retained) |shared| shared.release();
             bus.gpa.free(entry.key_ptr.*);
         }
-        bus.subs.deinit(bus.gpa);
-        var ret_it = bus.retained.iterator();
-        while (ret_it.next()) |entry| {
-            entry.value_ptr.*.release();
-            bus.gpa.free(entry.key_ptr.*);
-        }
-        bus.retained.deinit(bus.gpa);
-        var st_it = bus.stateful.keyIterator();
-        while (st_it.next()) |key| bus.gpa.free(key.*);
-        bus.stateful.deinit(bus.gpa);
-        var ov_it = bus.overflow.keyIterator();
-        while (ov_it.next()) |key| bus.gpa.free(key.*);
-        bus.overflow.deinit(bus.gpa);
-        var ct_it = bus.counters.keyIterator();
-        while (ct_it.next()) |key| bus.gpa.free(key.*);
-        bus.counters.deinit(bus.gpa);
+        bus.channels.deinit(bus.gpa);
         sync.unlock(&bus.mutex, bus.io);
         if (bus.space) |sp| sp.release();
         if (bus.envelope_pool.load(.acquire)) |pool| pool.release();
+    }
+
+    /// The per-channel state, created on first touch. Callers hold the broker lock. The
+    /// key is duped BEFORE the insert so a failed dupe cannot leave the map holding the
+    /// caller's (soon dangling) slice.
+    fn channelState(bus: *LocalBus, channel: Channel) Allocator.Error!*ChannelState {
+        if (bus.channels.getPtr(channel)) |st| return st;
+        const key = try bus.gpa.dupe(u8, channel);
+        const gop = bus.channels.getOrPut(bus.gpa, key) catch |e| {
+            bus.gpa.free(key);
+            return e;
+        };
+        gop.value_ptr.* = .{};
+        return gop.value_ptr;
     }
 
     /// Pre-fill the envelope pool for messages of about `envelope_bytes`
@@ -183,14 +188,7 @@ pub const LocalBus = struct {
     pub fn retain(bus: *LocalBus, channel: Channel) Allocator.Error!void {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        // Dupe the key *before* inserting: a getOrPut-then-dupe would leave the map
-        // holding the caller's slice (soon dangling) if the dupe failed.
-        const key = try bus.gpa.dupe(u8, channel);
-        const gop = bus.stateful.getOrPut(bus.gpa, key) catch |e| {
-            bus.gpa.free(key);
-            return e;
-        };
-        if (gop.found_existing) bus.gpa.free(key);
+        (try bus.channelState(channel)).stateful = true;
     }
 
     /// Choose what publishing does when a subscriber of `channel` has a full inbox.
@@ -198,21 +196,17 @@ pub const LocalBus = struct {
     pub fn setOverflow(bus: *LocalBus, channel: Channel, policy: Overflow) Allocator.Error!void {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        // Dupe-before-insert, same rationale as [`retain`](LocalBus.retain).
-        const key = try bus.gpa.dupe(u8, channel);
-        const gop = bus.overflow.getOrPut(bus.gpa, key) catch |e| {
-            bus.gpa.free(key);
-            return e;
-        };
-        if (gop.found_existing) bus.gpa.free(key);
-        gop.value_ptr.* = policy;
+        (try bus.channelState(channel)).overflow = policy;
     }
 
     /// Total number of envelopes dropped so far due to full subscriber inboxes.
     pub fn dropped(bus: *LocalBus) u64 {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        return bus.dropped_total;
+        var total: u64 = 0;
+        var it = bus.channels.valueIterator();
+        while (it.next()) |st| total += st.dropped;
+        return total;
     }
 
     /// A snapshot of one channel's traffic (published, dropped, live subscribers). Cheap
@@ -220,13 +214,8 @@ pub const LocalBus = struct {
     pub fn channelMetrics(bus: *LocalBus, channel: Channel) ChannelMetrics {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        var m: ChannelMetrics = .{};
-        if (bus.counters.get(channel)) |c| {
-            m.published = c.published;
-            m.dropped = c.dropped;
-        }
-        if (bus.subs.get(channel)) |list| m.subscribers = list.items.len;
-        return m;
+        const st = bus.channels.get(channel) orelse return .{};
+        return .{ .published = st.published, .dropped = st.dropped, .subscribers = st.subs.items.len };
     }
 
     /// Publish a JSON payload from `from` onto `channel`, fanning out to every current
@@ -268,42 +257,21 @@ pub const LocalBus = struct {
             sync.lock(&bus.mutex, bus.io);
             defer sync.unlock(&bus.mutex, bus.io);
 
-            // Hot path: the counter already exists — one lookup, no dupe. On the first
-            // publish, dupe the key *before* inserting so a failed dupe can't leave the
-            // map holding the caller's slice (dangling key, undefined value).
-            const counter = bus.counters.getPtr(channel) orelse blk: {
-                const key = bus.gpa.dupe(u8, channel) catch |e| return e;
-                const gop = bus.counters.getOrPut(bus.gpa, key) catch |e| {
-                    bus.gpa.free(key);
-                    return e;
-                };
-                gop.value_ptr.* = .{ .published = 0, .dropped = 0 };
-                break :blk gop.value_ptr;
-            };
-            counter.published += 1;
+            // ONE lookup covers counters, retained value, policy and subscribers.
+            const st = try bus.channelState(channel);
+            st.published += 1;
 
-            if (bus.stateful.contains(channel)) {
-                if (bus.retained.getPtr(channel)) |slot| {
-                    slot.*.release();
-                    slot.* = shared.retain();
-                } else {
-                    // First retained value on the channel: dupe-before-insert, as above.
-                    const key = bus.gpa.dupe(u8, channel) catch |e| return e;
-                    const gop = bus.retained.getOrPut(bus.gpa, key) catch |e| {
-                        bus.gpa.free(key);
-                        return e;
-                    };
-                    gop.value_ptr.* = shared.retain();
-                }
+            if (st.stateful) {
+                if (st.retained) |old| old.release();
+                st.retained = shared.retain();
             }
 
-            const policy = bus.overflow.get(channel) orelse .drop;
-            if (bus.subs.getPtr(channel)) |list| switch (policy) {
+            switch (st.overflow) {
                 .drop => {
                     var drops: u64 = 0;
                     var i: usize = 0;
-                    while (i < list.items.len) {
-                        switch (list.items[i].tryPush(bus.io, shared)) {
+                    while (i < st.subs.items.len) {
+                        switch (st.subs.items[i].tryPush(bus.io, shared)) {
                             .ok => i += 1,
                             // Full: drop for this subscriber, keep it subscribed.
                             .full => {
@@ -312,25 +280,24 @@ pub const LocalBus = struct {
                             },
                             // Receiver gone: prune (swap-remove; sub order is unspecified).
                             .gone => {
-                                list.swapRemove(i).release(bus.io);
+                                st.subs.swapRemove(i).release(bus.io);
                             },
                         }
                     }
-                    bus.dropped_total += drops;
-                    counter.dropped += drops;
+                    st.dropped += drops;
                 },
                 // Snapshot the live inboxes (with a reference each, so a concurrent
                 // receiver deinit can't free them under us); pushes happen lock-free below.
-                .block => {
+                .block => if (st.subs.items.len > 0) {
                     // Reserve before retaining: an append failing *after* a retain would
                     // leak that reference (the cleanup defer only releases listed items).
-                    blocking_targets.ensureUnusedCapacity(scratch, list.items.len) catch |e| return e;
-                    for (list.items) |inbox| {
+                    blocking_targets.ensureUnusedCapacity(scratch, st.subs.items.len) catch |e| return e;
+                    for (st.subs.items) |inbox| {
                         blocking_targets.appendAssumeCapacity(inbox.retain());
                     }
                     space = bus.space; // non-null: subscribers exist, so an inbox was created
                 },
-            };
+            }
         }
 
         // The `.block` fan-out: no broker lock held — this is the backpressure. Sweep
@@ -369,12 +336,12 @@ pub const LocalBus = struct {
         if (!saw_gone) return;
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
-        var subs_it = bus.subs.iterator();
-        while (subs_it.next()) |entry| {
+        var it = bus.channels.valueIterator();
+        while (it.next()) |st| {
             var i: usize = 0;
-            while (i < entry.value_ptr.items.len) {
-                if (entry.value_ptr.items[i].isReceiverGone(bus.io)) {
-                    entry.value_ptr.swapRemove(i).release(bus.io);
+            while (i < st.subs.items.len) {
+                if (st.subs.items[i].isReceiverGone(bus.io)) {
+                    st.subs.swapRemove(i).release(bus.io);
                 } else {
                     i += 1;
                 }
@@ -411,62 +378,28 @@ pub const LocalBus = struct {
         sync.lock(&bus.mutex, bus.io);
         defer sync.unlock(&bus.mutex, bus.io);
         if (bus.space == null) bus.space = try SpaceSignal.create(bus.gpa);
-        // Start with just the receiver's reference; each *successful* channel append adds
-        // one. If a mid-loop OOM aborts the subscription, the errdefers below detach the
-        // inbox from the channels already wired and drop every reference — no orphaned
-        // inbox (which would otherwise leak its ring, its SpaceSignal ref, and any retained
-        // values already pushed into it).
-        const inbox = try Inbox.create(bus.gpa, capacity, 1, bus.space.?);
+        const inbox = try Inbox.create(bus.gpa, capacity, bus.space.?);
         errdefer inbox.release(bus.io);
-        var appended: usize = 0;
-        errdefer {
-            for (channels[0..appended]) |channel| {
-                if (bus.subs.getPtr(channel)) |list| {
-                    for (list.items, 0..) |it, i| {
-                        if (it == inbox) {
-                            _ = list.orderedRemove(i);
-                            break;
-                        }
-                    }
-                }
-                inbox.release(bus.io);
-            }
+
+        // Two passes: first everything that can fail (create channel states, reserve
+        // list room), then the infallible wiring — so a mid-subscription OOM never
+        // leaves the inbox half-attached. Reserving `channels.len` slots per list also
+        // covers duplicate names in one call.
+        for (channels) |channel| {
+            const st = try bus.channelState(channel);
+            try st.subs.ensureUnusedCapacity(bus.gpa, channels.len);
         }
         for (channels) |channel| {
+            const st = bus.channels.getPtr(channel).?;
             // Hand the joiner the current value of a stateful channel right away.
-            if (bus.retained.get(channel)) |shared| {
-                _ = inbox.tryPush(bus.io, shared);
-            }
-            // Dupe-before-insert (see [`retain`](LocalBus.retain)): a failed dupe after
-            // getOrPut would leave a dangling key in the map. If the later append fails,
-            // an entry with an empty list is left behind — owned key, valid state.
-            const list = bus.subs.getPtr(channel) orelse blk: {
-                const key = try bus.gpa.dupe(u8, channel);
-                const gop = bus.subs.getOrPut(bus.gpa, key) catch |e| {
-                    bus.gpa.free(key);
-                    return e;
-                };
-                gop.value_ptr.* = .empty;
-                break :blk gop.value_ptr;
-            };
-            try list.append(bus.gpa, inbox);
-            _ = inbox.retain();
-            appended += 1;
+            if (st.retained) |shared| _ = inbox.tryPush(bus.io, shared);
+            st.subs.appendAssumeCapacity(inbox.retain());
         }
         return .{ .inbox = inbox, .io = bus.io };
     }
 };
 
 // --- tests ---------------------------------------------------------------------------------
-
-const TestEnv = struct {
-    threaded: std.Io.Threaded,
-    bus: LocalBus,
-
-    fn init() TestEnv {
-        return .{ .threaded = .init(std.testing.allocator, .{}), .bus = undefined };
-    }
-};
 
 fn publishN(bus: *LocalBus, from: []const u8, channel: []const u8, n: i64) !void {
     var buf: [64]u8 = undefined;
