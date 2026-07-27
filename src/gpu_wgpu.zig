@@ -248,12 +248,24 @@ const paint = @import("paint.zig");
 const paint_gl = @import("paint_gl.zig");
 
 /// GPU Backend implementation for WebGPU / Vulkan / DX12 / Metal via wgpu-native.
-/// Plugs into Canvas.gl so Canvas draw calls delegate to WebGPU/Vulkan.
+///
+/// NOT YET WIRED INTO Canvas.gl, and not yet a working GPU backend even if it were: every
+/// vtable method below only forwards to `recorder` (a `paint_gl.GlRecorder`), which
+/// accumulates vertices/atlas data in CPU memory — the same code path the software GL
+/// backend uses. Nothing here creates `pipeline`/`bind_group`/`texture`/`vertex_buf` (they
+/// stay null; `deinit`'s release-if-set calls are dead code today) or ever calls
+/// wgpuQueueWriteBuffer/wgpuRenderPassEncoderDraw/wgpuQueueSubmit — so `recorder`'s output is
+/// never actually uploaded or drawn. Assigning `backend()` to `Canvas.gl` today would
+/// reproduce the "primitives vanish with no error" failure this vtable shape has hit before:
+/// finish the upload+submit step first (feed recorder.vertexBytes()/atlasPtr() to
+/// vertex_buf/texture via a real pipeline) before wiring this into Canvas.gl.
 pub const WgpuBackend = struct {
     gpu: *Gpu,
     gpa: std.mem.Allocator,
     recorder: paint_gl.GlRecorder,
 
+    // Placeholders for the not-yet-implemented submission path — never created, so always
+    // null; `deinit`'s release-if-set is future-proofing for when init actually builds these.
     pipeline: c.WGPURenderPipeline = null,
     bind_group_layout: c.WGPUBindGroupLayout = null,
     bind_group: c.WGPUBindGroup = null,
@@ -368,7 +380,7 @@ pub const WgpuBackend = struct {
     }
 };
 
-test "WgpuBackend exposes a working GlBackend vtable" {
+test "WgpuBackend's vtable records draws into its CPU-side GlRecorder (no GPU upload yet)" {
     var fake_gpu: Gpu = undefined;
     var wgpu_b = WgpuBackend.init(&fake_gpu, std.testing.allocator);
     defer wgpu_b.deinit();
