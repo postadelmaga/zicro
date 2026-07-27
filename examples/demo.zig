@@ -114,6 +114,9 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const events = state.queue.take();
 
     var ui = widget.Ui.begin(&state.widget_store, canvas, &state.font, theme, bounds, now, events);
+    // `theme` above is a fresh copy from the preset's `make()` every frame, so scaling it
+    // here can't compound across frames (see Ui.autoScale's doc comment).
+    ui.autoScale(state.window.scaleFactor());
 
     // Draw overall demo header
     ui.beginCard(65);
