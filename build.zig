@@ -44,6 +44,14 @@ pub fn build(b: *std.Build) void {
             wgpu.addIncludePath(wgpu_dep.path("include"));
             wgpu.addLibraryPath(wgpu_dep.path("lib"));
             wgpu.linkSystemLibrary("wgpu_native", .{});
+            wgpu.addIncludePath(b.path("vendor/stb"));
+            wgpu.addCSourceFile(.{
+                .file = b.path("vendor/stb/stb_truetype_impl.c"),
+                .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+            });
+            if (target.result.os.tag == .linux) {
+                wgpu.linkSystemLibrary("harfbuzz", .{});
+            }
 
             const wgpu_tests = b.addTest(.{ .root_module = wgpu });
             const run_wgpu_tests = b.addRunArtifact(wgpu_tests);
@@ -243,6 +251,7 @@ fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
             .{ "linux-dmabuf-v1.xml", "linux-dmabuf-v1.c" },
             .{ "viewporter.xml", "viewporter.c" },
             .{ "fractional-scale-v1.xml", "fractional-scale-v1.c" },
+            .{ "text-input-v3.xml", "text-input-v3.c" },
         };
         for (protocols) |p| {
             const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });

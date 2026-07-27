@@ -245,14 +245,43 @@ test "a headless device comes up, and says whether it will take our SPIR-V" {
 }
 
 const paint = @import("paint.zig");
+const paint_gl = @import("paint_gl.zig");
 
 /// GPU Backend implementation for WebGPU / Vulkan / DX12 / Metal via wgpu-native.
 /// Plugs into Canvas.gl so Canvas draw calls delegate to WebGPU/Vulkan.
 pub const WgpuBackend = struct {
     gpu: *Gpu,
+    gpa: std.mem.Allocator,
+    recorder: paint_gl.GlRecorder,
 
-    pub fn init(gpu: *Gpu) WgpuBackend {
-        return .{ .gpu = gpu };
+    pipeline: c.WGPURenderPipeline = null,
+    bind_group_layout: c.WGPUBindGroupLayout = null,
+    bind_group: c.WGPUBindGroup = null,
+    texture: c.WGPUTexture = null,
+    texture_view: c.WGPUTextureView = null,
+    sampler: c.WGPUSampler = null,
+    uniform_buf: c.WGPUBuffer = null,
+    vertex_buf: c.WGPUBuffer = null,
+    vertex_buf_cap: usize = 0,
+
+    pub fn init(gpu: *Gpu, gpa: std.mem.Allocator) WgpuBackend {
+        return .{
+            .gpu = gpu,
+            .gpa = gpa,
+            .recorder = paint_gl.GlRecorder.init(gpa),
+        };
+    }
+
+    pub fn deinit(self: *WgpuBackend) void {
+        self.recorder.deinit();
+        if (self.vertex_buf) |b| c.wgpuBufferRelease(b);
+        if (self.uniform_buf) |b| c.wgpuBufferRelease(b);
+        if (self.texture_view) |v| c.wgpuTextureViewRelease(v);
+        if (self.texture) |t| c.wgpuTextureRelease(t);
+        if (self.sampler) |s| c.wgpuSamplerRelease(s);
+        if (self.bind_group) |bg| c.wgpuBindGroupRelease(bg);
+        if (self.bind_group_layout) |bgl| c.wgpuBindGroupLayoutRelease(bgl);
+        if (self.pipeline) |p| c.wgpuRenderPipelineRelease(p);
     }
 
     pub fn backend(self: *WgpuBackend) paint.GlBackend {
@@ -260,6 +289,18 @@ pub const WgpuBackend = struct {
             .ptr = @ptrCast(self),
             .vtable = &vtable,
         };
+    }
+
+    pub fn reset(self: *WgpuBackend) void {
+        self.recorder.reset();
+    }
+
+    pub fn vertexBytes(self: *const WgpuBackend) []const u8 {
+        return self.recorder.vertexBytes();
+    }
+
+    pub fn vertexCount(self: *const WgpuBackend) usize {
+        return self.recorder.vertexCount();
     }
 
     const vtable = paint.GlBackend.VTable{
@@ -275,23 +316,69 @@ pub const WgpuBackend = struct {
         .drawText = drawTextImpl,
     };
 
-    fn fillRoundedRectImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
-    fn fillRoundedRectPerCornerImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: paint.Corners, _: paint.Color, _: ?paint.Canvas.Clip) void {}
-    fn fillRoundedRectVGradientImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: paint.Color, _: ?paint.Canvas.Clip) void {}
-    fn fillConcaveCornerImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
-    fn strokeSegmentImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
-    fn strokeRoundedRectImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
-    fn blitImageImpl(_: *anyopaque, _: i32, _: i32, _: u32, _: u32, _: []const u8, _: u32, _: u32, _: ?paint.Canvas.Clip) void {}
-    fn blitMaskImpl(_: *anyopaque, _: i32, _: i32, _: u32, _: u32, _: []const u8, _: u32, _: u32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
-    fn blitImageRotImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: []const u8, _: u32, _: u32, _: f32, _: ?paint.Canvas.Clip) void {}
-    fn drawTextImpl(_: *anyopaque, _: *paint.text.Font, _: i32, _: i32, _: []const u8, _: paint.TextOpts, _: ?paint.Canvas.Clip) void {}
+    fn fillRoundedRectImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.fillRoundedRect(b.ptr, x, y, w, h, radius, color, clip);
+    }
+    fn fillRoundedRectPerCornerImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, corners: paint.Corners, color: paint.Color, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.fillRoundedRectPerCorner(b.ptr, x, y, w, h, corners, color, clip);
+    }
+    fn fillRoundedRectVGradientImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, top: paint.Color, bottom: paint.Color, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.fillRoundedRectVGradient(b.ptr, x, y, w, h, radius, top, bottom, clip);
+    }
+    fn fillConcaveCornerImpl(ptr: *anyopaque, x: f32, y: f32, size: f32, cx: f32, cy: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.fillConcaveCorner(b.ptr, x, y, size, cx, cy, color, clip);
+    }
+    fn strokeSegmentImpl(ptr: *anyopaque, ax: f32, ay: f32, bx: f32, by: f32, width: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.strokeSegment(b.ptr, ax, ay, bx, by, width, color, clip);
+    }
+    fn strokeRoundedRectImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.strokeRoundedRect(b.ptr, x, y, w, h, radius, stroke, color, clip);
+    }
+    fn blitImageImpl(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.blitImage(b.ptr, dst_x, dst_y, dst_w, dst_h, src, src_w, src_h, clip);
+    }
+    fn blitMaskImpl(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, tint: paint.Color, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.blitMask(b.ptr, dst_x, dst_y, dst_w, dst_h, src, src_w, src_h, tint, clip);
+    }
+    fn blitImageRotImpl(ptr: *anyopaque, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.blitImageRot(b.ptr, dx, dy, dw, dh, src, src_w, src_h, angle, clip);
+    }
+    fn drawTextImpl(ptr: *anyopaque, font: *paint.text.Font, x: i32, baseline_y: i32, s: []const u8, opts: paint.TextOpts, clip: ?paint.Canvas.Clip) void {
+        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
+        const b = self.recorder.iface();
+        b.vtable.drawText(b.ptr, font, x, baseline_y, s, opts, clip);
+    }
 };
 
-test "WgpuBackend exposes valid GlBackend vtable for Canvas delegation" {
+test "WgpuBackend exposes a working GlBackend vtable" {
     var fake_gpu: Gpu = undefined;
-    var wgpu_b = WgpuBackend.init(&fake_gpu);
+    var wgpu_b = WgpuBackend.init(&fake_gpu, std.testing.allocator);
+    defer wgpu_b.deinit();
     const gb = wgpu_b.backend();
-    try std.testing.expect(gb.vtable.fillRoundedRect != null);
-    try std.testing.expect(gb.vtable.drawText != null);
+    try std.testing.expect(@as(?*const anyopaque, @ptrCast(gb.vtable.fillRoundedRect)) != null);
+    try std.testing.expect(@as(?*const anyopaque, @ptrCast(gb.vtable.drawText)) != null);
+
+    gb.vtable.fillRoundedRect(gb.ptr, 10, 20, 100, 40, 8, .{ .r = 1, .g = 0, .b = 0, .a = 1 }, null);
+    try std.testing.expectEqual(@as(usize, 6), wgpu_b.vertexCount());
+    wgpu_b.reset();
+    try std.testing.expectEqual(@as(usize, 0), wgpu_b.vertexCount());
 }
 
