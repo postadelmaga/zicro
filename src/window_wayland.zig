@@ -531,7 +531,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
 
         const surface = self.surface.?;
         surface.attach(slot.buffer, 0, 0);
-        surface.damageBuffer(0, 0, @intCast(bw), @intCast(bh));
+        if (canvas.damage) |d| {
+            surface.damageBuffer(@intCast(d.x0), @intCast(d.y0), @intCast(d.width()), @intCast(d.height()));
+        } else {
+            surface.damageBuffer(0, 0, @intCast(bw), @intCast(bh));
+        }
         surface.commit();
         slot.busy = true;
         self.needs_redraw = false;

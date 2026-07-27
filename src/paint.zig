@@ -528,8 +528,67 @@ pub const Canvas = struct {
     /// Backend GPU opzionale: se presente, i primitivi delegano alla sua vtable (GLES3/
     /// WebGL2) invece di rasterizzare su CPU. `null` = raster CPU (default, output invariato).
     gl: ?*GlBackend = null,
+    /// Damage tracking: accumulated bounding box of pixels modified since last reset.
+    damage: ?DamageRect = null,
 
     pub const Clip = struct { x0: u32, y0: u32, x1: u32, y1: u32 };
+
+    pub const DamageRect = struct {
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+
+        pub fn width(self: DamageRect) u32 {
+            return self.x1 -| self.x0;
+        }
+
+        pub fn height(self: DamageRect) u32 {
+            return self.y1 -| self.y0;
+        }
+
+        pub fn unionWith(self: DamageRect, other: DamageRect) DamageRect {
+            return .{
+                .x0 = @min(self.x0, other.x0),
+                .y0 = @min(self.y0, other.y0),
+                .x1 = @max(self.x1, other.x1),
+                .y1 = @max(self.y1, other.y1),
+            };
+        }
+    };
+
+    pub fn resetDamage(self: *Canvas) void {
+        self.damage = null;
+    }
+
+    pub fn markFullDamage(self: *Canvas) void {
+        self.damage = .{ .x0 = 0, .y0 = 0, .x1 = self.width, .y1 = self.height };
+    }
+
+    pub fn addDamage(self: *Canvas, x0: u32, y0: u32, x1: u32, y1: u32) void {
+        var cx0 = @min(x0, self.width);
+        var cy0 = @min(y0, self.height);
+        var cx1 = @min(x1, self.width);
+        var cy1 = @min(y1, self.height);
+
+        if (self.clip) |c| {
+            cx0 = @max(cx0, c.x0);
+            cy0 = @max(cy0, c.y0);
+            cx1 = @min(cx1, c.x1);
+            cy1 = @min(cy1, c.y1);
+        }
+
+        if (cx0 >= cx1 or cy0 >= cy1) return;
+
+        if (self.damage) |*d| {
+            d.x0 = @min(d.x0, cx0);
+            d.y0 = @min(d.y0, cy0);
+            d.x1 = @max(d.x1, cx1);
+            d.y1 = @max(d.y1, cy1);
+        } else {
+            self.damage = .{ .x0 = cx0, .y0 = cy0, .x1 = cx1, .y1 = cy1 };
+        }
+    }
 
     pub fn init(pixels: []u32, width: u32, height: u32) Canvas {
         std.debug.assert(pixels.len == @as(usize, width) * @as(usize, height));
@@ -668,6 +727,7 @@ pub const Canvas = struct {
     /// highlight ring. The panel occupies the canvas minus `style.margin` on each side.
     pub fn drawChrome(self: *Canvas, style: Style) void {
         std.debug.assert(self.gl == null); // no GL path yet — see `GlBackend`'s doc
+        self.markFullDamage();
         const m: f32 = @floatFromInt(style.margin);
         const pw = @as(f32, @floatFromInt(self.width)) - 2.0 * m;
         const ph = @as(f32, @floatFromInt(self.height)) - 2.0 * m;
@@ -922,6 +982,7 @@ pub const Canvas = struct {
         const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
         if (x0 >= x1 or y0 >= y1) return;
+        self.addDamage(x0, y0, x1, y1);
 
         const width_span = x1 - x0;
         var stack_sx_buf: [8192]u32 = undefined;
@@ -969,6 +1030,8 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, dst_x + @as(i32, @intCast(dst_w))))));
         const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        if (x0 >= x1 or y0 >= y1) return;
+        self.addDamage(x0, y0, x1, y1);
         const inv: f32 = 1.0 / 255.0;
         const rx: f32 = @floatFromInt(dst_x);
         const ry: f32 = @floatFromInt(dst_y);
@@ -1020,6 +1083,7 @@ pub const Canvas = struct {
         const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
         if (x0 >= x1 or y0 >= y1) return;
+        self.addDamage(x0, y0, x1, y1);
 
         const width_span = x1 - x0;
         var stack_sx_buf: [8192]u32 = undefined;
@@ -1067,6 +1131,7 @@ pub const Canvas = struct {
         const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(cy + hd)))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
         if (x0 >= x1 or y0 >= y1) return;
+        self.addDamage(x0, y0, x1, y1);
 
         const ca = @cos(-angle);
         const sa = @sin(-angle);
@@ -1111,6 +1176,8 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + size)))));
         const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + size)))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        if (x0 >= x1 or y0 >= y1) return;
+        self.addDamage(x0, y0, x1, y1);
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
@@ -1134,6 +1201,8 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
         const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        if (x0 >= x1 or y0 >= y1) return;
+        self.addDamage(x0, y0, x1, y1);
         // Interior fast-path: beyond a margin (radius+0.5) from every edge the coverage is
         // EXACTLY 1.0 (neither corner curve nor edge AA) → skip the SDF/@sqrt there. For
         // large fills (backdrop, stage, panels) that's the vast majority of the pixels:
@@ -1477,6 +1546,13 @@ pub const Canvas = struct {
         if (g.bitmap.len == 0) return;
         const gx0 = pen_x + g.xoff;
         const gy0 = baseline_y + g.yoff;
+        if (g.w > 0 and g.h > 0) {
+            const bx0: u32 = @intCast(@max(0, gx0));
+            const by0: u32 = @intCast(@max(0, gy0));
+            const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, gx0 + g.w))));
+            const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, gy0 + g.h))));
+            self.addDamage(bx0, by0, bx1, by1);
+        }
         const W: i32 = @intCast(self.width);
         const H: i32 = @intCast(self.height);
         // The text color is constant across the glyph: linearize it once, not per pixel.
@@ -1794,4 +1870,30 @@ test "blitImage, blitMask and blitImageRot blit correctly" {
     canvas.blitImageRot(10.0, 10.0, 16.0, 16.0, &src_img, 2, 2, 0.0);
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), px[10 * W + 10]);
 }
+
+test "Canvas damage tracking records and unions modified regions" {
+    const W: u32 = 100;
+    const H: u32 = 100;
+    var pixels: [W * H]u32 = undefined;
+    var canvas = Canvas.init(&pixels, W, H);
+
+    try std.testing.expectEqual(@as(?Canvas.DamageRect, null), canvas.damage);
+
+    canvas.fillRoundedRect(10.0, 20.0, 30.0, 40.0, 0.0, Color.rgba(1.0, 0.0, 0.0, 1.0));
+    try std.testing.expect(canvas.damage != null);
+    const d1 = canvas.damage.?;
+    try std.testing.expect(d1.x0 <= 10 and d1.y0 <= 20);
+    try std.testing.expect(d1.x1 >= 40 and d1.y1 >= 60);
+
+    canvas.resetDamage();
+    try std.testing.expectEqual(@as(?Canvas.DamageRect, null), canvas.damage);
+
+    // Test multiple draws accumulating bounding box
+    canvas.fillRoundedRect(5.0, 5.0, 10.0, 10.0, 0.0, Color.rgba(0.0, 1.0, 0.0, 1.0));
+    canvas.fillRoundedRect(50.0, 60.0, 20.0, 20.0, 0.0, Color.rgba(0.0, 0.0, 1.0, 1.0));
+    const d2 = canvas.damage.?;
+    try std.testing.expect(d2.x0 <= 5 and d2.y0 <= 5);
+    try std.testing.expect(d2.x1 >= 70 and d2.y1 >= 80);
+}
+
 
