@@ -1420,6 +1420,105 @@ pub const Ui = struct {
         return sig.clicked;
     }
 
+    // --- advanced widgets (Issue #22) -------------------------------------------------------------
+
+    /// Collapsible tree node. Renders a toggle arrow (▶ / ▼) and label.
+    /// Returns true if the node is expanded, false if collapsed.
+    pub fn treeNode(ui: *Ui, label_: []const u8, is_open: *bool) bool {
+        const t = ui.theme;
+        const id = ui.makeId(label_);
+        const arrow = if (is_open.*) "▼ " else "▶ ";
+        const r = ui.allocRect(ui.availW(), t.ctl_h);
+        ui.navFocusHook(id, false);
+        const sig = ui.interact(id, r);
+        if (sig.clicked) {
+            is_open.* = !is_open.*;
+        }
+        const bg = if (sig.hovered) t.bg_widget_hot else t.bg_widget;
+        ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, bg);
+
+        var buf: [256]u8 = undefined;
+        const text_str = std.fmt.bufPrint(&buf, "{s}{s}", .{ arrow, label_ }) catch label_;
+        ui.drawTextIn(r, text_str, .left, t.font_size, .regular, t.text);
+        return is_open.*;
+    }
+
+    /// Interactive color picker with swatch preview and R, G, B, A sliders.
+    /// Returns true if the color was modified.
+    pub fn colorPicker(ui: *Ui, label_: []const u8, color: *Color) bool {
+        ui.beginRow();
+        defer ui.endRow();
+
+        const t = ui.theme;
+        const swatch_r = ui.allocRect(t.ctl_h, t.ctl_h);
+        ui.canvas.fillRoundedRect(swatch_r.x, swatch_r.y, swatch_r.w, swatch_r.h, t.radius, color.*);
+
+        var changed = false;
+        var r_val = color.r;
+        var g_val = color.g;
+        var b_val = color.b;
+        var a_val = color.a;
+
+        var r_buf: [64]u8 = undefined;
+        var g_buf: [64]u8 = undefined;
+        var b_buf: [64]u8 = undefined;
+        var a_buf: [64]u8 = undefined;
+
+        const r_lbl = std.fmt.bufPrint(&r_buf, "{s}_R", .{label_}) catch "R";
+        const g_lbl = std.fmt.bufPrint(&g_buf, "{s}_G", .{label_}) catch "G";
+        const b_lbl = std.fmt.bufPrint(&b_buf, "{s}_B", .{label_}) catch "B";
+        const a_lbl = std.fmt.bufPrint(&a_buf, "{s}_A", .{label_}) catch "A";
+
+        if (ui.slider(r_lbl, &r_val, 0.0, 1.0)) { color.r = r_val; changed = true; }
+        if (ui.slider(g_lbl, &g_val, 0.0, 1.0)) { color.g = g_val; changed = true; }
+        if (ui.slider(b_lbl, &b_val, 0.0, 1.0)) { color.b = b_val; changed = true; }
+        if (ui.slider(a_lbl, &a_val, 0.0, 1.0)) { color.a = a_val; changed = true; }
+
+        return changed;
+    }
+
+    /// Renders a tabular header row with column titles.
+    pub fn tableHeader(ui: *Ui, columns: []const []const u8, col_widths: []const f32) void {
+        const t = ui.theme;
+        const h = t.ctl_h;
+        const total_w = ui.availW();
+        const r = ui.allocRect(total_w, h);
+        ui.canvas.fillRoundedRect(r.x, r.y, r.w, r.h, t.radius, t.bg_widget_hot);
+
+        var cur_x = r.x;
+        for (columns, 0..) |col, i| {
+            const w = if (i < col_widths.len) col_widths[i] else (total_w / @as(f32, @floatFromInt(columns.len)));
+            const cell_r = Rect{ .x = cur_x, .y = r.y, .w = w, .h = h };
+            ui.drawTextIn(cell_r, col, .left, t.font_size, .bold, t.text);
+            cur_x += w;
+        }
+    }
+
+    pub const RichStyle = struct {
+        color: Color = paint.Color.rgba(1.0, 1.0, 1.0, 1.0),
+        size: u16 = 14,
+        style: text.Style = .regular,
+    };
+
+    pub const RichSpan = struct {
+        text: []const u8,
+        style: RichStyle = .{},
+    };
+
+    /// Renders a rich text label with multi-styled spans in sequence.
+    pub fn richText(ui: *Ui, spans: []const RichSpan) void {
+        const t = ui.theme;
+        ui.beginRow();
+        defer ui.endRow();
+
+        for (spans) |span| {
+            const sz = if (span.style.size > 0) span.style.size else t.font_size;
+            const tw = ui.measureText(span.text, sz, span.style.style);
+            const r = ui.allocRect(tw, @floatFromInt(sz + 4));
+            ui.drawTextIn(r, span.text, .left, sz, span.style.style, span.style.color);
+        }
+    }
+
     // --- text field ----------------------------------------------------------------------------------
 
     pub const TextEdit = enum { idle, changed, submitted };
@@ -2943,3 +3042,23 @@ test "slider: press on track sets the value" {
     try testing.expect(changed);
     try testing.expect(v > 20 and v < 80);
 }
+
+test "advanced widgets: treeNode, colorPicker, tableHeader, richText" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+
+    var open = false;
+    var col = Color.rgba(1.0, 0.0, 0.0, 1.0);
+
+    var ui = h.frame(10, &.{});
+    try testing.expect(!ui.treeNode("Tree", &open));
+    ui.tableHeader(&.{ "Col 1", "Col 2" }, &.{ 100.0, 100.0 });
+    try testing.expect(!ui.colorPicker("Picker", &col));
+    ui.richText(&.{
+        .{ .text = "Hello ", .style = .{ .color = Color.rgba(1, 0, 0, 1) } },
+        .{ .text = "World", .style = .{ .color = Color.rgba(0, 1, 0, 1), .size = 18 } },
+    });
+    _ = ui.end();
+}
+
