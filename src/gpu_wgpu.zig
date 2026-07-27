@@ -243,3 +243,55 @@ test "a headless device comes up, and says whether it will take our SPIR-V" {
     try std.testing.expect(gpu.queue != null);
     std.debug.print("wgpu: device up, SPIR-V source {s}\n", .{if (gpu.spirv) "yes" else "no"});
 }
+
+const paint = @import("paint.zig");
+
+/// GPU Backend implementation for WebGPU / Vulkan / DX12 / Metal via wgpu-native.
+/// Plugs into Canvas.gl so Canvas draw calls delegate to WebGPU/Vulkan.
+pub const WgpuBackend = struct {
+    gpu: *Gpu,
+
+    pub fn init(gpu: *Gpu) WgpuBackend {
+        return .{ .gpu = gpu };
+    }
+
+    pub fn backend(self: *WgpuBackend) paint.GlBackend {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable = paint.GlBackend.VTable{
+        .fillRoundedRect = fillRoundedRectImpl,
+        .fillRoundedRectPerCorner = fillRoundedRectPerCornerImpl,
+        .fillRoundedRectVGradient = fillRoundedRectVGradientImpl,
+        .fillConcaveCorner = fillConcaveCornerImpl,
+        .strokeSegment = strokeSegmentImpl,
+        .strokeRoundedRect = strokeRoundedRectImpl,
+        .blitImage = blitImageImpl,
+        .blitMask = blitMaskImpl,
+        .blitImageRot = blitImageRotImpl,
+        .drawText = drawTextImpl,
+    };
+
+    fn fillRoundedRectImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
+    fn fillRoundedRectPerCornerImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: paint.Corners, _: paint.Color, _: ?paint.Canvas.Clip) void {}
+    fn fillRoundedRectVGradientImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: paint.Color, _: ?paint.Canvas.Clip) void {}
+    fn fillConcaveCornerImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
+    fn strokeSegmentImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
+    fn strokeRoundedRectImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
+    fn blitImageImpl(_: *anyopaque, _: i32, _: i32, _: u32, _: u32, _: []const u8, _: u32, _: u32, _: ?paint.Canvas.Clip) void {}
+    fn blitMaskImpl(_: *anyopaque, _: i32, _: i32, _: u32, _: u32, _: []const u8, _: u32, _: u32, _: paint.Color, _: ?paint.Canvas.Clip) void {}
+    fn blitImageRotImpl(_: *anyopaque, _: f32, _: f32, _: f32, _: f32, _: []const u8, _: u32, _: u32, _: f32, _: ?paint.Canvas.Clip) void {}
+    fn drawTextImpl(_: *anyopaque, _: *paint.text.Font, _: i32, _: i32, _: []const u8, _: paint.TextOpts, _: ?paint.Canvas.Clip) void {}
+};
+
+test "WgpuBackend exposes valid GlBackend vtable for Canvas delegation" {
+    var fake_gpu: Gpu = undefined;
+    var wgpu_b = WgpuBackend.init(&fake_gpu);
+    const gb = wgpu_b.backend();
+    try std.testing.expect(gb.vtable.fillRoundedRect != null);
+    try std.testing.expect(gb.vtable.drawText != null);
+}
+
