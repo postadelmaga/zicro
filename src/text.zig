@@ -11,7 +11,10 @@
 const std = @import("std");
 const c = @cImport({
     @cInclude("stb_truetype.h");
+    @cInclude("hb.h");
 });
+
+pub const has_harfbuzz = @hasDecl(c, "hb_buffer_create");
 
 /// Available faces. The default embeds regular+bold; italic/bold_italic are
 /// optional and, when absent, fall back to bold/regular.
@@ -37,9 +40,46 @@ const Face = struct {
     // Owned TTF bytes (font loaded from disk): they must outlive `info`, which
     // points into them. `null` for statically embedded fonts.
     owned: ?[]u8 = null,
+    hb_blob: ?*c.hb_blob_t = null,
+    hb_face: ?*c.hb_face_t = null,
+    hb_font: ?*c.hb_font_t = null,
+
+    fn initHb(self: *Face, ttf: []const u8) void {
+        if (!has_harfbuzz) return;
+        const blob = c.hb_blob_create(@ptrCast(ttf.ptr), @intCast(ttf.len), c.HB_MEMORY_MODE_READONLY, null, null);
+        if (blob) |b| {
+            const face = c.hb_face_create(b, 0);
+            if (face) |f| {
+                const font = c.hb_font_create(f);
+                self.hb_blob = b;
+                self.hb_face = f;
+                self.hb_font = font;
+            } else {
+                c.hb_blob_destroy(b);
+            }
+        }
+    }
+
+    fn deinit(self: *Face, gpa: std.mem.Allocator) void {
+        if (has_harfbuzz) {
+            if (self.hb_font) |f| c.hb_font_destroy(f);
+            if (self.hb_face) |f| c.hb_face_destroy(f);
+            if (self.hb_blob) |b| c.hb_blob_destroy(b);
+        }
+        if (self.owned) |b| gpa.free(b);
+    }
 };
 
-const CacheKey = struct { px: u16, style: Style, sub_x: u2, cp: u32 };
+const CacheKey = struct { px: u16, style: Style, sub_x: u2, cp_or_idx: u32, is_index: bool = false };
+
+pub const ShapedGlyph = struct {
+    glyph_index: u32,
+    x_advance: f32,
+    y_advance: f32,
+    x_offset: f32,
+    y_offset: f32,
+    face_info: *c.stbtt_fontinfo,
+};
 
 /// A font: up to 4 styled faces + an ordered fallback chain + a shared glyph
 /// cache (key px+style+cp). When the primary face lacks a codepoint, the glyph
@@ -73,20 +113,21 @@ pub const Font = struct {
         const p: [*c]const u8 = @ptrCast(ttf.ptr);
         const off = c.stbtt_GetFontOffsetForIndex(p, 0);
         if (c.stbtt_InitFont(&face.info, p, off) == 0) return error.FontInit;
+        face.initHb(ttf);
         const idx = @intFromEnum(style);
         // Replacing a face: the cached glyphs of that style go stale, but the key
         // includes the style and not the face — the cache is cleared for
         // simplicity and correctness (faces are changed rarely).
-        if (self.faces[idx]) |old| {
-            if (old.owned) |b| self.gpa.free(b);
+        if (self.faces[idx]) |*old| {
+            old.deinit(self.gpa);
             self.clearCache();
         }
         self.faces[idx] = face;
     }
 
     /// Loads a face from a .ttf/.otf file on disk (bytes owned by the font).
-    pub fn loadFace(self: *Font, style: Style, path: []const u8) !void {
-        const bytes = try std.fs.cwd().readFileAlloc(self.gpa, path, 64 * 1024 * 1024);
+    pub fn loadFace(self: *Font, io: std.Io, style: Style, path: []const u8) !void {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, self.gpa, .limited(64 * 1024 * 1024));
         errdefer self.gpa.free(bytes);
         try self.setFace(style, bytes, true);
     }
@@ -99,8 +140,16 @@ pub const Font = struct {
         const p: [*c]const u8 = @ptrCast(ttf.ptr);
         const off = c.stbtt_GetFontOffsetForIndex(p, 0);
         if (c.stbtt_InitFont(&face.info, p, off) == 0) return error.FontInit;
+        face.initHb(ttf);
         try self.fallbacks.append(self.gpa, face);
         self.clearCache();
+    }
+
+    /// Loads a fallback face from a .ttf/.otf file on disk (bytes owned by the font).
+    pub fn loadFallback(self: *Font, io: std.Io, path: []const u8) !void {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, self.gpa, .limited(64 * 1024 * 1024));
+        errdefer self.gpa.free(bytes);
+        try self.addFallback(bytes, true);
     }
 
     /// Whether some face (styled or fallback) can render `cp` with a real glyph
@@ -126,6 +175,11 @@ pub const Font = struct {
     /// Effective face for a style, with fallback: bold_italic→italic→bold→
     /// regular, so a font with only regular+bold stays usable.
     fn faceFor(self: *Font, style: Style) ?*c.stbtt_fontinfo {
+        if (self.faceStructFor(style)) |f| return &f.info;
+        return null;
+    }
+
+    fn faceStructFor(self: *Font, style: Style) ?*Face {
         const order: []const Style = switch (style) {
             .regular => &.{.regular},
             .bold => &.{ .bold, .regular },
@@ -133,7 +187,7 @@ pub const Font = struct {
             .bold_italic => &.{ .bold_italic, .bold, .italic, .regular },
         };
         for (order) |s| {
-            if (self.faces[@intFromEnum(s)]) |*f| return &f.info;
+            if (self.faces[@intFromEnum(s)]) |*f| return f;
         }
         return null;
     }
@@ -157,7 +211,7 @@ pub const Font = struct {
 
     /// Rasterized glyph for (size, style, subpixel_x, codepoint), from the cache.
     pub fn getGlyph(self: *Font, px: u16, style: Style, sub_x: u2, cp: u32) !*const Glyph {
-        const key = CacheKey{ .px = px, .style = style, .sub_x = sub_x, .cp = cp };
+        const key = CacheKey{ .px = px, .style = style, .sub_x = sub_x, .cp_or_idx = cp, .is_index = false };
         if (self.cache.getPtr(key)) |g| return g;
 
         const info = self.faceForCp(style, cp) orelse return error.NoFace;
@@ -189,11 +243,88 @@ pub const Font = struct {
             .advance = @as(f32, @floatFromInt(adv)) * scale,
             .bitmap = owned,
         };
-        // getOrPut instead of put+getPtr: one hash lookup instead of two (the entry is
-        // always new — the miss was checked above and the font is single-threaded).
         const gop = try self.cache.getOrPut(self.gpa, key);
         gop.value_ptr.* = g;
         return gop.value_ptr;
+    }
+
+    /// Rasterized glyph for a specific glyph index in `info`, from the cache.
+    pub fn getGlyphByIndex(self: *Font, info: *c.stbtt_fontinfo, px: u16, style: Style, sub_x: u2, glyph_index: u32) !*const Glyph {
+        const key = CacheKey{ .px = px, .style = style, .sub_x = sub_x, .cp_or_idx = glyph_index, .is_index = true };
+        if (self.cache.getPtr(key)) |g| return g;
+
+        const scale = scaleFor(info, px);
+
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var xoff: c_int = 0;
+        var yoff: c_int = 0;
+        const shift_x = @as(f32, @floatFromInt(sub_x)) * 0.25;
+        const bmp = c.stbtt_GetGlyphBitmapSubpixel(info, scale, scale, shift_x, 0.0, @intCast(glyph_index), &w, &h, &xoff, &yoff);
+        const owned: []const u8 = if (bmp != null and w > 0 and h > 0) blk: {
+            const n: usize = @intCast(w * h);
+            break :blk try self.gpa.dupe(u8, bmp[0..n]);
+        } else &[_]u8{};
+        if (bmp != null) c.stbtt_FreeBitmap(bmp, null);
+        errdefer if (owned.len > 0) self.gpa.free(owned);
+
+        var adv: c_int = 0;
+        var lsb: c_int = 0;
+        c.stbtt_GetGlyphHMetrics(info, @intCast(glyph_index), &adv, &lsb);
+
+        const g = Glyph{
+            .w = w,
+            .h = h,
+            .xoff = xoff,
+            .yoff = yoff,
+            .advance = @as(f32, @floatFromInt(adv)) * scale,
+            .bitmap = owned,
+        };
+        const gop = try self.cache.getOrPut(self.gpa, key);
+        gop.value_ptr.* = g;
+        return gop.value_ptr;
+    }
+
+    /// Shapes `text` into a sequence of positioned glyphs using HarfBuzz.
+    /// Returns `true` if shaping was successfully performed, `false` if HarfBuzz is unavailable
+    /// or font has no HarfBuzz handle.
+    pub fn shapeText(self: *Font, px: u16, style: Style, text: []const u8, out: *std.ArrayListUnmanaged(ShapedGlyph), alloc: std.mem.Allocator) !bool {
+        if (!has_harfbuzz) return false;
+        const face = self.faceStructFor(style) orelse return false;
+        const hb_font = face.hb_font orelse return false;
+
+        const buf = c.hb_buffer_create() orelse return false;
+        defer c.hb_buffer_destroy(buf);
+
+        c.hb_buffer_add_utf8(buf, @ptrCast(text.ptr), @intCast(text.len), 0, @intCast(text.len));
+        c.hb_buffer_guess_segment_properties(buf);
+
+        const scale = scaleFor(&face.info, px);
+        c.hb_shape(hb_font, buf, null, 0);
+
+        var count: u32 = 0;
+        const infos = c.hb_buffer_get_glyph_infos(buf, &count);
+        const positions = c.hb_buffer_get_glyph_positions(buf, &count);
+        if (count == 0) return true;
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const g_idx = infos[i].codepoint;
+            const x_adv = @as(f32, @floatFromInt(positions[i].x_advance)) * scale;
+            const y_adv = @as(f32, @floatFromInt(positions[i].y_advance)) * scale;
+            const x_off = @as(f32, @floatFromInt(positions[i].x_offset)) * scale;
+            const y_off = @as(f32, @floatFromInt(positions[i].y_offset)) * scale;
+
+            try out.append(alloc, .{
+                .glyph_index = g_idx,
+                .x_advance = x_adv,
+                .y_advance = y_adv,
+                .x_offset = x_off,
+                .y_offset = y_off,
+                .face_info = &face.info,
+            });
+        }
+        return true;
     }
 
     pub fn getKernAdvance(self: *Font, style: Style, px: u16, cp1: u32, cp2: u32) f32 {
@@ -228,6 +359,7 @@ pub const Font = struct {
     /// Width in pixels of `s` (sum of advances + kerning), for centering/aligning.
     pub fn measure(self: *Font, px: u16, style: Style, s: []const u8) i32 {
         var w: GlyphWalker = .init(self, px, style, s);
+        defer w.deinit();
         while (w.next()) |_| {}
         return @intFromFloat(@round(w.pen_x));
     }
@@ -235,10 +367,10 @@ pub const Font = struct {
     pub fn deinit(self: *Font) void {
         self.clearCache();
         self.cache.deinit(self.gpa);
-        for (self.faces) |maybe| {
-            if (maybe) |f| if (f.owned) |b| self.gpa.free(b);
+        for (&self.faces) |*maybe| {
+            if (maybe.*) |*f| f.deinit(self.gpa);
         }
-        for (self.fallbacks.items) |f| if (f.owned) |b| self.gpa.free(b);
+        for (self.fallbacks.items) |*f| f.deinit(self.gpa);
         self.fallbacks.deinit(self.gpa);
     }
 };
@@ -258,6 +390,11 @@ pub const GlyphWalker = struct {
     /// Quantize `pen_x`'s fraction into `glyph.sub_x` (crisp small text at fixed pixel
     /// sizes); off for `measure`, which only wants the total advance.
     subpixel: bool = false,
+    shaping: bool = true,
+
+    shaped_items: std.ArrayListUnmanaged(ShapedGlyph) = .empty,
+    shaped_idx: usize = 0,
+    shaped_init: bool = false,
 
     pub fn init(font: *Font, px: u16, style: Style, s: []const u8) GlyphWalker {
         return .{ .font = font, .px = px, .style = style, .s = s };
@@ -267,9 +404,37 @@ pub const GlyphWalker = struct {
         return .{ .font = font, .px = px, .style = style, .s = s, .pen_x = pen_x, .subpixel = true };
     }
 
+    pub fn deinit(w: *GlyphWalker) void {
+        w.shaped_items.deinit(w.font.gpa);
+    }
+
     /// One glyph and the pen position (rounded, pixel) to draw it at. `null` at end of
     /// string; advances `pen_x` by the glyph's width so the next call continues the run.
     pub fn next(w: *GlyphWalker) ?struct { glyph: *const Glyph, pen_x: i32 } {
+        if (w.shaping and !w.shaped_init) {
+            w.shaped_init = true;
+            _ = w.font.shapeText(w.px, w.style, w.s, &w.shaped_items, w.font.gpa) catch false;
+        }
+
+        if (w.shaped_items.items.len > 0) {
+            if (w.shaped_idx >= w.shaped_items.items.len) {
+                w.shaped_items.deinit(w.font.gpa);
+                w.shaped_items = .empty;
+                return null;
+            }
+            const sg = w.shaped_items.items[w.shaped_idx];
+            w.shaped_idx += 1;
+
+            const sub_x: u2 = if (w.subpixel)
+                @intCast(@as(i32, @intFromFloat(@round(((w.pen_x + sg.x_offset) - @floor(w.pen_x + sg.x_offset)) * 4.0))) & 3)
+            else
+                0;
+            const glyph = w.font.getGlyphByIndex(sg.face_info, w.px, w.style, sub_x, sg.glyph_index) catch return w.next();
+            const ipen_x: i32 = @intFromFloat(@floor(w.pen_x + sg.x_offset + 0.5));
+            w.pen_x += sg.x_advance;
+            return .{ .glyph = glyph, .pen_x = ipen_x };
+        }
+
         if (w.i >= w.s.len) return null;
         const seq = std.unicode.utf8ByteSequenceLength(w.s[w.i]) catch 1;
         const end = @min(w.i + seq, w.s.len);
@@ -323,14 +488,13 @@ test "fallback chain resolves a codepoint the primary lacks" {
     try std.testing.expect(!font.hasGlyph(.regular, snowman));
     try std.testing.expect(font.hasGlyph(.regular, 'A')); // but it has Latin
 
-    // DejaVu Sans (glyf TrueType, ubiquitous) does. Read its bytes via the io API
-    // and register as a fallback; skip if this box lacks the font.
+    // DejaVu Sans (glyf TrueType, ubiquitous) does. Read its bytes via loadFallback;
+    // skip if this box lacks the font.
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const deja = "/usr/share/fonts/TTF/DejaVuSans.ttf";
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, deja, gpa, .limited(64 * 1024 * 1024)) catch return;
-    try font.addFallback(bytes, true); // font owns & frees the bytes
+    font.loadFallback(io, deja) catch return;
 
     try std.testing.expect(font.hasGlyph(.regular, snowman)); // now coverable
     const g = try font.getGlyph(32, .regular, 0, snowman);
@@ -345,3 +509,31 @@ test "fallback chain resolves a codepoint the primary lacks" {
     // A Latin glyph still comes from the primary (Hack), unaffected by the fallback.
     try std.testing.expect((try font.getGlyph(32, .regular, 0, 'A')).advance > 0);
 }
+
+test "HarfBuzz shaping shapes text runs and produces positioned glyphs" {
+    if (!has_harfbuzz) return;
+    const gpa = std.testing.allocator;
+    var font = try Font.initDefault(gpa);
+    defer font.deinit();
+
+    var shaped: std.ArrayListUnmanaged(ShapedGlyph) = .empty;
+    defer shaped.deinit(gpa);
+
+    const text_str = "hello world";
+    const ok = try font.shapeText(24, .regular, text_str, &shaped, gpa);
+    try std.testing.expect(ok);
+    try std.testing.expectEqual(@as(usize, text_str.len), shaped.items.len);
+
+    // Test GlyphWalker with shaping
+    var walker = GlyphWalker.init(&font, 24, .regular, text_str);
+    defer walker.deinit();
+
+    var count: usize = 0;
+    while (walker.next()) |item| {
+        try std.testing.expect(item.glyph.advance > 0);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, text_str.len), count);
+}
+
+

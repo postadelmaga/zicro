@@ -68,21 +68,73 @@ const unpremul_recip: [256]u32 = blk: {
 /// LUT (no per-pixel divide). The shared present-conversion for any backend that composes
 /// in premultiplied ARGB (the analytic chrome/glyph path) but presents straight RGBA.
 pub fn premulToStraightRgba(src: []const u32, dst: []u32) void {
-    for (src, dst) |p, *o| {
-        const a: u32 = (p >> 24) & 0xff;
-        if (a == 0) {
-            o.* = 0;
+    const n = @min(src.len, dst.len);
+    const vec_len = 4;
+    var i: usize = 0;
+    while (i + vec_len <= n) : (i += vec_len) {
+        const p_vec: @Vector(4, u32) = src[i..][0..4].*;
+        const a_vec = (p_vec >> @as(@Vector(4, u5), @splat(24))) & @as(@Vector(4, u32), @splat(0xff));
+
+        // Trivial transparent block fast-path
+        if (@reduce(.And, a_vec == @as(@Vector(4, u32), @splat(0)))) {
+            dst[i..][0..4].* = @splat(0);
             continue;
         }
-        if (a == 255) { // opaque: just swap R↔B (premul == straight)
-            o.* = (@as(u32, 255) << 24) | ((p & 0xff) << @as(u5, 16)) | (p & 0x0000ff00) | ((p >> 16) & 0xff);
+
+        // Trivial opaque block fast-path (R <-> B byte swap)
+        if (@reduce(.And, a_vec == @as(@Vector(4, u32), @splat(255)))) {
+            const r = (p_vec >> @as(@Vector(4, u5), @splat(16))) & @as(@Vector(4, u32), @splat(0xff));
+            const g = p_vec & @as(@Vector(4, u32), @splat(0x0000ff00));
+            const b = (p_vec & @as(@Vector(4, u32), @splat(0xff))) << @as(@Vector(4, u5), @splat(16));
+            const a = @as(@Vector(4, u32), @splat(0xff000000));
+            dst[i..][0..4].* = a | b | g | r;
+            continue;
+        }
+
+        // General SIMD path per lane
+        const a_arr: [4]u32 = a_vec;
+        const m_vec: @Vector(4, u32) = .{
+            unpremul_recip[a_arr[0]],
+            unpremul_recip[a_arr[1]],
+            unpremul_recip[a_arr[2]],
+            unpremul_recip[a_arr[3]],
+        };
+
+        const r_in = (p_vec >> @as(@Vector(4, u5), @splat(16))) & @as(@Vector(4, u32), @splat(0xff));
+        const g_in = (p_vec >> @as(@Vector(4, u5), @splat(8))) & @as(@Vector(4, u32), @splat(0xff));
+        const b_in = p_vec & @as(@Vector(4, u32), @splat(0xff));
+
+        const sr_v: @Vector(4, u32) = @min(@as(@Vector(4, u32), @splat(255)), (r_in * m_vec) >> @as(@Vector(4, u5), @splat(16)));
+        const sg_v: @Vector(4, u32) = @min(@as(@Vector(4, u32), @splat(255)), (g_in * m_vec) >> @as(@Vector(4, u5), @splat(16)));
+        const sb_v: @Vector(4, u32) = @min(@as(@Vector(4, u32), @splat(255)), (b_in * m_vec) >> @as(@Vector(4, u5), @splat(16)));
+
+        const is_zero = a_vec == @as(@Vector(4, u32), @splat(0));
+        const res_a = a_vec << @as(@Vector(4, u5), @splat(24));
+        const res_b = sb_v << @as(@Vector(4, u5), @splat(16));
+        const res_g = sg_v << @as(@Vector(4, u5), @splat(8));
+        const res_r = sr_v;
+
+        const out_vec = res_a | res_b | res_g | res_r;
+        dst[i..][0..4].* = @select(u32, is_zero, @as(@Vector(4, u32), @splat(0)), out_vec);
+    }
+
+    // Scalar tail loop for remaining pixels
+    while (i < n) : (i += 1) {
+        const p = src[i];
+        const a: u32 = (p >> 24) & 0xff;
+        if (a == 0) {
+            dst[i] = 0;
+            continue;
+        }
+        if (a == 255) {
+            dst[i] = (@as(u32, 255) << 24) | ((p & 0xff) << @as(u5, 16)) | (p & 0x0000ff00) | ((p >> 16) & 0xff);
             continue;
         }
         const m = unpremul_recip[a];
         const sr: u32 = @min(@as(u32, 255), (((p >> 16) & 0xff) * m) >> 16);
         const sg: u32 = @min(@as(u32, 255), (((p >> 8) & 0xff) * m) >> 16);
         const sb: u32 = @min(@as(u32, 255), ((p & 0xff) * m) >> 16);
-        o.* = (a << @as(u5, 24)) | (sb << @as(u5, 16)) | (sg << @as(u5, 8)) | sr;
+        dst[i] = (a << @as(u5, 24)) | (sb << @as(u5, 16)) | (sg << @as(u5, 8)) | sr;
     }
 }
 
@@ -538,6 +590,52 @@ pub const Canvas = struct {
         };
     }
 
+    inline fn packOpaqueU8(self: *const Canvas, r: u8, g: u8, b: u8) u32 {
+        return switch (self.format) {
+            .argb_premul => (0xFF000000) | (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b),
+            .rgba_straight => (0xFF000000) | (@as(u32, b) << 16) | (@as(u32, g) << 8) | @as(u32, r),
+        };
+    }
+
+    /// Fast integer alpha-over path for straight RGBA u8 pixels onto packed `dst`.
+    inline fn overColorU8(self: *const Canvas, dst: u32, sr: u8, sg: u8, sb: u8, sa: u8) u32 {
+        if (sa == 0) return dst;
+        if (sa == 255) return self.packOpaqueU8(sr, sg, sb);
+        switch (self.format) {
+            .argb_premul => {
+                const inv_a: u32 = 255 - sa;
+                const da = (dst >> 24) & 0xff;
+                const dr = (dst >> 16) & 0xff;
+                const dg = (dst >> 8) & 0xff;
+                const db = dst & 0xff;
+
+                const sr_p = (@as(u32, sr) * sa * 257 + 257) >> 16;
+                const sg_p = (@as(u32, sg) * sa * 257 + 257) >> 16;
+                const sb_p = (@as(u32, sb) * sa * 257 + 257) >> 16;
+
+                const oa = sa + ((da * inv_a * 257 + 257) >> 16);
+                const or_c = sr_p + ((dr * inv_a * 257 + 257) >> 16);
+                const og_c = sg_p + ((dg * inv_a * 257 + 257) >> 16);
+                const ob_c = sb_p + ((db * inv_a * 257 + 257) >> 16);
+
+                return (@as(u32, @intCast(@min(255, oa))) << 24) |
+                    (@as(u32, @intCast(@min(255, or_c))) << 16) |
+                    (@as(u32, @intCast(@min(255, og_c))) << 8) |
+                    @as(u32, @intCast(@min(255, ob_c)));
+            },
+            .rgba_straight => {
+                const inv: f32 = 1.0 / 255.0;
+                return self.overColor(
+                    dst,
+                    @as(f32, @floatFromInt(sr)) * inv,
+                    @as(f32, @floatFromInt(sg)) * inv,
+                    @as(f32, @floatFromInt(sb)) * inv,
+                    @as(f32, @floatFromInt(sa)) * inv,
+                );
+            },
+        }
+    }
+
     /// Restrict subsequent drawing to `(x,y,w,h)` (canvas coords), intersected with the
     /// canvas. Returns the previous clip so callers can restore it
     /// (`const saved = canvas.setClip(...); defer canvas.clip = saved;`).
@@ -823,7 +921,21 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, dst_x + @as(i32, @intCast(dst_w))))));
         const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
-        const inv: f32 = 1.0 / 255.0;
+        if (x0 >= x1 or y0 >= y1) return;
+
+        const width_span = x1 - x0;
+        var stack_sx_buf: [8192]u32 = undefined;
+        const sx_map: ?[]u32 = if (width_span <= stack_sx_buf.len) stack_sx_buf[0..width_span] else null;
+        if (sx_map) |m| {
+            var i: usize = 0;
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+                m[i] = @min(src_w - 1, rel_x * src_w / dst_w);
+                i += 1;
+            }
+        }
+
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const rel_y: u32 = @intCast(@as(i32, @intCast(py)) - dst_y);
@@ -831,18 +943,14 @@ pub const Canvas = struct {
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
-                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
-                const sx = @min(src_w - 1, rel_x * src_w / dst_w);
+                const sx = if (sx_map) |m| m[px - x0] else blk: {
+                    const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+                    break :blk @min(src_w - 1, rel_x * src_w / dst_w);
+                };
                 const si = (@as(usize, sy) * src_w + sx) * 4;
                 const a = src[si + 3];
                 if (a == 0) continue;
-                row[px] = self.overColor(
-                    row[px],
-                    @as(f32, @floatFromInt(src[si])) * inv,
-                    @as(f32, @floatFromInt(src[si + 1])) * inv,
-                    @as(f32, @floatFromInt(src[si + 2])) * inv,
-                    @as(f32, @floatFromInt(a)) * inv,
-                );
+                row[px] = self.overColorU8(row[px], src[si], src[si + 1], src[si + 2], a);
             }
         }
     }
@@ -911,6 +1019,21 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intCast(@max(0, dst_x + @as(i32, @intCast(dst_w))))));
         const by1: u32 = @min(self.height, @as(u32, @intCast(@max(0, dst_y + @as(i32, @intCast(dst_h))))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        if (x0 >= x1 or y0 >= y1) return;
+
+        const width_span = x1 - x0;
+        var stack_sx_buf: [8192]u32 = undefined;
+        const sx_map: ?[]u32 = if (width_span <= stack_sx_buf.len) stack_sx_buf[0..width_span] else null;
+        if (sx_map) |m| {
+            var i: usize = 0;
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+                m[i] = @min(src_w - 1, rel_x * src_w / dst_w);
+                i += 1;
+            }
+        }
+
         const inv: f32 = 1.0 / 255.0;
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
@@ -919,8 +1042,10 @@ pub const Canvas = struct {
             const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
             var px: u32 = x0;
             while (px < x1) : (px += 1) {
-                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
-                const sx = @min(src_w - 1, rel_x * src_w / dst_w);
+                const sx = if (sx_map) |m| m[px - x0] else blk: {
+                    const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+                    break :blk @min(src_w - 1, rel_x * src_w / dst_w);
+                };
                 const a = src[(@as(usize, sy) * src_w + sx) * 4 + 3];
                 if (a == 0) continue;
                 row[px] = self.overColor(row[px], tint.r, tint.g, tint.b, @as(f32, @floatFromInt(a)) * inv * tint.a);
@@ -941,9 +1066,17 @@ pub const Canvas = struct {
         const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(cx + hd)))));
         const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(cy + hd)))));
         const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        if (x0 >= x1 or y0 >= y1) return;
+
         const ca = @cos(-angle);
         const sa = @sin(-angle);
-        const inv: f32 = 1.0 / 255.0;
+        const inv_dw = 1.0 / dw;
+        const inv_dh = 1.0 / dh;
+        const half_dw = dw * 0.5;
+        const half_dh = dh * 0.5;
+        const src_w_f = @as(f32, @floatFromInt(src_w));
+        const src_h_f = @as(f32, @floatFromInt(src_h));
+
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const ry = @as(f32, @floatFromInt(py)) + 0.5 - cy;
@@ -953,21 +1086,15 @@ pub const Canvas = struct {
                 const rx = @as(f32, @floatFromInt(px)) + 0.5 - cx;
                 const lx = rx * ca - ry * sa; // inverse-rotate into local dst space
                 const ly = rx * sa + ry * ca;
-                const u = (lx + dw * 0.5) / dw;
-                const v = (ly + dh * 0.5) / dh;
+                const u = (lx + half_dw) * inv_dw;
+                const v = (ly + half_dh) * inv_dh;
                 if (u < 0 or u >= 1 or v < 0 or v >= 1) continue;
-                const sx: u32 = @min(src_w - 1, @as(u32, @intFromFloat(u * @as(f32, @floatFromInt(src_w)))));
-                const sy: u32 = @min(src_h - 1, @as(u32, @intFromFloat(v * @as(f32, @floatFromInt(src_h)))));
+                const sx: u32 = @min(src_w - 1, @as(u32, @intFromFloat(u * src_w_f)));
+                const sy: u32 = @min(src_h - 1, @as(u32, @intFromFloat(v * src_h_f)));
                 const si = (@as(usize, sy) * src_w + sx) * 4;
                 const a = src[si + 3];
                 if (a == 0) continue;
-                row[px] = self.overColor(
-                    row[px],
-                    @as(f32, @floatFromInt(src[si])) * inv,
-                    @as(f32, @floatFromInt(src[si + 1])) * inv,
-                    @as(f32, @floatFromInt(src[si + 2])) * inv,
-                    @as(f32, @floatFromInt(a)) * inv,
-                );
+                row[px] = self.overColorU8(row[px], src[si], src[si + 1], src[si + 2], a);
             }
         }
     }
@@ -1341,6 +1468,7 @@ pub const Canvas = struct {
     pub fn drawText(self: *Canvas, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts) void {
         if (self.gl) |g| return g.vtable.drawText(g.ptr, font, x, baseline_y, s, opts, self.clip);
         var w: text.GlyphWalker = .initAt(font, opts.size, opts.style, s, @floatFromInt(x));
+        defer w.deinit();
         while (w.next()) |gp| self.blitGlyph(gp.glyph, gp.pen_x, baseline_y, opts.color);
     }
 
@@ -1624,3 +1752,46 @@ test "drawChrome flat-core equals the per-pixel reference" {
         }
     }
 }
+
+test "blitImage, blitMask and blitImageRot blit correctly" {
+    const gpa = std.testing.allocator;
+    const W: u32 = 64;
+    const H: u32 = 64;
+    const px = try gpa.alloc(u32, W * H);
+    defer gpa.free(px);
+    @memset(px, 0);
+
+    var canvas = Canvas.init(px, W, H);
+
+    // 2x2 RGBA image (red, green, blue, white)
+    const src_img = [_]u8{
+        255, 0,   0,   255, // Red
+        0,   255, 0,   255, // Green
+        0,   0,   255, 255, // Blue
+        255, 255, 255, 255, // White
+    };
+
+    // Blit scaled to 16x16 at (10, 10)
+    canvas.blitImage(10, 10, 16, 16, &src_img, 2, 2);
+
+    // Top-left pixel of blitted rect (10,10) should be Red in premul ARGB: 0xFFFF0000
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), px[10 * W + 10]);
+    // Top-right pixel (25,10) should be Green: 0xFF00FF00
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), px[10 * W + 25]);
+    // Bottom-left pixel (10,25) should be Blue: 0xFF0000FF
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), px[25 * W + 10]);
+    // Bottom-right pixel (25,25) should be White: 0xFFFFFFFF
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), px[25 * W + 25]);
+
+    // Test blitMask
+    @memset(px, 0);
+    canvas.blitMask(0, 0, 10, 10, &src_img, 2, 2, Color.rgba(255, 0, 0, 1.0));
+    // Since tint is red and alpha is 255 for all 4 pixels, output should be opaque Red 0xFFFF0000
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), px[0]);
+
+    // Test blitImageRot (0 rotation should match plain blit)
+    @memset(px, 0);
+    canvas.blitImageRot(10.0, 10.0, 16.0, 16.0, &src_img, 2, 2, 0.0);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), px[10 * W + 10]);
+}
+

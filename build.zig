@@ -209,6 +209,7 @@ fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
     if (target.result.os.tag == .linux) {
         mod.linkSystemLibrary("wayland-client", .{});
         mod.linkSystemLibrary("asound", .{}); // ALSA: backend audio (audio_device.zig)
+        mod.linkSystemLibrary("harfbuzz", .{}); // HarfBuzz: text shaping (src/text.zig)
 
         // PipeWire: low-latency audio backend, preferred over ALSA at runtime when a
         // PipeWire graph is reachable. The pull-model pw_stream is bridged to zicro's
