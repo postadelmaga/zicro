@@ -539,6 +539,13 @@ pub const Ui = struct {
 
     const DdDraw = struct { rect: Rect, options: []const []const u8, selected: usize, content_h: f32 };
 
+    /// Auto-scales the theme geometry for HiDPI displays using the window's scale factor.
+    pub fn autoScale(ui: *Ui, win_scale: f32) void {
+        if (win_scale > 0.0 and win_scale != 1.0) {
+            ui.theme = ui.theme.scaled(win_scale);
+        }
+    }
+
     // --- frame lifecycle ---------------------------------------------------------------
 
     pub fn begin(
@@ -3061,4 +3068,17 @@ test "advanced widgets: treeNode, colorPicker, tableHeader, richText" {
     });
     _ = ui.end();
 }
+
+test "HiDPI autoScale adjusts theme geometry proportionally" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+
+    var ui = h.frame(10, &.{});
+    const orig_h = ui.theme.ctl_h;
+    ui.autoScale(2.0);
+    try testing.expectEqual(orig_h * 2.0, ui.theme.ctl_h);
+    _ = ui.end();
+}
+
 

@@ -57,6 +57,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     pointer_y: f32 = 0,
     pointer_serial: u32 = 0,
     cursor_shape: u32 = 1,
+    scale_factor: f32 = 1.0,
 
     // Multi-window on ONE connection (window-server shape): children share
     // the root's display/registry/globals and are driven by the root's run()
@@ -594,6 +595,17 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         defer input.destroy();
         input.add(0, 0, @intCast(bw), @intCast(bh));
         self.surface.?.setInputRegion(input);
+    }
+
+    pub fn scaleFactor(self: *const Window) f32 {
+        return self.scale_factor;
+    }
+
+    pub fn setScaleFactor(self: *Window, factor: f32) void {
+        if (factor > 0.0 and factor != self.scale_factor) {
+            self.scale_factor = factor;
+            self.needs_redraw = true;
+        }
     }
 
     const buffer_listener = wl.Buffer.Listener{ .release = onBufferRelease };
