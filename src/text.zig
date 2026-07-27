@@ -9,12 +9,19 @@
 //! (`Canvas.drawText`); here there is only rasterization, with no dependency on paint.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// HarfBuzz is only linked for the Linux desktop build (`addNativeDeps` in build.zig);
+// macOS/Windows/wasm/Android don't have the header on their include path, so pulling it
+// in unconditionally breaks every cross-target build (`hb.h` not found).
+const have_hb_lib = builtin.target.os.tag == .linux and builtin.target.abi != .android;
+
 const c = @cImport({
     @cInclude("stb_truetype.h");
-    @cInclude("hb.h");
+    if (have_hb_lib) @cInclude("hb.h");
 });
 
-pub const has_harfbuzz = @hasDecl(c, "hb_buffer_create");
+pub const has_harfbuzz = have_hb_lib and @hasDecl(c, "hb_buffer_create");
 
 /// Available faces. The default embeds regular+bold; italic/bold_italic are
 /// optional and, when absent, fall back to bold/regular.
@@ -40,9 +47,9 @@ const Face = struct {
     // Owned TTF bytes (font loaded from disk): they must outlive `info`, which
     // points into them. `null` for statically embedded fonts.
     owned: ?[]u8 = null,
-    hb_blob: ?*c.hb_blob_t = null,
-    hb_face: ?*c.hb_face_t = null,
-    hb_font: ?*c.hb_font_t = null,
+    hb_blob: if (have_hb_lib) ?*c.hb_blob_t else void = if (have_hb_lib) null else {},
+    hb_face: if (have_hb_lib) ?*c.hb_face_t else void = if (have_hb_lib) null else {},
+    hb_font: if (have_hb_lib) ?*c.hb_font_t else void = if (have_hb_lib) null else {},
 
     fn initHb(self: *Face, ttf: []const u8) void {
         if (!has_harfbuzz) return;
@@ -417,11 +424,11 @@ pub const GlyphWalker = struct {
         }
 
         if (w.shaped_items.items.len > 0) {
-            if (w.shaped_idx >= w.shaped_items.items.len) {
-                w.shaped_items.deinit(w.font.gpa);
-                w.shaped_items = .empty;
-                return null;
-            }
+            // Freed once by `deinit` (every caller `defer`s it), not here: freeing on
+            // exhaustion and resetting to `.empty` would make a stray extra `next()` call
+            // (after it already returned `null` once) silently fall through to the
+            // byte-walk path below and re-walk the string from `w.i == 0`, duplicating glyphs.
+            if (w.shaped_idx >= w.shaped_items.items.len) return null;
             const sg = w.shaped_items.items[w.shaped_idx];
             w.shaped_idx += 1;
 

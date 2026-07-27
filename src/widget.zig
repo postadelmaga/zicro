@@ -1453,12 +1453,19 @@ pub const Ui = struct {
     /// Interactive color picker with swatch preview and R, G, B, A sliders.
     /// Returns true if the color was modified.
     pub fn colorPicker(ui: *Ui, label_: []const u8, color: *Color) bool {
-        ui.beginRow();
-        defer ui.endRow();
-
         const t = ui.theme;
+
+        // Swatch + label share a row of their own; the R/G/B/A sliders below are each a
+        // full-width row (`slider` claims the whole row via `availW()` — composing several
+        // of them side by side in ONE row would starve every slider after the first of space).
+        ui.beginRow();
         const swatch_r = ui.allocRect(t.ctl_h, t.ctl_h);
         ui.canvas.fillRoundedRect(swatch_r.x, swatch_r.y, swatch_r.w, swatch_r.h, t.radius, color.*);
+        if (label_.len > 0) {
+            const label_r = ui.allocRect(ui.availW(), t.ctl_h);
+            ui.drawTextIn(label_r, label_, .left, t.font_size, .regular, t.text);
+        }
+        ui.endRow();
 
         var changed = false;
         var r_val = color.r;

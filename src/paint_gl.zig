@@ -354,6 +354,7 @@ pub const GlRecorder = struct {
     fn drawText(ptr: *anyopaque, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
         var w: text.GlyphWalker = .initAt(font, opts.size, opts.style, s, @floatFromInt(x));
+        defer w.deinit();
         while (w.next()) |gp| {
             const g = gp.glyph;
             if (g.bitmap.len == 0 or g.w <= 0 or g.h <= 0) continue;

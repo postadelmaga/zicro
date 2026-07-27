@@ -971,6 +971,25 @@ pub const Canvas = struct {
         }
     }
 
+    /// Precomputed per-column nearest-neighbour source-x lookup for a scaled blit's row
+    /// loop (shared by `blitImage`/`blitMask`): the mapping is the same for every row, so
+    /// computing it once instead of per-pixel drops the integer division to O(width) instead
+    /// of O(width*height). `null` when the span doesn't fit `buf` — the caller falls back to
+    /// the inline per-pixel computation.
+    fn scaleXMap(buf: []u32, x0: u32, x1: u32, dst_x: i32, dst_w: u32, src_w: u32) ?[]const u32 {
+        const span = x1 - x0;
+        if (span > buf.len) return null;
+        const m = buf[0..span];
+        var px: u32 = x0;
+        var i: usize = 0;
+        while (px < x1) : (px += 1) {
+            const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
+            m[i] = @min(src_w - 1, rel_x * src_w / dst_w);
+            i += 1;
+        }
+        return m;
+    }
+
     /// Blit an RGBA8 (straight-alpha, bytes R,G,B,A) sprite into the dst rect, source-over,
     /// nearest-neighbour scaled and honoring clip + canvas [`Format`]. For app icons/thumbnails.
     pub fn blitImage(self: *Canvas, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32) void {
@@ -984,18 +1003,8 @@ pub const Canvas = struct {
         if (x0 >= x1 or y0 >= y1) return;
         self.addDamage(x0, y0, x1, y1);
 
-        const width_span = x1 - x0;
         var stack_sx_buf: [8192]u32 = undefined;
-        const sx_map: ?[]u32 = if (width_span <= stack_sx_buf.len) stack_sx_buf[0..width_span] else null;
-        if (sx_map) |m| {
-            var i: usize = 0;
-            var px: u32 = x0;
-            while (px < x1) : (px += 1) {
-                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
-                m[i] = @min(src_w - 1, rel_x * src_w / dst_w);
-                i += 1;
-            }
-        }
+        const sx_map = scaleXMap(&stack_sx_buf, x0, x1, dst_x, dst_w, src_w);
 
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
@@ -1085,18 +1094,8 @@ pub const Canvas = struct {
         if (x0 >= x1 or y0 >= y1) return;
         self.addDamage(x0, y0, x1, y1);
 
-        const width_span = x1 - x0;
         var stack_sx_buf: [8192]u32 = undefined;
-        const sx_map: ?[]u32 = if (width_span <= stack_sx_buf.len) stack_sx_buf[0..width_span] else null;
-        if (sx_map) |m| {
-            var i: usize = 0;
-            var px: u32 = x0;
-            while (px < x1) : (px += 1) {
-                const rel_x: u32 = @intCast(@as(i32, @intCast(px)) - dst_x);
-                m[i] = @min(src_w - 1, rel_x * src_w / dst_w);
-                i += 1;
-            }
-        }
+        const sx_map = scaleXMap(&stack_sx_buf, x0, x1, dst_x, dst_w, src_w);
 
         const inv: f32 = 1.0 / 255.0;
         var py: u32 = y0;
@@ -1897,3 +1896,76 @@ test "Canvas damage tracking records and unions modified regions" {
 }
 
 
+
+test "premulToStraightRgba: SIMD fast/general lanes match the scalar reference" {
+    // The 3-element test above never reaches the @Vector(4, ...) path (n < 4) — this one
+    // uses a length that isn't a multiple of 4 to exercise the vector loop AND its scalar
+    // tail, with random + forced all-zero/all-opaque lanes to hit every fast path.
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    const N = 37;
+    var src: [N]u32 = undefined;
+    for (&src) |*p| {
+        const a = rnd.uintLessThan(u32, 256);
+        const r = rnd.uintLessThan(u32, 256);
+        const g = rnd.uintLessThan(u32, 256);
+        const b = rnd.uintLessThan(u32, 256);
+        p.* = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    // force some exact 0 and exact 255 alpha lanes too
+    src[0] = (0 << 24) | (200 << 16) | (100 << 8) | 50;
+    src[1] = (255 << 24) | (200 << 16) | (100 << 8) | 50;
+    src[4] = (0 << 24);
+    src[5] = (255 << 24) | (1 << 16) | (2 << 8) | 3;
+
+    var got: [N]u32 = undefined;
+    premulToStraightRgba(&src, &got);
+
+    var want: [N]u32 = undefined;
+    for (src, 0..) |p, idx| {
+        const a: u32 = (p >> 24) & 0xff;
+        if (a == 0) { want[idx] = 0; continue; }
+        if (a == 255) {
+            want[idx] = (@as(u32, 255) << 24) | ((p & 0xff) << 16) | (p & 0x0000ff00) | ((p >> 16) & 0xff);
+            continue;
+        }
+        const m = unpremul_recip[a];
+        const sr: u32 = @min(@as(u32, 255), (((p >> 16) & 0xff) * m) >> 16);
+        const sg: u32 = @min(@as(u32, 255), (((p >> 8) & 0xff) * m) >> 16);
+        const sb: u32 = @min(@as(u32, 255), ((p & 0xff) * m) >> 16);
+        want[idx] = (a << 24) | (sb << 16) | (sg << 8) | sr;
+    }
+    for (got, want, 0..) |g, w, idx| {
+        if (g != w) std.debug.print("mismatch at {d}: src=0x{x:0>8} got=0x{x:0>8} want=0x{x:0>8}\n", .{ idx, src[idx], g, w });
+    }
+    try std.testing.expectEqualSlices(u32, &want, &got);
+}
+
+test "overColorU8 (integer fast path used by blitImage) tracks the overColor float reference" {
+    // blitImage's hot loop went from overColor's float per-pixel math to overColorU8's
+    // integer *257>>16 approximation — this sweeps alpha × dst × src to bound the
+    // resulting rounding error instead of trusting the arithmetic by inspection.
+    var canvas_buf: [1]u32 = undefined;
+    var canvas = Canvas.init(&canvas_buf, 1, 1);
+    var max_diff: i32 = 0;
+    var sa: u32 = 1;
+    while (sa < 255) : (sa += 1) {
+        var dv: u32 = 0;
+        while (dv <= 255) : (dv += 51) { // sample dst values across the range
+            const dst: u32 = (dv << 24) | (dv << 16) | (dv << 8) | dv; // premul-consistent dst (r=g=b=a-ish)
+            var sc: u32 = 0;
+            while (sc <= 255) : (sc += 17) {
+                const got = canvas.overColorU8(dst, @intCast(sc), @intCast(sc), @intCast(sc), @intCast(sa));
+                const inv: f32 = 1.0 / 255.0;
+                const want = canvas.overColor(dst, @as(f32, @floatFromInt(sc)) * inv, @as(f32, @floatFromInt(sc)) * inv, @as(f32, @floatFromInt(sc)) * inv, @as(f32, @floatFromInt(sa)) * inv);
+                const ga: i32 = @intCast((got >> 24) & 0xff);
+                const wa: i32 = @intCast((want >> 24) & 0xff);
+                const gr: i32 = @intCast((got >> 16) & 0xff);
+                const wr: i32 = @intCast((want >> 16) & 0xff);
+                const diff: i32 = @max(@as(i32, @intCast(@abs(ga - wa))), @as(i32, @intCast(@abs(gr - wr))));
+                if (diff > max_diff) max_diff = diff;
+            }
+        }
+    }
+    try std.testing.expect(max_diff <= 2); // ≤2/255 rounding error vs. the float reference
+}
