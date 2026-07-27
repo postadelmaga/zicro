@@ -68,6 +68,7 @@ pub extern const wl_subcompositor_interface: Interface;
 pub extern const wl_subsurface_interface: Interface;
 pub extern const wl_surface_interface: Interface;
 pub extern const wl_region_interface: Interface;
+pub extern const wl_output_interface: Interface;
 pub extern const wl_shm_interface: Interface;
 pub extern const wl_shm_pool_interface: Interface;
 pub extern const wl_buffer_interface: Interface;
@@ -90,6 +91,10 @@ pub extern const wp_viewporter_interface: Interface;
 pub extern const wp_viewport_interface: Interface;
 pub extern const wp_fractional_scale_manager_v1_interface: Interface;
 pub extern const wp_fractional_scale_v1_interface: Interface;
+pub extern const xdg_positioner_interface: Interface;
+pub extern const xdg_popup_interface: Interface;
+pub extern const zwp_text_input_manager_v3_interface: Interface;
+pub extern const zwp_text_input_v3_interface: Interface;
 
 /// 24.8 fixed point, the wire format of pointer coordinates.
 pub const Fixed = i32;
@@ -173,6 +178,15 @@ pub const Compositor = opaque {
 };
 
 pub const Surface = opaque {
+    pub const Listener = extern struct {
+        enter: *const fn (data: ?*anyopaque, surface: *Surface, output: *Output) callconv(.c) void,
+        leave: *const fn (data: ?*anyopaque, surface: *Surface, output: *Output) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *Surface, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
     pub fn destroy(self: *Surface) void {
         _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
     }
@@ -200,6 +214,25 @@ pub const Surface = opaque {
 
     pub fn damageBuffer(self: *Surface, x: i32, y: i32, w: i32, h: i32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 9, null, version(self), 0, x, y, w, h);
+    }
+};
+
+pub const Output = opaque {
+    pub const Listener = extern struct {
+        geometry: *const fn (data: ?*anyopaque, output: *Output, x: i32, y: i32, physical_width: i32, physical_height: i32, subpixel: i32, make: ?[*:0]const u8, model: ?[*:0]const u8, transform: i32) callconv(.c) void,
+        mode: *const fn (data: ?*anyopaque, output: *Output, flags: u32, width: i32, height: i32, refresh: i32) callconv(.c) void,
+        done: *const fn (data: ?*anyopaque, output: *Output) callconv(.c) void,
+        scale: *const fn (data: ?*anyopaque, output: *Output, factor: i32) callconv(.c) void,
+        name: *const fn (data: ?*anyopaque, output: *Output, name: ?[*:0]const u8) callconv(.c) void,
+        description: *const fn (data: ?*anyopaque, output: *Output, description: ?[*:0]const u8) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *Output, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
+    pub fn destroy(self: *Output) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
     }
 };
 
@@ -543,6 +576,11 @@ pub const XdgWmBase = opaque {
         addListener(self, listener, data);
     }
 
+    pub fn createPositioner(self: *XdgWmBase) *XdgPositioner {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &xdg_positioner_interface, version(self), 0, @as(?*Proxy, null));
+        return @ptrCast(p.?);
+    }
+
     pub fn getXdgSurface(self: *XdgWmBase, surface: *Surface) *XdgSurface {
         const p = wl_proxy_marshal_flags(proxy(self), 2, &xdg_surface_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(surface)));
         return @ptrCast(p.?);
@@ -550,6 +588,56 @@ pub const XdgWmBase = opaque {
 
     pub fn pong(self: *XdgWmBase, serial: u32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 3, null, version(self), 0, serial);
+    }
+};
+
+pub const XdgPositioner = opaque {
+    pub fn destroy(self: *XdgPositioner) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+    pub fn setSize(self: *XdgPositioner, width: i32, height: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, width, height);
+    }
+    pub fn setAnchorRect(self: *XdgPositioner, x: i32, y: i32, width: i32, height: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), 0, x, y, width, height);
+    }
+    pub fn setAnchor(self: *XdgPositioner, anchor: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 3, null, version(self), 0, anchor);
+    }
+    pub fn setGravity(self: *XdgPositioner, gravity: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 4, null, version(self), 0, gravity);
+    }
+    pub fn setConstraintAdjustment(self: *XdgPositioner, adjustment: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 5, null, version(self), 0, adjustment);
+    }
+    pub fn setOffset(self: *XdgPositioner, x: i32, y: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 6, null, version(self), 0, x, y);
+    }
+    pub fn setReactive(self: *XdgPositioner) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 7, null, version(self), 0);
+    }
+};
+
+pub const XdgPopup = opaque {
+    pub const Listener = extern struct {
+        configure: *const fn (data: ?*anyopaque, popup: *XdgPopup, x: i32, y: i32, width: i32, height: i32) callconv(.c) void,
+        popup_done: *const fn (data: ?*anyopaque, popup: *XdgPopup) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *XdgPopup, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
+    pub fn destroy(self: *XdgPopup) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+
+    pub fn grab(self: *XdgPopup, seat: *Seat, serial: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, @as(*Proxy, @ptrCast(seat)), serial);
+    }
+
+    pub fn reposition(self: *XdgPopup, positioner: *XdgPositioner, token: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), 0, @as(*Proxy, @ptrCast(positioner)), token);
     }
 };
 
@@ -567,12 +655,74 @@ pub const XdgSurface = opaque {
         return @ptrCast(p.?);
     }
 
+    pub fn getPopup(self: *XdgSurface, parent: ?*XdgSurface, positioner: *XdgPositioner) *XdgPopup {
+        const p = wl_proxy_marshal_flags(proxy(self), 2, &xdg_popup_interface, version(self), 0, @as(?*Proxy, null), @as(?*Proxy, @ptrCast(parent)), @as(*Proxy, @ptrCast(positioner)));
+        return @ptrCast(p.?);
+    }
+
     pub fn setWindowGeometry(self: *XdgSurface, x: i32, y: i32, w: i32, h: i32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 3, null, version(self), 0, x, y, w, h);
     }
 
     pub fn ackConfigure(self: *XdgSurface, serial: u32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 4, null, version(self), 0, serial);
+    }
+};
+
+pub const ZwpTextInputManagerV3 = opaque {
+    pub fn destroy(self: *ZwpTextInputManagerV3) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+    pub fn getTextInput(self: *ZwpTextInputManagerV3, seat: *Seat) *ZwpTextInputV3 {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &zwp_text_input_v3_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(seat)));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const ZwpTextInputV3 = opaque {
+    pub const Listener = extern struct {
+        enter: *const fn (data: ?*anyopaque, text_input: *ZwpTextInputV3, surface: *Surface) callconv(.c) void,
+        leave: *const fn (data: ?*anyopaque, text_input: *ZwpTextInputV3, surface: *Surface) callconv(.c) void,
+        preedit_string: *const fn (data: ?*anyopaque, text_input: *ZwpTextInputV3, text: ?[*:0]const u8, cursor_begin: i32, cursor_end: i32) callconv(.c) void,
+        commit_string: *const fn (data: ?*anyopaque, text_input: *ZwpTextInputV3, text: ?[*:0]const u8) callconv(.c) void,
+        delete_surrounding_text: *const fn (data: ?*anyopaque, text_input: *ZwpTextInputV3, before_length: u32, after_length: u32) callconv(.c) void,
+        done: *const fn (data: ?*anyopaque, text_input: *ZwpTextInputV3, serial: u32) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *ZwpTextInputV3, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
+    pub fn destroy(self: *ZwpTextInputV3) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+
+    pub fn enable(self: *ZwpTextInputV3) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0);
+    }
+
+    pub fn disable(self: *ZwpTextInputV3) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), 0);
+    }
+
+    pub fn setSurroundingText(self: *ZwpTextInputV3, text: [*:0]const u8, cursor: i32, anchor: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 3, null, version(self), 0, text, cursor, anchor);
+    }
+
+    pub fn setTextChangeCause(self: *ZwpTextInputV3, cause: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 4, null, version(self), 0, cause);
+    }
+
+    pub fn setContentType(self: *ZwpTextInputV3, hint: u32, purpose: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 5, null, version(self), 0, hint, purpose);
+    }
+
+    pub fn setCursorRectangle(self: *ZwpTextInputV3, x: i32, y: i32, width: i32, height: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 6, null, version(self), 0, x, y, width, height);
+    }
+
+    pub fn commit(self: *ZwpTextInputV3) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 7, null, version(self), 0);
     }
 };
 
@@ -751,6 +901,9 @@ pub const Viewport = opaque {
 /// a surface, in 120ths (120 = 1.0, 132 = 1.1). Pair with a [`Viewport`]: render the
 /// buffer at `logical × scale` and set the viewport destination to the logical size.
 pub const FractionalScaleManager = opaque {
+    pub fn destroy(self: *FractionalScaleManager) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
     // requests: 0 = destroy, 1 = get_fractional_scale(new_id, surface)
     pub fn getFractionalScale(self: *FractionalScaleManager, surface: *Surface) *FractionalScale {
         const p = wl_proxy_marshal_flags(proxy(self), 1, &wp_fractional_scale_v1_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(surface)));
@@ -766,6 +919,10 @@ pub const FractionalScale = opaque {
 
     pub fn setListener(self: *FractionalScale, listener: *const Listener, data: ?*anyopaque) void {
         addListener(self, listener, data);
+    }
+
+    pub fn destroy(self: *FractionalScale) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
     }
 };
 

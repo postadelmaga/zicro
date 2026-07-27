@@ -59,6 +59,12 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     cursor_shape: u32 = 1,
     scale_factor: f32 = 1.0,
 
+    fractional_scale_manager: ?*wl.FractionalScaleManager = null,
+    outputs: std.ArrayList(*OutputInfo) = .empty,
+    fractional_scale: ?*wl.FractionalScale = null,
+    entered_outputs: std.ArrayList(*OutputInfo) = .empty,
+    has_fractional_scale: bool = false,
+
     // Multi-window on ONE connection (window-server shape): children share
     // the root's display/registry/globals and are driven by the root's run()
     // loop. Focus targets live on the root — the seat is connection-global,
@@ -77,6 +83,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     repeat_down: bool = false,
     repeat_target: ?*Window = null,
     repeat_at: i64 = 0, // ms timestamp of the next synthetic press
+
+    pub const OutputInfo = struct {
+        name: u32,
+        output: *wl.Output,
+        scale: i32 = 1,
+        root: *Window,
+    };
 
     const BufferSlot = struct {
         buffer: ?*wl.Buffer = null,
@@ -121,7 +134,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.wm_base.?.setListener(&wm_base_listener, self);
 
         const surface = self.compositor.?.createSurface();
+        surface.setListener(&surface_listener, self);
         self.surface = surface;
+        if (self.fractional_scale_manager) |mgr| {
+            const fs = mgr.getFractionalScale(surface);
+            fs.setListener(&fractional_scale_listener, self);
+            self.fractional_scale = fs;
+        }
         const xdg_surface = self.wm_base.?.getXdgSurface(surface);
         xdg_surface.setListener(&xdg_surface_listener, self);
         self.xdg_surface = xdg_surface;
@@ -174,7 +193,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         };
 
         const surface = self.compositor.?.createSurface();
+        surface.setListener(&surface_listener, self);
         self.surface = surface;
+        if (parent.fractional_scale_manager) |mgr| {
+            const fs = mgr.getFractionalScale(surface);
+            fs.setListener(&fractional_scale_listener, self);
+            self.fractional_scale = fs;
+        }
         const xdg_surface = self.wm_base.?.getXdgSurface(surface);
         xdg_surface.setListener(&xdg_surface_listener, self);
         self.xdg_surface = xdg_surface;
@@ -235,7 +260,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         };
 
         const surface = self.compositor.?.createSurface();
+        surface.setListener(&surface_listener, self);
         self.surface = surface;
+        if (parent.fractional_scale_manager) |mgr| {
+            const fs = mgr.getFractionalScale(surface);
+            fs.setListener(&fractional_scale_listener, self);
+            self.fractional_scale = fs;
+        }
         const sub = subcompositor.getSubsurface(surface, parent.surface.?);
         sub.setPosition(x, y);
         sub.setDesync(); // panels repaint on their own cadence
@@ -320,6 +351,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
                 break;
             }
         }
+        if (self.fractional_scale) |fs| fs.destroy();
+        self.entered_outputs.deinit(self.gpa);
         self.dropBuffers();
         self.staged.pixels.deinit(self.gpa);
         self.front.pixels.deinit(self.gpa);
@@ -354,6 +387,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             if (child.opts.on_close) |cb| cb(child, child.opts.user);
             child.deinitChild();
         }
+        if (self.fractional_scale) |fs| fs.destroy();
+        self.entered_outputs.deinit(self.gpa);
+        for (self.outputs.items) |info| {
+            info.output.destroy();
+            self.gpa.destroy(info);
+        }
+        self.outputs.deinit(self.gpa);
+        if (self.fractional_scale_manager) |m| m.destroy();
         self.children.deinit(self.gpa);
         self.dropBuffers();
         self.staged.pixels.deinit(self.gpa);
@@ -640,10 +681,119 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             self.seat = seat;
         } else if (std.mem.eql(u8, iface, "org_kde_kwin_appmenu_manager")) {
             self.appmenu_manager = @ptrCast(registry.bind(name, &wl.org_kde_kwin_appmenu_manager_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, "wl_output")) {
+            const output: *wl.Output = @ptrCast(registry.bind(name, &wl.wl_output_interface, @min(ver, 4)).?);
+            const info = self.gpa.create(OutputInfo) catch return;
+            info.* = .{ .name = name, .output = output, .scale = 1, .root = self };
+            output.setListener(&output_listener, info);
+            self.outputs.append(self.gpa, info) catch {};
+        } else if (std.mem.eql(u8, iface, "wp_fractional_scale_manager_v1")) {
+            self.fractional_scale_manager = @ptrCast(registry.bind(name, &wl.wp_fractional_scale_manager_v1_interface, 1).?);
         }
     }
 
-    fn onGlobalRemove(_: ?*anyopaque, _: *wl.Registry, _: u32) callconv(.c) void {}
+    fn onGlobalRemove(data: ?*anyopaque, _: *wl.Registry, name: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        for (self.outputs.items, 0..) |info, idx| {
+            if (info.name == name) {
+                _ = self.outputs.orderedRemove(idx);
+                removeOutputFromWindow(self, info);
+                for (self.children.items) |child| {
+                    removeOutputFromWindow(child, info);
+                }
+                info.output.destroy();
+                self.gpa.destroy(info);
+                break;
+            }
+        }
+    }
+
+    fn removeOutputFromWindow(win: *Window, info: *OutputInfo) void {
+        for (win.entered_outputs.items, 0..) |entered, i| {
+            if (entered == info) {
+                _ = win.entered_outputs.orderedRemove(i);
+                win.updateLegacyScale();
+                break;
+            }
+        }
+    }
+
+    const surface_listener = wl.Surface.Listener{
+        .enter = onSurfaceEnter,
+        .leave = onSurfaceLeave,
+    };
+
+    fn onSurfaceEnter(data: ?*anyopaque, _: *wl.Surface, output: *wl.Output) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        const root = self.parent orelse self;
+        for (root.outputs.items) |info| {
+            if (info.output == output) {
+                for (self.entered_outputs.items) |existing| {
+                    if (existing == info) return;
+                }
+                self.entered_outputs.append(self.gpa, info) catch {};
+                self.updateLegacyScale();
+                break;
+            }
+        }
+    }
+
+    fn onSurfaceLeave(data: ?*anyopaque, _: *wl.Surface, output: *wl.Output) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        for (self.entered_outputs.items, 0..) |info, i| {
+            if (info.output == output) {
+                _ = self.entered_outputs.orderedRemove(i);
+                self.updateLegacyScale();
+                break;
+            }
+        }
+    }
+
+    fn updateLegacyScale(self: *Window) void {
+        if (self.has_fractional_scale) return;
+        var max_scale: i32 = 1;
+        for (self.entered_outputs.items) |info| {
+            if (info.scale > max_scale) max_scale = info.scale;
+        }
+        self.setScaleFactor(@floatFromInt(max_scale));
+    }
+
+    const output_listener = wl.Output.Listener{
+        .geometry = onOutputGeometry,
+        .mode = onOutputMode,
+        .done = onOutputDone,
+        .scale = onOutputScale,
+        .name = onOutputName,
+        .description = onOutputDescription,
+    };
+
+    fn onOutputGeometry(_: ?*anyopaque, _: *wl.Output, _: i32, _: i32, _: i32, _: i32, _: i32, _: ?[*:0]const u8, _: ?[*:0]const u8, _: i32) callconv(.c) void {}
+    fn onOutputMode(_: ?*anyopaque, _: *wl.Output, _: u32, _: i32, _: i32, _: i32) callconv(.c) void {}
+    fn onOutputDone(_: ?*anyopaque, _: *wl.Output) callconv(.c) void {}
+
+    fn onOutputScale(data: ?*anyopaque, _: *wl.Output, factor: i32) callconv(.c) void {
+        const info: *OutputInfo = @ptrCast(@alignCast(data.?));
+        info.scale = factor;
+        const root = info.root;
+        root.updateLegacyScale();
+        for (root.children.items) |child| {
+            child.updateLegacyScale();
+        }
+    }
+
+    fn onOutputName(_: ?*anyopaque, _: *wl.Output, _: ?[*:0]const u8) callconv(.c) void {}
+    fn onOutputDescription(_: ?*anyopaque, _: *wl.Output, _: ?[*:0]const u8) callconv(.c) void {}
+
+    const fractional_scale_listener = wl.FractionalScale.Listener{
+        .preferred_scale = onPreferredScale,
+    };
+
+    fn onPreferredScale(data: ?*anyopaque, _: *wl.FractionalScale, scale: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.has_fractional_scale = true;
+        const factor = @as(f32, @floatFromInt(scale)) / 120.0;
+        self.setScaleFactor(factor);
+    }
 
     const wm_base_listener = wl.XdgWmBase.Listener{ .ping = onPing };
     fn onPing(_: ?*anyopaque, wm_base: *wl.XdgWmBase, serial: u32) callconv(.c) void {
