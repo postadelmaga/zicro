@@ -305,6 +305,15 @@ pub const Subsurface = opaque {
     pub fn setDesync(self: *Subsurface) void {
         _ = wl_proxy_marshal_flags(proxy(self), 5, null, version(self), 0);
     }
+
+    /// Stacks this subsurface below `sibling` (opcode 3; see wayland.xml
+    /// wl_subsurface.place_below). A freshly created subsurface is placed
+    /// TOP-most in its parent's stack by default — callers presenting a GPU
+    /// frame (video, mesh) below content the parent draws on its own surface
+    /// (labels, chrome) need this, or that content ends up hidden underneath.
+    pub fn placeBelow(self: *Subsurface, sibling: *Surface) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 3, null, version(self), 0, @as(*Proxy, @ptrCast(sibling)));
+    }
 };
 
 // --- zwp_linux_dmabuf_v1 ------------------------------------------------------------------
