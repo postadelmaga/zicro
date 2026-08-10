@@ -237,21 +237,7 @@ fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
         //                      pulls in zwp_tablet_tool_v2_interface, so tablet-v2 must be
         //                      generated too even though only the wl_pointer path is driven
         //   appmenu          — org_kde_kwin_appmenu (KDE global menu)
-        //   color-representation-v1 — segnala coefficienti/range YCbCr (BT.601/709,
-        //                      limited/full) su una subsurface dmabuf.
-        //   color-management-v1 — segnala primari/funzione di trasferimento
-        //                      (gamma/EOTF) della surface: su un compositor con
-        //                      pipeline colore avanzata attiva (wp_color_manager_v1,
-        //                      es. KWin recenti) un dmabuf YCbCr SENZA questo viene
-        //                      trattato con un'ipotesi di colore sbagliata — visto in
-        //                      pratica un crollo di luminosità severo sul percorso
-        //                      zero-copy VAAPI di Zuer (ZUER_VAAPI_DMABUF), risolto
-        //                      solo dichiarando ANCHE questo (non basta
-        //                      color-representation da solo: confrontato via
-        //                      WAYLAND_DEBUG col trace di mpv --vo=dmabuf-wayland,
-        //                      che su questo stesso compositor mostra il video giusto
-        //                      e usa entrambi i protocolli insieme).
-        // The last six are consumed by zrame's backend (compositor blur, dmabuf video,
+        // The last four are consumed by zrame's backend (compositor blur, dmabuf video,
         // HiDPI viewport/fractional scale): ALL interface tables are generated here, in
         // one repo, because zrame links this module's C objects — a table generated in
         // both repos collides at link time.
@@ -266,8 +252,6 @@ fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
             .{ "viewporter.xml", "viewporter.c" },
             .{ "fractional-scale-v1.xml", "fractional-scale-v1.c" },
             .{ "text-input-v3.xml", "text-input-v3.c" },
-            .{ "color-representation-v1.xml", "color-representation-v1.c" },
-            .{ "color-management-v1.xml", "color-management-v1.c" },
         };
         for (protocols) |p| {
             const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
