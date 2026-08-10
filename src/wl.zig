@@ -326,38 +326,12 @@ pub const LinuxDmabuf = opaque {
 };
 
 pub const BufferParams = opaque {
-    /// `created`/`failed` (see `create`): unlike `Buffer.Listener.release`,
-    /// `created`'s `buffer` arg is a NEW_ID the SERVER allocates — libwayland's
-    /// generic dispatcher builds the `*Buffer` proxy itself from
-    /// `zwp_linux_buffer_params_v1_interface`'s event `types` table (generated
-    /// by wayland-scanner from the protocol XML, which always includes the
-    /// full event set regardless of which requests a hand-written wrapper
-    /// exposes) — this listener is otherwise exactly the same shape as every
-    /// other one in this file, nothing special to implement on our side.
-    pub const Listener = extern struct {
-        created: *const fn (data: ?*anyopaque, params: *BufferParams, buffer: *Buffer) callconv(.c) void,
-        failed: *const fn (data: ?*anyopaque, params: *BufferParams) callconv(.c) void,
-    };
-
-    pub fn setListener(self: *BufferParams, listener: *const Listener, data: ?*anyopaque) void {
-        addListener(self, listener, data);
-    }
-
     pub fn destroy(self: *BufferParams) void {
         _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
     }
 
     pub fn add(self: *BufferParams, fd: c_int, plane: u32, offset: u32, stride: u32, modifier: u64) void {
         _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, fd, plane, offset, stride, @as(u32, @intCast(modifier >> 32)), @as(u32, @truncate(modifier)));
-    }
-
-    /// `create` (async): the result arrives later via `Listener.created`/
-    /// `.failed` instead of failing the whole connection on an unsupported
-    /// format/modifier — unlike `createImmed`, an invalid dmabuf here is a
-    /// normal `failed` event, recoverable by the caller. Set a listener
-    /// BEFORE calling this (events can arrive as soon as the next dispatch).
-    pub fn create(self: *BufferParams, w: i32, h: i32, format: u32, flags: u32) void {
-        _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), 0, w, h, format, flags);
     }
 
     /// `create_immed` (v2+): synchronous buffer creation — an invalid dmabuf is
