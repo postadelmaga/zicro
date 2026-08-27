@@ -31,7 +31,9 @@ pub const Axis = enum(u1) { horizontal = 0, vertical = 1 };
 const dormant_width: f32 = 2.0;
 const expanded_width: f32 = 10.0;
 const min_thumb: f32 = 12.0;
-const inner_margin: f32 = 1.0;
+const inner_margin: f32 = 3.0; // stay clear of the frame's rounded edge
+const activity_hold: f32 = 1.2; // seconds the thumb stays after a scroll
+const activity_fade: f32 = 0.25; // fade-out window at the end of the hold
 const grab_tol: f32 = 8.0; // extra hover/grab reach beyond the bar's visual width (lead-in)
 // Opacity ramps. The track background only shows while the pointer is on the bar
 // (aiming/dragging): on plain area-hover just the thumb fades in, so a translucent
@@ -39,6 +41,7 @@ const grab_tol: f32 = 8.0; // extra hover/grab reach beyond the bar's visual wid
 const bg_interact: f32 = 0.7;
 const handle_active: f32 = 0.6;
 const handle_interact: f32 = 1.0;
+const handle_activity: f32 = 0.85;
 // Kinetic friction (px/s²) and the speed below which motion snaps to rest (px/s).
 const friction: f32 = 1000.0;
 const stop_speed: f32 = 20.0;
@@ -58,6 +61,11 @@ pub const Scroll = struct {
     // Animation factors (linear 0..1; eased with cubicOut on use).
     show: [2]f32 = .{ 0, 0 },
     area_hover: f32 = 0,
+    /// Seconds of "recently scrolled" visibility left: the thumb shows after any offset
+    /// change (wheel, keys, programmatic jumps, kinetics) even with the pointer outside
+    /// the area, then fades — otherwise keyboard scrolling never revealed the bar.
+    activity: f32 = 0,
+    last_tick_off: [2]f32 = .{ 0, 0 },
     bar_hover: [2]f32 = .{ 0, 0 },
 
     // Interaction state.
@@ -135,8 +143,16 @@ pub const Scroll = struct {
         }
     }
 
+    /// 0..1: how "recently scrolled" the area is (1 during the hold, fading out).
+    fn activityFactor(self: *const Scroll) f32 {
+        return anim.cubicOut(std.math.clamp(self.activity / activity_fade, 0.0, 1.0));
+    }
+
     fn visualWidth(self: *const Scroll, d: u8) f32 {
-        return dormant_width + (expanded_width - dormant_width) * anim.cubicOut(self.bar_hover[d]);
+        // Aiming at the bar swells it fully; plain scroll activity (wheel/keys) swells it
+        // halfway (~6 px): the dormant 2 px hairline is invisible on a dark glass ground.
+        const swell = @max(anim.cubicOut(self.bar_hover[d]), 0.5 * self.activityFactor());
+        return dormant_width + (expanded_width - dormant_width) * swell;
     }
 
     /// Is `(x,y)` within the grab strip of axis `d`'s bar?
@@ -182,6 +198,7 @@ pub const Scroll = struct {
             if (show <= 0.01 or self.maxOff(d) <= 0) continue;
 
             const bh = anim.cubicOut(self.bar_hover[d]);
+            const act = self.activityFactor();
             const ah = anim.cubicOut(self.area_hover);
             const interacting = (self.dragging != null and self.dragging.? == d);
             const inter_f = if (interacting) 1.0 else bh;
@@ -189,7 +206,9 @@ pub const Scroll = struct {
             // Track background only on bar interaction (not area-hover), so hovering the
             // content shows just the thumb — no translucent full-height strip over it.
             const bg_op = anim.lerp(0.0, bg_interact, inter_f) * show;
-            const handle_op = @max(anim.lerp(0.0, handle_active, ah), anim.lerp(0.0, handle_interact, inter_f)) * show;
+            // Thumb opacity: area hover (0.6), scroll activity (0.85, wheel/keys, no pointer
+            // needed), interaction (1.0) — whichever is strongest.
+            const handle_op = @max(@max(anim.lerp(0.0, handle_active, ah), handle_activity * act), anim.lerp(0.0, handle_interact, inter_f)) * show;
 
             const w = self.visualWidth(d);
             const cross = self.barCross(d, w);
@@ -289,6 +308,7 @@ pub const Scroll = struct {
     /// still animating (so the owner keeps requesting frames).
     pub fn tick(self: *Scroll, dt: f32) bool {
         var active = false;
+        const off_before = self.offset;
 
         // Wheel low-pass: reach 90% of the pending delta in 0.1s.
         const t = 1.0 - std.math.pow(f32, 0.1, dt / 0.1);
@@ -332,7 +352,26 @@ pub const Scroll = struct {
         if (na != self.area_hover) active = true;
         self.area_hover = na;
 
+        // Scroll activity: any offset change (here or written directly by the owner since
+        // the last tick) re-arms the visibility hold; while it runs down we keep animating
+        // so the fade-out actually gets drawn.
+        if (self.offset[0] != off_before[0] or self.offset[1] != off_before[1] or
+            self.offset[0] != self.last_tick_off[0] or self.offset[1] != self.last_tick_off[1])
+        {
+            self.activity = activity_hold;
+        }
+        self.last_tick_off = self.offset;
+        if (self.activity > 0) {
+            self.activity = @max(0.0, self.activity - dt);
+            active = true;
+        }
+
         return active or self.dragging != null;
+    }
+
+    /// Reveal the bars for `activity_hold` seconds (e.g. after a programmatic scroll).
+    pub fn pulse(self: *Scroll) void {
+        self.activity = activity_hold;
     }
 };
 
@@ -424,4 +463,17 @@ test "both bars render when content overflows on both axes (h-bar not dropped)" 
     }
     try std.testing.expect(right > 0); // vertical bar paints (known-good)
     try std.testing.expect(bottom > 0); // horizontal bar must paint too
+}
+
+test "idle scroll area settles: tick returns false once fades and activity are done" {
+    var s = Scroll{};
+    s.setViewport(.{ .x = 0, .y = 0, .w = 800, .h = 600 });
+    s.setContent(800, 5000);
+    var active_ticks: usize = 0;
+    var i: usize = 0;
+    while (i < 600) : (i += 1) {
+        if (s.tick(1.0 / 60.0)) active_ticks += 1;
+    }
+    std.debug.print("\nactive_ticks={d} activity={d:.3} show={d:.3} off={d:.3} last={d:.3}\n", .{ active_ticks, s.activity, s.show[1], s.offset[1], s.last_tick_off[1] });
+    try std.testing.expect(active_ticks < 200);
 }
