@@ -215,7 +215,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) f32 {
 }
 
 /// Pixel coverage of an SDF: full at d <= -0.5, zero at d >= 0.5.
-fn coverage(d: f32) f32 {
+pub fn coverage(d: f32) f32 {
     return std.math.clamp(0.5 - d, 0.0, 1.0);
 }
 
@@ -350,6 +350,14 @@ pub const Style = struct {
     content_radius: f32 = 14,
     /// Progressive fade-out width of the content near its edges (0 to disable).
     content_fade_width: f32 = 0,
+    /// Fade-out width applied ONLY in the rounded-corner zones of the content (where
+    /// the nearest edge point lies on the arc): straight edges stay crisp, the corners
+    /// melt softly into the glass. 0 to disable. Composes with `content_fade_width`.
+    corner_fade_width: f32 = 0,
+    /// Opacity of a 1px definition ring drawn OVER the content along the panel edge
+    /// (light on top, darker at the bottom): keeps a bright frameless window readable
+    /// on a bright desktop. 0 = off. Drawn by the host after the content blit.
+    edge_ring_alpha: f32 = 0,
     /// Inset of the compositor blur region relative to the panel (0 for full panel blur).
     blur_inset: f32 = 0,
     /// Width of the animated border band: blitted frames only show within this
@@ -382,6 +390,8 @@ pub const Style = struct {
         s.corner_radius = 0;
         s.content_radius = 0;
         s.content_fade_width = 0;
+        s.corner_fade_width = 0;
+        s.edge_ring_alpha = 0;
         s.border_anim_width = 0;
         s.border_alpha = 0;
         s.shadow_alpha = 0;
@@ -725,6 +735,57 @@ pub const Canvas = struct {
 
     /// Paint the full window chrome: transparent gutter, drop shadow, glass panel,
     /// highlight ring. The panel occupies the canvas minus `style.margin` on each side.
+    /// Anti-aliased ring of `width` px hugging the rounded rect `(x,y,w,h)` from the
+    /// inside, color lerped from `top` (y = top edge) to `bottom`. Only the pixels of
+    /// the edge band are visited (~perimeter × band), so it is cheap even full-frame.
+    pub fn strokeRoundedRectGradient(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, width: f32, top: Color, bottom: Color) void {
+        if (w <= 0 or h <= 0 or width <= 0) return;
+        // Only pixels that can carry ring coverage are visited: a `width+1.5` strip along
+        // the straight edges and the `radius+1.5` corner quadrants (where the arc runs).
+        const edge_band = width + 1.5;
+        const corner = radius + 1.5;
+        const x0: i64 = @intFromFloat(@floor(x));
+        const y0: i64 = @intFromFloat(@floor(y));
+        const x1: i64 = @intFromFloat(@ceil(x + w));
+        const y1: i64 = @intFromFloat(@ceil(y + h));
+        const eb: i64 = @intFromFloat(@ceil(edge_band));
+        const cb: i64 = @intFromFloat(@ceil(corner));
+        var py: i64 = @max(0, y0);
+        const py_end: i64 = @min(@as(i64, @intCast(self.height)), y1);
+        while (py < py_end) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const t = std.math.clamp((fy - y) / h, 0.0, 1.0);
+            const cr = top.r + (bottom.r - top.r) * t;
+            const cg = top.g + (bottom.g - top.g) * t;
+            const cb_ = top.b + (bottom.b - top.b) * t;
+            const ca = top.a + (bottom.a - top.a) * t;
+            const row = self.pixels[@as(usize, @intCast(py)) * self.width ..][0..self.width];
+            const in_corner_rows = (py < y0 + cb) or (py >= y1 - cb);
+            const in_edge_rows = (py < y0 + eb) or (py >= y1 - eb);
+            // Straight edge rows: the whole row; corner rows: the two corner quadrants;
+            // every other row: only the thin left/right strips.
+            var spans: [2][2]i64 = .{ .{ x0, x0 + eb }, .{ x1 - eb, x1 } };
+            if (in_edge_rows) {
+                spans = .{ .{ x0, x1 }, .{ 0, 0 } };
+            } else if (in_corner_rows) {
+                spans = .{ .{ x0, x0 + cb }, .{ x1 - cb, x1 } };
+            }
+            for (spans) |sp| {
+                var px: i64 = @max(0, sp[0]);
+                const px_end: i64 = @min(@as(i64, @intCast(self.width)), sp[1]);
+                while (px < px_end) : (px += 1) {
+                    const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                    const d = roundedRectSdf(fx, fy, x, y, w, h, radius);
+                    // Band centred `width/2` inside the edge, clipped to the rect itself.
+                    const a = coverage(@abs(d + width / 2.0) - width / 2.0) * coverage(d) * ca;
+                    if (a <= 0.002) continue;
+                    const i: usize = @intCast(px);
+                    row[i] = self.overColor(row[i], cr, cg, cb_, a);
+                }
+            }
+        }
+    }
+
     pub fn drawChrome(self: *Canvas, style: Style) void {
         std.debug.assert(self.gl == null); // no GL path yet — see `GlBackend`'s doc
         self.markFullDamage();
@@ -858,7 +919,7 @@ pub const Canvas = struct {
         // source pixels then become a straight packed write with no blend. This is the opaque
         // full-window present path (ZUER_OPAQUE); the glass path keeps the full SDF masking.
         const trivial = style.margin == 0 and style.corner_radius == 0 and style.content_radius == 0 and
-            style.content_fade_width == 0 and style.border_anim_width == 0;
+            style.content_fade_width == 0 and style.corner_fade_width == 0 and style.border_anim_width == 0;
 
         // Flat-interior fast path for the glass (non-trivial) styles, mirroring the
         // `drawChrome` core: deep enough inside *both* rounded rects every mask is
@@ -868,7 +929,7 @@ pub const Canvas = struct {
         // vanish; this runs full-frame at 60Hz for glass windows.
         const guard = @max(
             @max(style.corner_radius, style.content_radius),
-            @max(style.content_fade_width, style.border_anim_width),
+            @max(@max(style.content_fade_width, style.corner_fade_width), style.border_anim_width),
         ) + 1.0;
         const flat_px0 = m + guard;
         const flat_px1 = m + pw - guard;
@@ -946,6 +1007,14 @@ pub const Canvas = struct {
 
                         if (style.content_fade_width > 0.0) {
                             content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
+                        }
+                        if (style.corner_fade_width > 0.0 and style.content_radius > 0.0) {
+                            // Corner zone: past the straight segments on BOTH axes, i.e. the
+                            // nearest boundary point lies on the arc. Only there the content
+                            // fades over `corner_fade_width`; the straight edges stay crisp.
+                            const qx = @abs(fx - (dx_f + sw_f / 2.0)) - (sw_f / 2.0 - style.content_radius);
+                            const qy = @abs(fy - (dy_f + sh_f / 2.0)) - (sh_f / 2.0 - style.content_radius);
+                            if (qx > 0.0 and qy > 0.0) content_cov *= smoothstep(0.0, style.corner_fade_width, -d_content);
                         }
                         if (style.border_anim_width > 0.0) {
                             content_cov *= 1.0 - smoothstep(0.0, style.border_anim_width, -d_panel);
@@ -1840,9 +1909,9 @@ test "blitImage, blitMask and blitImageRot blit correctly" {
 
     // 2x2 RGBA image (red, green, blue, white)
     const src_img = [_]u8{
-        255, 0,   0,   255, // Red
-        0,   255, 0,   255, // Green
-        0,   0,   255, 255, // Blue
+        255, 0, 0, 255, // Red
+        0, 255, 0, 255, // Green
+        0, 0, 255, 255, // Blue
         255, 255, 255, 255, // White
     };
 
@@ -1895,8 +1964,6 @@ test "Canvas damage tracking records and unions modified regions" {
     try std.testing.expect(d2.x1 >= 70 and d2.y1 >= 80);
 }
 
-
-
 test "premulToStraightRgba: SIMD fast/general lanes match the scalar reference" {
     // The 3-element test above never reaches the @Vector(4, ...) path (n < 4) — this one
     // uses a length that isn't a multiple of 4 to exercise the vector loop AND its scalar
@@ -1924,7 +1991,10 @@ test "premulToStraightRgba: SIMD fast/general lanes match the scalar reference" 
     var want: [N]u32 = undefined;
     for (src, 0..) |p, idx| {
         const a: u32 = (p >> 24) & 0xff;
-        if (a == 0) { want[idx] = 0; continue; }
+        if (a == 0) {
+            want[idx] = 0;
+            continue;
+        }
         if (a == 255) {
             want[idx] = (@as(u32, 255) << 24) | ((p & 0xff) << 16) | (p & 0x0000ff00) | ((p >> 16) & 0xff);
             continue;
