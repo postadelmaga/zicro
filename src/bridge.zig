@@ -72,7 +72,7 @@ pub fn writeRawFrame(w: *Io.Writer, frame: RawFrame) !void {
     const total_len = 1 + 2 + frame.channel.len + frame.data.len;
     if (total_len > std.math.maxInt(u32)) return error.FrameTooLarge;
     try w.writeInt(u32, @intCast(total_len), .little);
-    try w.writeInt(u8, @intFromEnum(frame.kind), .little);
+    try w.writeInt(u8, @backingInt(frame.kind), .little);
     try w.writeInt(u16, @intCast(frame.channel.len), .little);
     try w.writeAll(frame.channel);
     try w.writeAll(frame.data);

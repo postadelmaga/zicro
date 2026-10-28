@@ -80,8 +80,8 @@ pub const phi = proportion.phi;
 /// guard over this list, so forgetting a re-export fails the web/android build in this
 /// repo instead of surfacing as a missing symbol in a downstream app.
 pub const substrate_decls = [_][]const u8{
-    "paint",  "paint_gl", "text",       "theme",     "anim", "keymap",
-    "scroll", "widget",   "gesture",    "proportion", "phi", "clipboard",
+    "paint",  "paint_gl", "text",    "theme",      "anim", "keymap",
+    "scroll", "widget",   "gesture", "proportion", "phi",  "clipboard",
     "wl",     "window",
 };
 

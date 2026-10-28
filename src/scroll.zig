@@ -238,7 +238,7 @@ pub const Scroll = struct {
     /// discrete wheel notches (smoothed in `tick`), false for trackpad pixels (applied
     /// verbatim). Returns true if the event fell inside the scrollable content.
     pub fn onWheel(self: *Scroll, axis: Axis, value: f32, line: bool, x: f32, y: f32) bool {
-        const d: u8 = @intFromEnum(axis);
+        const d: u8 = @backingInt(axis);
         if (!self.inViewport(x, y) or self.maxOff(d) <= 0) return false;
         if (line) {
             self.unprocessed[d] += value * wheel_gain; // smoothed in tick

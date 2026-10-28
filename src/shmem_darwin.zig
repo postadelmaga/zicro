@@ -42,7 +42,7 @@ pub fn createSlot(id_buf: *[64]u8, total: usize) !CreateResult {
     const written = std.fmt.bufPrint(id_buf, "/ms-{d}-{d}", .{ getpid(), seq }) catch unreachable;
 
     var name_buf: [64:0]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&name_buf, "{s}", .{written}) catch unreachable;
+    const name = std.mem.printSentinel(&name_buf, "{s}", .{written}, 0) catch unreachable;
     const fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0o600);
     if (fd < 0) return error.ShmOpenFailed;
     errdefer _ = close(fd);
@@ -55,7 +55,7 @@ pub fn createSlot(id_buf: *[64]u8, total: usize) !CreateResult {
 
 pub fn openSlot(id: []const u8, total: usize) !Mapping {
     var name_buf: [64:0]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&name_buf, "{s}", .{id}) catch return error.InvalidSlotId;
+    const name = std.mem.printSentinel(&name_buf, "{s}", .{id}, 0) catch return error.InvalidSlotId;
     const fd = shm_open(name, O_RDONLY, 0);
     if (fd < 0) return error.ShmOpenFailed;
     errdefer _ = close(fd);
@@ -67,7 +67,7 @@ pub fn closeWriter(m: Mapping, id: []const u8) void {
     std.posix.munmap(m.bytes);
     _ = close(m.fd);
     var name_buf: [64:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&name_buf, "{s}", .{id})) |name| {
+    if (std.mem.printSentinel(&name_buf, "{s}", .{id}, 0)) |name| {
         _ = shm_unlink(name);
     } else |_| {}
 }

@@ -55,16 +55,16 @@ pub const Window = struct {
         // Draw once before the surface is even attached — every backend's
         // first frame is real content, not a blank flash.
         self.redraw();
-        rt.sendWordsCarry(REQ, @intFromEnum(proto.Tag.attach_surface), (proto.AttachSurface{ .node = self.root, .width = w, .height = h, .pitch = w * 4 }).encode(), vmo);
+        rt.sendWordsCarry(REQ, @backingInt(proto.Tag.attach_surface), (proto.AttachSurface{ .node = self.root, .width = w, .height = h, .pitch = w * 4 }).encode(), vmo);
         _ = rt.recvWords(REP); // ok/err from attach — nothing actionable differently either way yet
-        rt.sendWords(REQ, @intFromEnum(proto.Tag.commit), (proto.NodeOnly{ .node = self.root }).encode());
+        rt.sendWords(REQ, @backingInt(proto.Tag.commit), (proto.NodeOnly{ .node = self.root }).encode());
         _ = rt.recvWords(REP);
 
         return self;
     }
 
     pub fn deinit(self: *Window) void {
-        rt.sendWords(REQ, @intFromEnum(proto.Tag.disconnect), .{ 0, 0, 0, 0 });
+        rt.sendWords(REQ, @backingInt(proto.Tag.disconnect), .{ 0, 0, 0, 0 });
         self.gpa.destroy(self);
     }
 
@@ -90,12 +90,12 @@ pub const Window = struct {
     pub fn run(self: *Window) !void {
         while (!self.closed) {
             const r = rt.recvWords(REP);
-            const tag: proto.Tag = @enumFromInt(@as(u32, @truncate(r.tag)));
+            const tag: proto.Tag = @fromBackingInt(@intCast(@as(u32, @truncate(r.tag))));
             if (tag != .key_event) continue; // a stray ok/err reply — ignore
             const ke = proto.KeyEvent.decode(r.words);
             if (self.opts.on_key) |cb| cb(self, ke.code, @intFromBool(ke.pressed), self.opts.user);
             self.redraw();
-            rt.sendWords(REQ, @intFromEnum(proto.Tag.commit), (proto.NodeOnly{ .node = self.root }).encode());
+            rt.sendWords(REQ, @backingInt(proto.Tag.commit), (proto.NodeOnly{ .node = self.root }).encode());
             _ = rt.recvWords(REP);
         }
     }

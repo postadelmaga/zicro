@@ -62,7 +62,7 @@ pub const OwnedEnvelope = struct {
 /// Write an envelope as one JSON object — the wire shape shared by every zicro/Micro
 /// codec: `{"from":…,"channel":…,"payload":<compact JSON>}`, from/channel JSON-escaped.
 /// Payload is re-stringified in compact form to prevent injection of newlines/whitespace.
-pub const WriteEnvelopeJsonError = error{ MalformedPayload } || std.Io.Writer.Error;
+pub const WriteEnvelopeJsonError = error{MalformedPayload} || std.Io.Writer.Error;
 
 pub fn writeEnvelopeJson(gpa: Allocator, w: *std.Io.Writer, env: *const Envelope) WriteEnvelopeJsonError!void {
     // Re-parse and re-stringify payload to ensure it's valid compact JSON (no newlines/whitespace).

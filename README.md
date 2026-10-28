@@ -22,7 +22,7 @@ Frame app sees is identical on every OS.
 
 ## What is zicro?
 
-A faithful port of the Rust **Micro** workspace to Zig 0.16. The three ideas are the same:
+A faithful port of the Rust **Micro** workspace to Zig 0.17. The three ideas are the same:
 
 1. **`Envelope` + channels (`protocol`)** — the only types modules share. Routing is by
    channel name; a module never inspects another's internals. `Topic(T)` binds a channel

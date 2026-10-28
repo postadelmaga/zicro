@@ -103,14 +103,14 @@ pub const AudioBlock = struct {
 
 test "frame rejects a mismatched buffer" {
     const gpa = std.testing.allocator;
-    var ok = try Frame.init(gpa, 2, 2, .rgba8, &(.{0} ** 16));
+    var ok = try Frame.init(gpa, 2, 2, .rgba8, &@as([16]u8, @splat(0)));
     ok.deinit();
-    try std.testing.expectError(error.WrongBufferSize, Frame.init(gpa, 2, 2, .rgba8, &(.{0} ** 15)));
+    try std.testing.expectError(error.WrongBufferSize, Frame.init(gpa, 2, 2, .rgba8, &@as([15]u8, @splat(0))));
 }
 
 test "audio block counts frames" {
     const gpa = std.testing.allocator;
-    var b = try AudioBlock.init(gpa, 48_000, 2, &(.{0.0} ** 256));
+    var b = try AudioBlock.init(gpa, 48_000, 2, &@as([256]f32, @splat(0.0)));
     defer b.deinit();
     try std.testing.expectEqual(@as(usize, 128), b.frames());
 }

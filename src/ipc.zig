@@ -185,7 +185,6 @@ pub const ProcessReceiver = struct {
             },
         }
     }
-
 };
 
 // --- tests ---------------------------------------------------------------------------------
@@ -218,7 +217,16 @@ test "postcard codec round-trips and matches the Micro wire format" {
 test "varint survives multi-byte lengths" {
     const gpa = testing.allocator;
     // A payload longer than 127 bytes forces a two-byte LEB128 length.
-    const long = "[" ++ "1," ** 100 ++ "1]";
+    // `**` left the language in 0.17 and `@splat` cannot build a pattern, so the
+    // 100 "1," pairs are laid down at comptime: "[" + 200 bytes + "1]" = 203.
+    const long_buf = comptime blk: {
+        var buf: [203]u8 = undefined;
+        buf[0] = '[';
+        for (0..100) |i| buf[1 + i * 2 ..][0..2].* = "1,".*;
+        buf[201..][0..2].* = "1]".*;
+        break :blk buf;
+    };
+    const long: []const u8 = &long_buf;
     const env: Envelope = .{ .from = "sidecar", .channel = "scene", .payload = long };
     const bytes = try serializeEnvelopePostcard(gpa, &env);
     defer gpa.free(bytes);
@@ -275,4 +283,3 @@ test "process pair round-trips postcard packets" {
     try testing.expectEqualStrings("[1,2,3]", got.env.payload);
     try testing.expectError(error.EndOfStream, rx.recv());
 }
-

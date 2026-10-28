@@ -601,7 +601,7 @@ test "device out compiles and plays into the null/real backend without error" {
     // is that the API compiles and that play() on an open device doesn't crash.
     var dev = DeviceOut.open(48_000, 2) catch return;
     defer dev.close();
-    var block = try AudioBlock.init(std.testing.allocator, 48_000, 2, &(.{0.0} ** 512));
+    var block = try AudioBlock.init(std.testing.allocator, 48_000, 2, &@as([512]f32, @splat(0.0)));
     defer block.deinit();
     dev.play(&block);
 }

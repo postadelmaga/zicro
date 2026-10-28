@@ -244,8 +244,11 @@ pub const LocalBus = struct {
         // Stack space for the `.block` snapshot: only fan-outs beyond ~48 subscribers
         // touch the allocator, keeping the common publish path allocation-free (the list
         // over-reserves on first growth, so leave generous headroom).
-        var sfa = std.heap.stackFallback(64 * @sizeOf(*Inbox), bus.gpa);
-        const scratch = sfa.get();
+        // 0.17 replaced `std.heap.stackFallback` with BufferFirstAllocator, which
+        // takes the buffer instead of carrying it: same stack-first behaviour.
+        var scratch_buf: [64 * @sizeOf(*Inbox)]u8 = undefined;
+        var sfa: std.heap.BufferFirstAllocator = .init(&scratch_buf, bus.gpa);
+        const scratch = sfa.allocator();
         var blocking_targets: SubList = .empty;
         defer {
             // Normally emptied by the sweep; on an error path this releases the snapshot.

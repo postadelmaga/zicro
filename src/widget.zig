@@ -1483,10 +1483,22 @@ pub const Ui = struct {
         const b_lbl = std.fmt.bufPrint(&b_buf, "{s}_B", .{label_}) catch "B";
         const a_lbl = std.fmt.bufPrint(&a_buf, "{s}_A", .{label_}) catch "A";
 
-        if (ui.slider(r_lbl, &r_val, 0.0, 1.0)) { color.r = r_val; changed = true; }
-        if (ui.slider(g_lbl, &g_val, 0.0, 1.0)) { color.g = g_val; changed = true; }
-        if (ui.slider(b_lbl, &b_val, 0.0, 1.0)) { color.b = b_val; changed = true; }
-        if (ui.slider(a_lbl, &a_val, 0.0, 1.0)) { color.a = a_val; changed = true; }
+        if (ui.slider(r_lbl, &r_val, 0.0, 1.0)) {
+            color.r = r_val;
+            changed = true;
+        }
+        if (ui.slider(g_lbl, &g_val, 0.0, 1.0)) {
+            color.g = g_val;
+            changed = true;
+        }
+        if (ui.slider(b_lbl, &b_val, 0.0, 1.0)) {
+            color.b = b_val;
+            changed = true;
+        }
+        if (ui.slider(a_lbl, &a_val, 0.0, 1.0)) {
+            color.a = a_val;
+            changed = true;
+        }
 
         return changed;
     }
@@ -3087,5 +3099,3 @@ test "HiDPI autoScale adjusts theme geometry proportionally" {
     try testing.expectEqual(orig_h * 2.0, ui.theme.ctl_h);
     _ = ui.end();
 }
-
-

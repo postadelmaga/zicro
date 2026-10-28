@@ -545,7 +545,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (bw != self.buf_w or bh != self.buf_h) try self.resizeBuffers(bw, bh);
 
         const slot = self.freeSlot() orelse return;
-        
+
         // Background clearing (transparent black by default)
         @memset(slot.pixels, 0x00000000);
 

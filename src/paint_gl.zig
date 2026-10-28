@@ -251,9 +251,15 @@ pub const GlRecorder = struct {
         const vb = @as(f32, @floatFromInt(s.y + s.h)) * inv;
         const uv = [4][2]f32{ .{ ua, va }, .{ ub, va }, .{ ub, vb }, .{ ua, vb } };
         var vv: Vertex = .{
-            .r = col.r, .g = col.g, .b = col.b, .a = col.a,
+            .r = col.r,
+            .g = col.g,
+            .b = col.b,
+            .a = col.a,
             .mode = mode,
-            .clip_x0 = cl[0], .clip_y0 = cl[1], .clip_x1 = cl[2], .clip_y1 = cl[3],
+            .clip_x0 = cl[0],
+            .clip_y0 = cl[1],
+            .clip_x1 = cl[2],
+            .clip_y1 = cl[3],
         };
         for ([6]usize{ 0, 1, 2, 0, 2, 3 }) |i| {
             vv.x = pos[i][0];
@@ -300,9 +306,15 @@ pub const GlRecorder = struct {
         self.verts.ensureUnusedCapacity(self.gpa, 6) catch return; // see `quad`'s rationale
         const cl = clipTuple(clip);
         var v: Vertex = .{
-            .r = color.r, .g = color.g, .b = color.b, .a = color.a,
+            .r = color.r,
+            .g = color.g,
+            .b = color.b,
+            .a = color.a,
             .mode = 3,
-            .clip_x0 = cl[0], .clip_y0 = cl[1], .clip_x1 = cl[2], .clip_y1 = cl[3],
+            .clip_x0 = cl[0],
+            .clip_y0 = cl[1],
+            .clip_x1 = cl[2],
+            .clip_y1 = cl[3],
         };
         const p = [4][2]f32{ .{ ax + nx, ay + ny }, .{ bx + nx, by + ny }, .{ bx - nx, by - ny }, .{ ax - nx, ay - ny } };
         for ([6]usize{ 0, 1, 2, 0, 2, 3 }) |i| {

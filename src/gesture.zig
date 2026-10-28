@@ -35,7 +35,7 @@ pub const Recognizer = struct {
     pub const max_touch = 8;
     const Pt = struct { id: i32 = -1, x: f32 = 0, y: f32 = 0 };
 
-    pts: [max_touch]Pt = [_]Pt{.{}} ** max_touch,
+    pts: [max_touch]Pt = @splat(.{}),
     n: usize = 0,
     pinching: bool = false,
     prev_dist: f32 = 0,

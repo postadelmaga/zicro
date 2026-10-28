@@ -271,6 +271,11 @@ pub const Runtime = struct {
     shared: *RuntimeShared,
     pool: *WorkerPool,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    /// Set by `join`, which frees `shared`: after it every module thread has been
+    /// joined, so `liveCount` is 0 by construction and must NOT read `shared`
+    /// (doing so was a use-after-free — harmless until an allocator recycled the
+    /// block, which is exactly what `App.deinit`'s assert then tripped over).
+    joined: bool = false,
 
     /// New runtime over an existing bus — the caller keeps bus ownership (and can publish
     /// or subscribe from outside any module, e.g. the app's main thread).
@@ -296,6 +301,7 @@ pub const Runtime = struct {
     /// shutdown or failure) — pair it with [`LocalBus.channelMetrics`] for a cheap health
     /// view of a running app.
     pub fn liveCount(rt: *Runtime) usize {
+        if (rt.joined) return 0; // `shared` is gone; every thread was joined
         return rt.shared.live.load(.monotonic);
     }
 
@@ -357,6 +363,7 @@ pub const Runtime = struct {
             rt.gpa.destroy(entry.ctx);
         }
         rt.entries.deinit(rt.gpa);
+        rt.joined = true;
         // Modules are done: close the queue, let the workers drain it, join them.
         rt.pool.shutdownAndDestroy();
         const failed = rt.shared.failed.toOwnedSlice(rt.shared.gpa) catch &.{};

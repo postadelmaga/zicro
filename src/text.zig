@@ -16,10 +16,9 @@ const builtin = @import("builtin");
 // in unconditionally breaks every cross-target build (`hb.h` not found).
 const have_hb_lib = builtin.target.os.tag == .linux and builtin.target.abi != .android;
 
-const c = @cImport({
-    @cInclude("stb_truetype.h");
-    if (have_hb_lib) @cInclude("hb.h");
-});
+// Translated by the `addTextC` step in build.zig (see src/c/text.h): Zig 0.17
+// removed `@cImport`, so the headers arrive as a module instead of in-line.
+const c = @import("text_c");
 
 pub const has_harfbuzz = have_hb_lib and @hasDecl(c, "hb_buffer_create");
 
@@ -121,7 +120,7 @@ pub const Font = struct {
         const off = c.stbtt_GetFontOffsetForIndex(p, 0);
         if (c.stbtt_InitFont(&face.info, p, off) == 0) return error.FontInit;
         face.initHb(ttf);
-        const idx = @intFromEnum(style);
+        const idx = @backingInt(style);
         // Replacing a face: the cached glyphs of that style go stale, but the key
         // includes the style and not the face — the cache is cleared for
         // simplicity and correctness (faces are changed rarely).
@@ -194,7 +193,7 @@ pub const Font = struct {
             .bold_italic => &.{ .bold_italic, .bold, .italic, .regular },
         };
         for (order) |s| {
-            if (self.faces[@intFromEnum(s)]) |*f| return f;
+            if (self.faces[@backingInt(s)]) |*f| return f;
         }
         return null;
     }
@@ -542,5 +541,3 @@ test "HarfBuzz shaping shapes text runs and produces positioned glyphs" {
     }
     try std.testing.expectEqual(@as(usize, text_str.len), count);
 }
-
-

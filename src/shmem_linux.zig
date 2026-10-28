@@ -26,7 +26,7 @@ fn shmPath(buf: *[96:0]u8, id: []const u8) ![:0]const u8 {
     // A POSIX shm name "/foo" lives at /dev/shm/foo on Linux — same layout glibc uses,
     // which is what keeps a zicro slot openable by a Rust `shm_open` peer.
     if (id.len == 0 or id[0] != '/') return error.InvalidSlotId;
-    return std.fmt.bufPrintZ(buf, "/dev/shm{s}", .{id});
+    return std.mem.printSentinel(buf, "/dev/shm{s}", .{id}, 0);
 }
 
 /// Create a fresh, uniquely-named region of `total` bytes and map it read-write. The slot
@@ -96,7 +96,7 @@ pub fn closeReader(m: Mapping) void {
 /// Whether `pid` names a live process, via `/proc/<pid>`.
 fn pidAlive(pid: i32) bool {
     var buf: [32:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buf, "/proc/{d}", .{pid}) catch return true;
+    const path = std.mem.printSentinel(&buf, "/proc/{d}", .{pid}, 0) catch return true;
     return linux.errno(linux.access(path, 0)) == .SUCCESS;
 }
 
@@ -141,9 +141,9 @@ test "sweepOrphans removes dead-pid slots and keeps live ones" {
     while (pidAlive(dead_pid)) dead_pid -= 1;
 
     var dead_buf: [96:0]u8 = undefined;
-    const dead_path = try std.fmt.bufPrintZ(&dead_buf, "/dev/shm/micro-state-{d}-42", .{dead_pid});
+    const dead_path = try std.mem.printSentinel(&dead_buf, "/dev/shm/micro-state-{d}-42", .{dead_pid}, 0);
     var live_buf: [96:0]u8 = undefined;
-    const live_path = try std.fmt.bufPrintZ(&live_buf, "/dev/shm/micro-state-{d}-42", .{linux.getpid()});
+    const live_path = try std.mem.printSentinel(&live_buf, "/dev/shm/micro-state-{d}-42", .{linux.getpid()}, 0);
     for ([_][*:0]const u8{ dead_path, live_path }) |path| {
         const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
         try testing.expect(linux.errno(rc) == .SUCCESS);

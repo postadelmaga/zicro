@@ -41,7 +41,20 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .link_libc = true,
             });
+            // webgpu.h come modulo (0.17 ha rimosso `@cImport`): qui l'header lo
+            // porta la dipendenza prebuilt, quindi lo step lo crea Zicro.
+            const wgpu_c = b.addTranslateC(.{
+                .root_source_file = b.path("src/c/webgpu.h"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            wgpu_c.addIncludePath(wgpu_dep.path("include"));
+            wgpu.addImport("webgpu_c", wgpu_c.createModule());
             wgpu.addIncludePath(wgpu_dep.path("include"));
+            // gpu_wgpu.zig arriva a text.zig via paint_gl.zig: serve anche il suo
+            // modulo C (è il motivo per cui qui sotto c'è già stb_truetype).
+            addTextC(b, wgpu, target, optimize, true);
             wgpu.addLibraryPath(wgpu_dep.path("lib"));
             wgpu.linkSystemLibrary("wgpu_native", .{});
             wgpu.addIncludePath(b.path("vendor/stb"));
@@ -70,17 +83,32 @@ pub fn build(b: *std.Build) void {
     //     zw.addSystemIncludePath(.{ .cwd_relative = <emsdk>/cache/sysroot/include });
     //     zw.addIncludePath(.{ .cwd_relative = <emsdk>/.../emdawnwebgpu_pkg/webgpu/include });
     //
+    // Da Zig 0.17 (niente più `@cImport`) il consumatore deve anche TRADURRE
+    // l'header, perché gli include path di un modulo non guidano la traduzione.
+    // Lo step va creato sul builder della dipendenza, così `src/c/webgpu.h` si
+    // risolve rispetto a questa radice:
+    //
+    //     const zb = zicro.builder;
+    //     const wc = zb.addTranslateC(.{ .root_source_file = zb.path("src/c/webgpu.h"),
+    //         .target = wasm_target, .optimize = optimize, .link_libc = true });
+    //     wc.addSystemIncludePath(.{ .cwd_relative = <emsdk>/cache/sysroot/include });
+    //     wc.addIncludePath(.{ .cwd_relative = <emsdk>/.../emdawnwebgpu_pkg/webgpu/include });
+    //     zw.addImport("webgpu_c", wc.createModule());
+    //
     // A different NAME from the desktop module, deliberately: enabling both forms in one
     // build must not put gpu_wgpu.zig in two modules, and a consumer who imports both
     // deserves the compiler saying so with these two names in the error.
     const want_wgpu_browser = b.option(bool, "wgpu-browser", "publish the WebGPU binding without wgpu-native (emscripten form; bring the port's include paths)") orelse false;
     if (want_wgpu_browser) {
-        _ = b.addModule("zicro_wgpu_browser", .{
+        const wgpu_browser = b.addModule("zicro_wgpu_browser", .{
             .root_source_file = b.path("src/gpu_wgpu.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
+        // Come la forma desktop: text.zig è raggiungibile via paint_gl.zig.
+        // webgpu.h invece lo traduce il consumatore (vedi il commento sopra).
+        addTextC(b, wgpu_browser, target, optimize, true);
     }
 
     // `zig build test` — every `test` block in the library.
@@ -110,7 +138,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_bench = b.addRunArtifact(bench_exe);
-    if (b.args) |args| run_bench.addArgs(args);
+    run_bench.addPassthruArgs();
     const bench_step = b.step("bench", "Run the latency/throughput benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
@@ -146,6 +174,7 @@ pub fn build(b: *std.Build) void {
         });
         // stb_truetype for wasm: the web C shim predefines the STBTT_* hooks (no libc
         // headers) and routes malloc/libm to the Zig shims in wasm_shim.zig.
+        addTextC(b, web_zicro, wasm_target, .small, false);
         web_zicro.addIncludePath(b.path("vendor/stb"));
         web_zicro.addCSourceFile(.{
             .file = b.path("vendor/stb/stb_truetype_web.c"),
@@ -208,6 +237,7 @@ pub fn build(b: *std.Build) void {
 /// the PipeWire backend this way).
 fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, macos_sysroot: ?[]const u8) void {
     // stb_truetype FONT RASTERIZER (Hack regular+bold fonts embedded)
+    addTextC(b, mod, target, mod.optimize orelse .debug, true);
     mod.addIncludePath(b.path("vendor/stb"));
     mod.addCSourceFile(.{
         .file = b.path("vendor/stb/stb_truetype_impl.c"),
@@ -291,4 +321,34 @@ fn addMacosLinks(b: *std.Build, mod: *std.Build.Module, sysroot: ?[]const u8) vo
     mod.linkFramework("AppKit", .{});
     mod.linkFramework("Cocoa", .{});
     mod.linkFramework("CoreGraphics", .{});
+}
+
+/// The C half of `src/text.zig`, as a module.
+///
+/// Zig 0.17 removed `@cImport`, so stb_truetype (and HarfBuzz, where it exists)
+/// are translated by a build step and imported under the name "text_c". Every
+/// module that contains text.zig needs this. `zicro_android` is the exception:
+/// its target belongs to the CONSUMER, and a dependency's build.zig functions
+/// are not importable — so that one builds an equivalent step itself on
+/// `dep.builder` (see the android step in Zuer's build.zig).
+pub fn addTextC(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    link_libc: bool,
+) void {
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/text.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    tc.addIncludePath(b.path("vendor/stb"));
+    // Same condition as `have_hb_lib` in text.zig — the two must not drift.
+    if (target.result.os.tag == .linux and target.result.abi != .android) {
+        tc.defineCMacro("ZICRO_HAVE_HARFBUZZ", "1");
+        tc.linkSystemLibrary("harfbuzz", .{}); // pkg-config brings hb.h's include dir
+    }
+    mod.addImport("text_c", tc.createModule());
 }

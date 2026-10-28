@@ -94,7 +94,10 @@ pub const Window = switch (builtin.os.tag) {
             _ = self;
         }
         pub fn presentRgba(self: *@This(), w: u32, h: u32, rgba: []const u8) void {
-            _ = self; _ = w; _ = h; _ = rgba;
+            _ = self;
+            _ = w;
+            _ = h;
+            _ = rgba;
         }
         pub fn requestRedraw(self: *@This()) void {
             _ = self;
@@ -109,7 +112,8 @@ pub const Window = switch (builtin.os.tag) {
             _ = self;
         }
         pub fn setTitle(self: *@This(), title: [*:0]const u8) void {
-            _ = self; _ = title;
+            _ = self;
+            _ = title;
         }
         pub fn scaleFactor(self: *const @This()) f32 {
             _ = self;

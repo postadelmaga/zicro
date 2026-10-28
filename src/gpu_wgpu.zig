@@ -12,7 +12,7 @@
 //! a Wayland `wl_surface`, a Cocoa `CAMetalLayer`, a Win32 `HWND` or a `<canvas>`, and
 //! zicro is the only thing in the stack that knows which of those it has.
 //!
-//! ## Why `@cImport` and not a hand-rolled FFI
+//! ## Why translate-c and not a hand-rolled FFI
 //!
 //! A hand-written FFI makes sense when the real header is a hundred thousand generated
 //! lines and only a few dozen are used. `webgpu.h` is the
@@ -39,9 +39,9 @@ const std = @import("std");
 // a vendor extension). So the same Zig compiles against Dawn's copy of `webgpu.h` under
 // Emscripten and against wgpu-native's on the desktop, unchanged. That is the entire
 // reason this header was worth choosing over wgpu's own Rust API.
-pub const c = @cImport({
-    @cInclude("webgpu/webgpu.h");
-});
+// Translated by a build step (see src/c/webgpu.h): Zig 0.17 removed `@cImport`,
+// so webgpu.h arrives as the module "webgpu_c".
+pub const c = @import("webgpu_c");
 
 pub const Error = error{
     NoInstance,
@@ -393,4 +393,3 @@ test "WgpuBackend's vtable records draws into its CPU-side GlRecorder (no GPU up
     wgpu_b.reset();
     try std.testing.expectEqual(@as(usize, 0), wgpu_b.vertexCount());
 }
-
