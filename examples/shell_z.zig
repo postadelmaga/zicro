@@ -374,7 +374,10 @@ fn run(gpa: std.mem.Allocator) !void {
 // has no sensible recovery — return and let `_start`'s own post-call exit
 // tear the process down, same as zicro_host.zig's early-return-on-
 // disconnect convention.
-export fn main(_: usize) callconv(.c) void {
+export fn main(arg: usize) callconv(.c) void {
+    // The spawner packs our root node id into the argument (win_client.zig's layout);
+    // zicro_host passes 0, which decodes to the root it creates first (scenic_window.zig).
+    window.Window.spawn_arg = arg;
     var fba = std.heap.FixedBufferAllocator.init(&heap_buf);
     run(fba.allocator()) catch return;
 }
