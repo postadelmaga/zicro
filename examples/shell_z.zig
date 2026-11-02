@@ -49,6 +49,9 @@ const ShellState = struct {
     shift_pressed: bool = false,
     ctrl_pressed: bool = false,
     super_pressed: bool = false,
+    /// Where the last left click landed (buffer pixels), drawn as a small marker —
+    /// visible feedback that the pointer reaches the app, at the right place.
+    click: ?struct { x: i32, y: i32 } = null,
 
     pub fn init(gpa: std.mem.Allocator) !ShellState {
         return .{ .gpa = gpa, .lines = .empty, .input_buf = .empty };
@@ -197,6 +200,8 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const prompt_w: i32 = @intCast(prompt.len * font.GW);
     font.drawText(fb, @intCast(text_pad + prompt_w), @intCast(text_y), shell.input_buf.items, 0xFFFFFFFF);
 
+    if (shell.click) |c| drawMarker(canvas, content, c.x, c.y);
+
     const cursor_x = text_pad + prompt_w + @as(i32, @intCast(shell.input_buf.items.len * font.GW));
     var cy: i32 = text_y;
     while (cy < text_y + font.GH) : (cy += 1) {
@@ -207,6 +212,28 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             }
         }
     }
+}
+
+/// The click marker's colour — used nowhere else in the shell, so a test reading the
+/// framebuffer (Z's KTEST zicro_session) can tell it from everything drawn around it.
+pub const click_marker: u32 = 0xFFFF2BD6;
+const marker_half: i32 = 2;
+
+fn drawMarker(canvas: *paint.Canvas, content: window.Rect, x: i32, y: i32) void {
+    var my = y - marker_half;
+    while (my <= y + marker_half) : (my += 1) {
+        var mx = x - marker_half;
+        while (mx <= x + marker_half) : (mx += 1) {
+            if (mx >= 0 and my >= 0 and mx < content.w and my < content.h)
+                canvas.pixels[@intCast(my * content.w + mx)] = click_marker;
+        }
+    }
+}
+
+fn onMouse(_: *window.Window, ev: window.MouseEvent, user: ?*anyopaque) void {
+    const shell: *ShellState = @ptrCast(@alignCast(user.?));
+    if (ev.kind == .press and ev.button == 0x110) // BTN_LEFT
+        shell.click = .{ .x = @intFromFloat(ev.x), .y = @intFromFloat(ev.y) };
 }
 
 fn handleCommand(shell: *ShellState, cmd: []const u8) !void {
@@ -228,8 +255,7 @@ fn handleCommand(shell: *ShellState, cmd: []const u8) !void {
     } else if (std.mem.eql(u8, trimmed, "btop")) {
         var lo: u32 = 0;
         var hi: u32 = 0;
-        asm volatile (
-            "rdtsc"
+        asm volatile ("rdtsc"
             : [lo] "={eax}" (lo),
               [hi] "={edx}" (hi),
         );
@@ -359,6 +385,7 @@ fn run(gpa: std.mem.Allocator) !void {
         .height = 440,
         .on_draw = onDraw,
         .on_key = onKey,
+        .on_mouse = onMouse,
         .user = &shell,
     });
     defer win.deinit();

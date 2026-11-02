@@ -16,13 +16,19 @@
 //!   event that arrives before it.
 //! * `close_request` sets [`closed`](Client.closed) and is reported by
 //!   [`nextEvent`](Client.nextEvent) before anything else; queued input is moot once
-//!   the server has torn the window down. A reply still pending when it arrives is still
-//!   awaited (the server answers the request — likely `err`, the root being gone).
+//!   the server has torn the window down. A request still pending when it arrives is
+//!   ABANDONED: `call` returns `error.WindowClosed` instead of waiting for its reply.
+//!   protocol.zig says nothing is sent after a close_request, and a host that exits
+//!   right after sending it (zicro_host on QUIT) never answers — waiting would hang the
+//!   client forever. A server that does answer anyway (display_server) answers into an
+//!   endpoint nobody reads again: harmless, the client is disconnecting.
 //! * `configure` coalesces: only the newest size is kept (a zero-area one is ignored).
-//! * `key_event`s queue in a fixed ring of [`event_capacity`] (the kernel endpoint's own
-//!   depth, so a server that respects backpressure can never overflow it). Overflow
-//!   policy: the NEWEST event is dropped and counted in `dropped_events` — never a
-//!   blocking path, never an allocation.
+//! * Input — `key_event` and `surface_pointer` — queues in ONE fixed ring of
+//!   [`event_capacity`] (the kernel endpoint's own depth), so keys and clicks keep their
+//!   arrival order. Overflow policy: the NEWEST event is dropped and counted in
+//!   `dropped_events` — never a blocking path, never an allocation.
+//! * `surface_pointer` is already in this client's buffer coordinates (the server
+//!   inverts its own scaling); an unknown pointer kind is ignored like an unknown tag.
 //! * Unknown tags (the wire is not trusted, and a newer server may add pushes) are decoded
 //!   with the protocol's own `tagFromRaw`, never `@enumFromInt`: they are counted and
 //!   ignored. A capability carried on anything but a reply is closed, never leaked.
@@ -44,6 +50,8 @@ pub const event_capacity = 16;
 pub const Error = error{
     /// The transport refused a receive (bad/closed endpoint).
     RecvFailed,
+    /// The server closed the window while a request was pending: no reply will come.
+    WindowClosed,
 };
 
 /// A request's answer.
@@ -53,11 +61,18 @@ pub const Reply = union(enum) {
     node_created: graph.NodeId,
 };
 
+/// Queued input, in arrival order.
+pub const Input = union(enum) {
+    key: proto.KeyEvent,
+    pointer: proto.SurfacePointer,
+};
+
 /// What the event loop should handle next, in priority order.
 pub const Event = union(enum) {
     close,
     configure: proto.Configure,
     key: proto.KeyEvent,
+    pointer: proto.SurfacePointer,
 };
 
 /// `Transport` must provide:
@@ -72,9 +87,9 @@ pub fn Client(comptime Transport: type) type {
         /// The server sent `close_request`: the window is gone server-side.
         closed: bool = false,
         configure_pending: ?proto.Configure = null,
-        keys: [event_capacity]proto.KeyEvent = undefined,
-        key_head: usize = 0,
-        key_len: usize = 0,
+        inputs: [event_capacity]Input = undefined,
+        input_head: usize = 0,
+        input_len: usize = 0,
         /// Input events dropped because the ring was full (see the module doc).
         dropped_events: u64 = 0,
         /// Messages ignored: unknown tags, client-bound requests, replies with no request
@@ -89,16 +104,18 @@ pub fn Client(comptime Transport: type) type {
         /// first. `carry` is a capability to send along (copied, not moved — the caller
         /// still owns its handle).
         pub fn call(self: *Self, tag: proto.Tag, words: [4]u64, carry: ?usize) Error!Reply {
-            self.transport.send(@intFromEnum(tag), words, carry);
+            if (self.closed) return error.WindowClosed; // the window is gone: nothing to ask
+            self.transport.send(@backingInt(tag), words, carry);
             while (true) {
                 const m = try self.transport.recv();
                 if (self.absorb(m)) |reply| return reply;
+                if (self.closed) return error.WindowClosed;
             }
         }
 
         /// Send a request that has no reply (`disconnect`).
         pub fn sendOneWay(self: *Self, tag: proto.Tag, words: [4]u64) void {
-            self.transport.send(@intFromEnum(tag), words, null);
+            self.transport.send(@backingInt(tag), words, null);
         }
 
         /// The next thing for the event loop: `close` first, then the newest `configure`,
@@ -110,11 +127,14 @@ pub fn Client(comptime Transport: type) type {
                     self.configure_pending = null;
                     return .{ .configure = c };
                 }
-                if (self.key_len > 0) {
-                    const k = self.keys[self.key_head];
-                    self.key_head = (self.key_head + 1) % event_capacity;
-                    self.key_len -= 1;
-                    return .{ .key = k };
+                if (self.input_len > 0) {
+                    const in = self.inputs[self.input_head];
+                    self.input_head = (self.input_head + 1) % event_capacity;
+                    self.input_len -= 1;
+                    return switch (in) {
+                        .key => |k| .{ .key = k },
+                        .pointer => |p| .{ .pointer = p },
+                    };
                 }
                 const m = try self.transport.recv();
                 if (self.absorb(m)) |_| self.ignored += 1; // a reply nobody asked for
@@ -143,23 +163,29 @@ pub fn Client(comptime Transport: type) type {
                     const c = proto.Configure.decode(m.words);
                     if (c.w != 0 and c.h != 0) self.configure_pending = c else self.ignored += 1;
                 },
-                .key_event => {
-                    if (self.key_len == event_capacity) {
-                        self.dropped_events += 1;
-                    } else {
-                        self.keys[(self.key_head + self.key_len) % event_capacity] = proto.KeyEvent.decode(m.words);
-                        self.key_len += 1;
-                    }
+                .key_event => self.queue(.{ .key = proto.KeyEvent.decode(m.words) }),
+                .surface_pointer => if (proto.SurfacePointer.decode(m.words)) |p| self.queue(.{ .pointer = p }) else {
+                    self.ignored += 1;
                 },
-                // Hit-tested clicks arrive in absolute SCREEN coordinates and this protocol
-                // phase never tells a client where its window is, so they cannot be mapped
-                // to content coordinates yet: consumed, not delivered.
+                // The legacy push: absolute SCREEN coordinates, presses only, and no
+                // message ever tells a client where its window is — it cannot be mapped
+                // into this client's content. `surface_pointer` replaced it for clients
+                // that draw; consumed, not delivered.
                 .pointer_event => {},
                 // Client->server requests (and the parent-only spawn_request) never come
                 // from a server: a mismatch, ignored.
                 else => self.ignored += 1,
             }
             return null;
+        }
+
+        fn queue(self: *Self, in: Input) void {
+            if (self.input_len == event_capacity) {
+                self.dropped_events += 1;
+                return;
+            }
+            self.inputs[(self.input_head + self.input_len) % event_capacity] = in;
+            self.input_len += 1;
         }
 
         fn dropCap(self: *Self, m: Msg) void {
@@ -198,7 +224,7 @@ pub const FakeTransport = struct {
 };
 
 fn tagged(tag: proto.Tag, words: [4]u64) Msg {
-    return .{ .tag = @intFromEnum(tag), .words = words };
+    return .{ .tag = @backingInt(tag), .words = words };
 }
 
 const commit_req = (proto.NodeOnly{ .node = .{ .index = 0, .gen = 0 } }).encode();
@@ -207,18 +233,51 @@ test "events arriving before a reply are kept, not taken as the reply" {
     const script = [_]Msg{
         tagged(.key_event, (proto.KeyEvent{ .code = 30, .pressed = true }).encode()),
         tagged(.configure, (proto.Configure{ .w = 300, .h = 200 }).encode()),
-        tagged(.close_request, .{ 0, 0, 0, 0 }),
+        tagged(.surface_pointer, (proto.SurfacePointer{ .x = 5, .y = 6, .kind = .press, .button = 0x110 }).encode()),
         tagged(.ok, .{ 0, 0, 0, 0 }),
     };
     var c = Client(FakeTransport).init(.{ .inbound = &script });
     try testing.expectEqual(Reply.ok, try c.call(.commit, commit_req, null));
-    try testing.expectEqual(@as(u64, @intFromEnum(proto.Tag.commit)), c.transport.sent[0].tag);
-    // Every push survived the call; close outranks the rest.
+    try testing.expectEqual(@as(u64, @backingInt(proto.Tag.commit)), c.transport.sent[0].tag);
+    // Every push survived the call: configure first, then input in arrival order.
+    try testing.expectEqual(@as(u32, 300), (try c.nextEvent()).configure.w);
+    try testing.expectEqual(@as(u32, 30), (try c.nextEvent()).key.code);
+    const p = (try c.nextEvent()).pointer;
+    try testing.expectEqual(@as(u32, 5), p.x);
+    try testing.expectEqual(proto.SurfacePointer.Kind.press, p.kind);
+}
+
+test "a close_request during a request abandons it instead of waiting forever" {
+    // The host sent close_request and exited: the reply never comes. Before, the
+    // client kept waiting (the script then runs dry = the hang, here an error).
+    const script = [_]Msg{
+        tagged(.key_event, (proto.KeyEvent{ .code = 30, .pressed = true }).encode()),
+        tagged(.close_request, .{ 0, 0, 0, 0 }),
+    };
+    var c = Client(FakeTransport).init(.{ .inbound = &script });
+    try testing.expectError(error.WindowClosed, c.call(.commit, commit_req, null));
     try testing.expect(c.closed);
-    try testing.expectEqual(Event.close, try c.nextEvent());
+    try testing.expectEqual(Event.close, try c.nextEvent()); // close outranks the queued key
     try testing.expectEqual(Event.close, try c.nextEvent()); // sticky: the window is gone
-    try testing.expectEqual(@as(usize, 1), c.key_len);
-    try testing.expectEqual(@as(u32, 300), c.configure_pending.?.w);
+    try testing.expectEqual(@as(usize, 2), c.transport.next); // nothing read past the close
+}
+
+test "pointer input keeps its order with keys; an unknown pointer kind is ignored" {
+    var bad = (proto.SurfacePointer{ .x = 1, .y = 1, .kind = .motion }).encode();
+    bad[1] = 9;
+    const script = [_]Msg{
+        tagged(.surface_pointer, (proto.SurfacePointer{ .x = 10, .y = 20, .kind = .motion }).encode()),
+        tagged(.surface_pointer, bad),
+        tagged(.key_event, (proto.KeyEvent{ .code = 2, .pressed = true }).encode()),
+        tagged(.surface_pointer, (proto.SurfacePointer{ .x = 11, .y = 21, .kind = .release, .button = 0x110 }).encode()),
+    };
+    var c = Client(FakeTransport).init(.{ .inbound = &script });
+    try testing.expectEqual(@as(u32, 10), (try c.nextEvent()).pointer.x);
+    try testing.expectEqual(@as(u32, 2), (try c.nextEvent()).key.code);
+    const r = (try c.nextEvent()).pointer;
+    try testing.expectEqual(proto.SurfacePointer.Kind.release, r.kind);
+    try testing.expectEqual(@as(u32, 0x110), r.button);
+    try testing.expectEqual(@as(u64, 1), c.ignored);
 }
 
 test "configure coalesces to the newest size and outranks queued keys" {
@@ -239,12 +298,12 @@ test "configure coalesces to the newest size and outranks queued keys" {
 }
 
 test "unknown and high-bit tags are ignored, never read as a known message" {
-    const key_tag: u64 = @intFromEnum(proto.Tag.key_event);
+    const key_tag: u64 = @backingInt(proto.Tag.key_event);
     const script = [_]Msg{
         .{ .tag = 0x99, .words = .{ 30, 1, 0, 0 } }, // a tag this client does not know
         .{ .tag = (1 << 32) | key_tag, .words = .{ 30, 1, 0, 0 } }, // truncation would alias key_event
         .{ .tag = 0xDEAD_BEEF, .cap = 7 }, // and its carried cap must not leak
-        .{ .tag = @intFromEnum(proto.Tag.create_node) }, // a request, server-bound only
+        .{ .tag = @backingInt(proto.Tag.create_node) }, // a request, server-bound only
         tagged(.key_event, (proto.KeyEvent{ .code = 44, .pressed = false }).encode()),
     };
     var c = Client(FakeTransport).init(.{ .inbound = &script });

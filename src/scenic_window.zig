@@ -9,8 +9,9 @@
 //!   attach_surface{root,w,h,pitch} ─▶ ok point the root at a buffer inside it
 //!   commit{root}            ─▶ ok        make it visible
 //!   … then park: key_event → on_key, redraw, commit
+//!                surface_pointer → on_mouse (buffer coordinates), redraw, commit
 //!                configure{w,h} → new VMO, register_pool, attach, commit
-//!                close_request → leave run(); deinit sends disconnect
+//!                close_request → leave run(), even mid-request; deinit disconnects
 //! ```
 //! Every reply is checked: a refusal fails `init` (no half-attached window is ever
 //! returned) or ends `run` with an error — never a silent blank window. Messages are read
@@ -116,8 +117,8 @@ pub fn WindowOver(comptime Host: type) type {
             errdefer self.client.transport.freeSurface(self.surface);
             // Draw before attaching: the first frame is real content, not a blank flash.
             self.redraw();
-            try self.attach(self.surface);
-            try self.commit();
+            self.attach(self.surface) catch |e| return if (e == error.WindowClosed) error.ClosedDuringInit else e;
+            self.commit() catch |e| return if (e == error.WindowClosed) error.ClosedDuringInit else e;
             if (self.client.closed) return error.ClosedDuringInit;
             return self;
         }
@@ -139,6 +140,15 @@ pub fn WindowOver(comptime Host: type) type {
         /// can paint it once and touch only what changed. A resize hands `on_draw` a fresh
         /// (zeroed) buffer, so such an app must repaint fully when the size changes.
         pub fn run(self: *Self) !void {
+            self.loop() catch |e| switch (e) {
+                // The server closed the window while a frame or a resize was in flight:
+                // the same orderly end as a close_request read while idle.
+                error.WindowClosed => return,
+                else => return e,
+            };
+        }
+
+        fn loop(self: *Self) Error!void {
             while (!self.closed) {
                 switch (try self.client.nextEvent()) {
                     .close => return,
@@ -146,6 +156,25 @@ pub fn WindowOver(comptime Host: type) type {
                     .key => |k| {
                         if (self.opts.on_key) |cb| cb(self.platform(), k.code, @intFromBool(k.pressed), self.opts.user);
                         if (self.closed) return; // the app asked to leave: no frame owed
+                        self.redraw();
+                        try self.commit();
+                    },
+                    .pointer => |p| {
+                        // Already in this buffer's pixel space (the server inverted its
+                        // own scaling); only an app that asked for the mouse sees it.
+                        const cb = self.opts.on_mouse orelse continue;
+                        if (p.x >= self.width or p.y >= self.height) continue; // a stale-size point
+                        cb(self.platform(), .{
+                            .kind = switch (p.kind) {
+                                .motion => .motion,
+                                .press => .press,
+                                .release => .release,
+                            },
+                            .x = @floatFromInt(p.x),
+                            .y = @floatFromInt(p.y),
+                            .button = p.button,
+                        }, self.opts.user);
+                        if (self.closed) return;
                         self.redraw();
                         try self.commit();
                     },
@@ -282,13 +311,13 @@ const FakeHost = struct {
 const TestWindow = WindowOver(FakeHost);
 
 fn ok() Msg {
-    return .{ .tag = @intFromEnum(proto.Tag.ok) };
+    return .{ .tag = @backingInt(proto.Tag.ok) };
 }
 fn refuse(reason: proto.Reason) Msg {
-    return .{ .tag = @intFromEnum(proto.Tag.err), .words = (proto.Err{ .reason = reason }).encode() };
+    return .{ .tag = @backingInt(proto.Tag.err), .words = (proto.Err{ .reason = reason }).encode() };
 }
 fn push(tag: proto.Tag, words: [4]u64) Msg {
-    return .{ .tag = @intFromEnum(tag), .words = words };
+    return .{ .tag = @backingInt(tag), .words = words };
 }
 fn tagOf(m: Msg) proto.Tag {
     return proto.tagFromRaw(m.tag).?;
@@ -300,6 +329,14 @@ const Recorder = struct {
     draws: usize = 0,
     quit_on: ?u32 = null,
     win: ?*TestWindow = null,
+    mouse: [8]window.MouseEvent = undefined,
+    mice: usize = 0,
+
+    fn onMouse(_: *window.Window, ev: window.MouseEvent, user: ?*anyopaque) void {
+        const r: *Recorder = @ptrCast(@alignCast(user.?));
+        r.mouse[r.mice] = ev;
+        r.mice += 1;
+    }
 
     fn onDraw(canvas: *paint.Canvas, _: window.Rect, user: ?*anyopaque) void {
         const r: *Recorder = @ptrCast(@alignCast(user.?));
@@ -327,7 +364,7 @@ const Harness = struct {
         return .{ .inbound = script, .sent = &h.sent, .gpa = testing.allocator, .live_surfaces = &h.live };
     }
     fn opts(h: *Harness) window.Options {
-        return .{ .width = 8, .height = 4, .on_draw = Recorder.onDraw, .on_key = Recorder.onKey, .user = &h.rec };
+        return .{ .width = 8, .height = 4, .on_draw = Recorder.onDraw, .on_key = Recorder.onKey, .on_mouse = Recorder.onMouse, .user = &h.rec };
     }
     fn deinit(h: *Harness) void {
         h.sent.deinit(testing.allocator);
@@ -372,7 +409,7 @@ test "init fails on a dead endpoint and on a wrong reply kind" {
     var h: Harness = .{};
     defer h.deinit();
     try testing.expectError(error.RecvFailed, TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&.{}), 0));
-    const wrong = [_]Msg{.{ .tag = @intFromEnum(proto.Tag.node_created) }};
+    const wrong = [_]Msg{.{ .tag = @backingInt(proto.Tag.node_created) }};
     try testing.expectError(error.UnexpectedReply, TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&wrong), 0));
     try testing.expectEqual(@as(usize, 0), h.live);
 }
@@ -394,11 +431,10 @@ test "run: keys round-trip, a close_request ends the loop, deinit disconnects" {
     var h: Harness = .{};
     defer h.deinit();
     const script = [_]Msg{
-        ok(), ok(), ok(), // handshake
+        ok(),                                                                       ok(),                                  ok(), // handshake
         push(.key_event, (proto.KeyEvent{ .code = 30, .pressed = true }).encode()),
         // The close lands while the key's commit is in flight: kept, not taken as the reply.
-        push(.close_request, .{ 0, 0, 0, 0 }),
-        ok(),
+        push(.close_request, .{ 0, 0, 0, 0 }), ok(),
         // Never reached: run() must return on the close, not block for more.
     };
     const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&script), 0);
@@ -415,9 +451,9 @@ test "run: configure re-renders into a new pool and releases the old surface" {
     var h: Harness = .{};
     defer h.deinit();
     const script = [_]Msg{
-        ok(), ok(), ok(),
+        ok(),                                                            ok(), ok(),
         push(.configure, (proto.Configure{ .w = 16, .h = 8 }).encode()),
-        ok(), ok(), ok(), // register_pool, attach_surface, commit of the new size
+        ok(),                                  ok(), ok(), // register_pool, attach_surface, commit of the new size
         push(.close_request, .{ 0, 0, 0, 0 }),
     };
     const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&script), 0);
@@ -437,9 +473,8 @@ test "run: a resize the server refuses is an error, and nothing leaks" {
     var h: Harness = .{};
     defer h.deinit();
     const script = [_]Msg{
-        ok(), ok(), ok(),
-        push(.configure, (proto.Configure{ .w = 1 << 16, .h = 8 }).encode()),
-        ok(), refuse(.bad_geometry),
+        ok(),                                                                 ok(), ok(),
+        push(.configure, (proto.Configure{ .w = 1 << 16, .h = 8 }).encode()), ok(), refuse(.bad_geometry),
     };
     const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&script), 0);
     try testing.expectError(error.AttachRefused, w.run());
@@ -453,9 +488,8 @@ test "run: out of memory on resize keeps the old frame and the loop alive" {
     var h: Harness = .{};
     defer h.deinit();
     const script = [_]Msg{
-        ok(), ok(), ok(),
-        push(.configure, (proto.Configure{ .w = 32, .h = 32 }).encode()),
-        push(.close_request, .{ 0, 0, 0, 0 }),
+        ok(),                                                             ok(),                                  ok(),
+        push(.configure, (proto.Configure{ .w = 32, .h = 32 }).encode()), push(.close_request, .{ 0, 0, 0, 0 }),
     };
     var host = h.host(&script);
     host.fail_alloc_at = 1; // the first (init) surface succeeds, the resize's fails
@@ -471,7 +505,7 @@ test "run: the app leaving from on_key ends the loop without another frame" {
     var h: Harness = .{};
     defer h.deinit();
     const script = [_]Msg{
-        ok(), ok(), ok(),
+        ok(),                                                                      ok(), ok(),
         push(.key_event, (proto.KeyEvent{ .code = 1, .pressed = true }).encode()),
     };
     h.rec.quit_on = 1;
@@ -499,3 +533,96 @@ test "a close_request during the handshake fails init cleanly" {
     try testing.expectEqual(@as(usize, 0), h.live);
 }
 
+test "run: surface_pointer reaches on_mouse in buffer coordinates, then a frame" {
+    var h: Harness = .{};
+    defer h.deinit();
+    const script = [_]Msg{
+        ok(),                                                                                                       ok(), ok(),
+        push(.surface_pointer, (proto.SurfacePointer{ .x = 3, .y = 2, .kind = .press, .button = 0x110 }).encode()),
+        ok(), // its commit
+        push(.surface_pointer, (proto.SurfacePointer{ .x = 7, .y = 3, .kind = .release, .button = 0x110 }).encode()),
+        ok(),
+        push(.surface_pointer, (proto.SurfacePointer{ .x = 50, .y = 1, .kind = .motion }).encode()), // past an 8-px buffer: stale, dropped
+        push(.close_request, .{ 0, 0, 0, 0 }),
+    };
+    const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&script), 0);
+    try w.run();
+    try testing.expectEqual(@as(usize, 2), h.rec.mice);
+    try testing.expectEqual(window.MouseEvent.Kind.press, h.rec.mouse[0].kind);
+    try testing.expectEqual(@as(f32, 3), h.rec.mouse[0].x);
+    try testing.expectEqual(@as(f32, 2), h.rec.mouse[0].y);
+    try testing.expectEqual(@as(u32, 0x110), h.rec.mouse[0].button);
+    try testing.expectEqual(window.MouseEvent.Kind.release, h.rec.mouse[1].kind);
+    try testing.expectEqual(@as(usize, 3), h.rec.draws); // init + one per delivered event
+    w.deinit();
+}
+
+test "run: an app without on_mouse ignores the pointer and owes no frame" {
+    var h: Harness = .{};
+    defer h.deinit();
+    const script = [_]Msg{
+        ok(),                                                                                                       ok(),                                  ok(),
+        push(.surface_pointer, (proto.SurfacePointer{ .x = 1, .y = 1, .kind = .press, .button = 0x110 }).encode()), push(.close_request, .{ 0, 0, 0, 0 }),
+    };
+    var o = h.opts();
+    o.on_mouse = null;
+    const w = try TestWindow.initHost(testing.allocator, undefined, o, h.host(&script), 0);
+    try w.run();
+    try testing.expectEqual(@as(usize, 3), h.sent.items.len); // no commit for it
+    w.deinit();
+}
+
+test "run: a close_request instead of a commit's reply ends run cleanly (host exited)" {
+    var h: Harness = .{};
+    defer h.deinit();
+    const script = [_]Msg{
+        ok(),                                                                       ok(), ok(),
+        push(.key_event, (proto.KeyEvent{ .code = 30, .pressed = true }).encode()),
+        push(.close_request, .{ 0, 0, 0, 0 }), // zicro_host on QUIT: no reply follows
+    };
+    const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&script), 0);
+    try w.run(); // returns instead of blocking for the reply (the fake errors if read past)
+    w.deinit();
+    try testing.expectEqual(proto.Tag.disconnect, tagOf(h.sent.items[h.sent.items.len - 1]));
+    try testing.expectEqual(@as(usize, 0), h.live);
+}
+
+test "run: a close_request in the middle of a resize ends run and frees both surfaces" {
+    var h: Harness = .{};
+    defer h.deinit();
+    const script = [_]Msg{
+        ok(),                                                            ok(), ok(),
+        push(.configure, (proto.Configure{ .w = 16, .h = 8 }).encode()),
+        ok(), // register_pool of the new surface
+        push(.close_request, .{ 0, 0, 0, 0 }), // instead of attach_surface's reply
+    };
+    const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&script), 0);
+    try w.run();
+    try testing.expectEqual(@as(usize, 1), h.live); // only the surface still attached
+    w.deinit();
+    try testing.expectEqual(@as(usize, 0), h.live);
+}
+
+test "run: configures arriving during a resize coalesce into ONE more re-render" {
+    var h: Harness = .{};
+    defer h.deinit();
+    const script = [_]Msg{
+        ok(), ok(), ok(),
+        push(.configure, (proto.Configure{ .w = 10, .h = 5 }).encode()), // starts resize #1
+        push(.configure, (proto.Configure{ .w = 12, .h = 6 }).encode()), // arrive while #1's
+        push(.configure, (proto.Configure{ .w = 16, .h = 8 }).encode()), // requests are pending
+        ok(), ok(), ok(), // resize #1: register_pool, attach_surface, commit
+        ok(),                                  ok(), ok(), // resize #2, straight to the NEWEST size: 12x6 is never rendered
+        push(.close_request, .{ 0, 0, 0, 0 }),
+    };
+    const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), h.host(&script), 0);
+    defer w.deinit();
+    try w.run();
+    try testing.expectEqual(@as(u32, 16), w.width);
+    var pools: usize = 0;
+    for (h.sent.items) |m| {
+        if (tagOf(m) == .register_pool) pools += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), pools); // init + two resizes, not three
+    try testing.expectEqual(@as(usize, 1), h.live);
+}
