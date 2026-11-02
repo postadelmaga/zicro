@@ -474,6 +474,9 @@ test "idle scroll area settles: tick returns false once fades and activity are d
     while (i < 600) : (i += 1) {
         if (s.tick(1.0 / 60.0)) active_ticks += 1;
     }
-    std.debug.print("\nactive_ticks={d} activity={d:.3} show={d:.3} off={d:.3} last={d:.3}\n", .{ active_ticks, s.activity, s.show[1], s.offset[1], s.last_tick_off[1] });
+    // The state is printed only when the check fails: a passing test writes nothing to
+    // stderr (the build runner flags any stderr output with a "failed command" line).
+    if (active_ticks >= 200)
+        std.debug.print("\nactive_ticks={d} activity={d:.3} show={d:.3} off={d:.3} last={d:.3}\n", .{ active_ticks, s.activity, s.show[1], s.offset[1], s.last_tick_off[1] });
     try std.testing.expect(active_ticks < 200);
 }
