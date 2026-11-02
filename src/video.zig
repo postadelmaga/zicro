@@ -203,6 +203,7 @@ test "video sink presents the freshest frame" {
     var bus = core.LocalBus.init(testing.allocator, io);
     defer bus.deinit();
     var rt = try core.Runtime.init(testing.allocator, io, &bus);
+    defer rt.deinit();
 
     const tx, const rx = try media.latest(Frame, testing.allocator, io);
 

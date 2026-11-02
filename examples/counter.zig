@@ -71,6 +71,7 @@ pub fn main() !void {
     defer bus.deinit();
     try bus.retain("count"); // count is durable state: late joiners get the latest value
     var rt = try zicro.Runtime.init(gpa, io, &bus);
+    defer rt.deinit();
 
     var counts = try bus.subscribe("count");
     defer counts.deinit();

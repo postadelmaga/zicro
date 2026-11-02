@@ -115,15 +115,25 @@ pub const App = struct {
         return .{ .gpa = gpa, .io = io, .bus_ptr = bus_ptr, .rt = rt };
     }
 
-    /// Free the bus. Call after [`App.join`] / [`App.shutdownAndJoin`] (receivers handed
-    /// out by [`bus`](App.bus) stay valid — they only go quiet).
+    /// Tear the app down: the runtime first (joining it, after requesting shutdown, if
+    /// [`App.join`] / [`App.shutdownAndJoin`] was not called — the report is then
+    /// discarded), then the bus. Receivers handed out by [`bus`](App.bus) stay valid —
+    /// they only go quiet — and so do [`shutdownSignal`](App.shutdownSignal) handles.
+    /// Idempotent.
     pub fn deinit(app: *App) void {
-        // Freeing the bus while modules are still running would leave their threads with a
-        // dangling bus pointer — deinit is only valid once every module has stopped (via
-        // join / shutdownAndJoin).
-        std.debug.assert(app.liveCount() == 0);
+        if (app.rt.state() == .deinitialized) return;
+        // The runtime goes first: freeing the bus while modules still ran would leave
+        // their threads with a dangling bus pointer.
+        app.rt.deinit();
+        std.debug.assert(app.rt.liveCount() == 0);
         app.bus_ptr.deinit();
         app.gpa.destroy(app.bus_ptr);
+    }
+
+    /// An owning handle on the shutdown signal (see [`core.Shutdown`]) — e.g. for a UI
+    /// thread or a signal handler. The caller must `deinit()` it.
+    pub fn shutdownSignal(app: *App) core.Shutdown {
+        return app.rt.shutdownSignal();
     }
 
     /// The bus handle, for code outside a module (a UI, the main thread).
@@ -180,6 +190,9 @@ pub const App = struct {
         const instance = try app.gpa.create(World);
         errdefer app.gpa.destroy(instance);
         instance.* = World.init(id, actions, state, doc);
+        // The doc was moved into the instance: a refused spawn must free it too (spawn is
+        // transactional and leaves an owned instance to the caller on error).
+        errdefer instance.doc.deinit();
         try app.spawn(core.Module.ofOwned(World, instance));
     }
 
@@ -190,11 +203,13 @@ pub const App = struct {
     }
 
     /// Ask every module to stop (cooperative — modules observe it via `shouldStop`).
+    /// Idempotent; a no-op once joined.
     pub fn shutdown(app: *App) void {
         app.rt.shutdown();
     }
 
-    /// Wait for every module to finish, reporting which ones failed.
+    /// Wait for every module to finish, reporting which ones failed. Idempotent: a second
+    /// call returns an empty report.
     pub fn join(app: *App) core.JoinReport {
         return app.rt.join();
     }
@@ -284,4 +299,40 @@ test "world reduces actions and republishes committed state, retained" {
     const parsed = try msg.env().decode(i64, testing.allocator);
     defer parsed.deinit();
     try testing.expectEqual(@as(i64, 9), parsed.value);
+}
+
+test "repeated App lifecycles: every teardown order is defined, nothing leaks or faults" {
+    // page_allocator turns a use-after-free into a fault; testing.allocator catches leaks.
+    inline for (.{ std.heap.page_allocator, testing.allocator }) |gpa| {
+        var threaded: std.Io.Threaded = .init(gpa, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        for (0..20) |round| {
+            var app = try App.init(gpa, io);
+            try app.world(i64, CounterAction, "world", "actions", "state", .init(gpa, 0, reduce));
+            var handle = app.shutdownSignal(); // e.g. held by a UI thread
+            switch (round % 3) {
+                0 => { // the usual order, then everything again
+                    var r1 = app.shutdownAndJoin();
+                    r1.deinit();
+                    var r2 = app.shutdownAndJoin();
+                    r2.deinit();
+                    app.shutdown(); // `defer app.shutdown()` after a join: was a use-after-free
+                },
+                1 => { // stop through the outside handle, join
+                    handle.trigger();
+                    var r = app.join();
+                    r.deinit();
+                },
+                // Never joined: the world is still running, and deinit must request
+                // shutdown and join it itself.
+                else => try testing.expectEqual(@as(usize, 1), app.liveCount()),
+            }
+            app.deinit();
+            try testing.expectEqual(@as(usize, 0), app.liveCount());
+            app.deinit(); // idempotent
+            try testing.expect(handle.isTriggered()); // the handle outlived the app
+            handle.deinit();
+        }
+    }
 }

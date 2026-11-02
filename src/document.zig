@@ -19,18 +19,21 @@
 //! pointer plus an optional context pointer (Zig has no capturing closures).
 
 const std = @import("std");
+const hooks = @import("hooks.zig");
 const Allocator = std.mem.Allocator;
 
 /// Default undo depth when none is given.
 pub const default_max_depth: usize = 100;
 
+/// Optional state hooks `pub fn clone(self: *const S, gpa) !S` / `pub fn deinit(self: *S, gpa)`:
+/// they must be `pub`, or they are silently skipped (hooks.zig).
 fn cloneState(comptime S: type, gpa: Allocator, s: *const S) !S {
-    if (comptime std.meta.hasFn(S, "clone")) return s.clone(gpa);
+    if (comptime hooks.has(S, "clone")) return s.clone(gpa);
     return s.*;
 }
 
 fn deinitState(comptime S: type, gpa: Allocator, s: *S) void {
-    if (comptime std.meta.hasFn(S, "deinit")) s.deinit(gpa);
+    if (comptime hooks.has(S, "deinit")) s.deinit(gpa);
 }
 
 /// Generic undo/redo history for any cloneable state `S`. Holds the present value plus

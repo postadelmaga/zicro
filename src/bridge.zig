@@ -128,9 +128,17 @@ pub fn readFrame(gpa: Allocator, r: *Io.Reader) !?OwnedEnvelope {
 
 /// A running one-directional link between a bus and a stream. Stop it (and join its
 /// thread) with [`Bridge.stop`].
+///
+/// ## Ownership
+/// A `Bridge` value OWNS a thread and a heap flag: keep it in one place and stop it
+/// through a pointer. `stop` is idempotent on that value (a second call is a no-op), but a
+/// byte-copy of the struct is a second owner of the same thread — stopping both would
+/// join and free twice — so never copy a live bridge. `stop` is not thread-safe: call it
+/// from the owner only. The bus and the stream must outlive `stop`.
 pub const Bridge = struct {
     gpa: Allocator,
-    stop_flag: *std.atomic.Value(bool),
+    /// Null once stopped.
+    stop_flag: ?*std.atomic.Value(bool),
     thread: std.Thread,
 
     /// **Outbound**: forward every envelope published on `channels` of `bus` to `writer`.
@@ -180,11 +188,16 @@ pub const Bridge = struct {
         }
     }
 
-    /// Signal the bridge's thread to stop and wait for it.
-    pub fn stop(bridge: Bridge) void {
-        bridge.stop_flag.store(true, .release);
+    /// Signal the bridge's thread to stop and wait for it. Idempotent. An egress bridge
+    /// stops within [`poll_ns`] even when idle; envelopes still queued in its inbox are
+    /// released, not written (stop means stop, not drain). An ingress bridge stops at the
+    /// next frame boundary or when the stream ends (close it to interrupt a quiet link).
+    pub fn stop(bridge: *Bridge) void {
+        const flag = bridge.stop_flag orelse return;
+        flag.store(true, .release);
         bridge.thread.join();
-        bridge.gpa.destroy(bridge.stop_flag);
+        bridge.gpa.destroy(flag);
+        bridge.stop_flag = null;
     }
 };
 
@@ -243,7 +256,7 @@ test "egress then ingress carries a bus across a byte stream" {
     var captured: std.Io.Writer.Allocating = .init(gpa);
     defer captured.deinit();
     {
-        const out = Bridge.egress(gpa, &bus_a, &.{"x"}, &captured.writer) catch unreachable;
+        var out = Bridge.egress(gpa, &bus_a, &.{"x"}, &captured.writer) catch unreachable;
         try bus_a.publish("mod-a", "x", "{\"n\":7}");
         try bus_a.publish("mod-a", "x", "{\"n\":8}");
         sync.sleepNs(io, 50 * std.time.ns_per_ms); // let the egress thread drain
@@ -257,7 +270,7 @@ test "egress then ingress carries a bus across a byte stream" {
     defer rx.deinit();
     {
         var in: std.Io.Reader = .fixed(captured.writer.buffered());
-        const inb = Bridge.ingress(gpa, &bus_b, &in) catch unreachable;
+        var inb = Bridge.ingress(gpa, &bus_b, &in) catch unreachable;
         defer inb.stop(); // the reader EOFs, so the thread ends on its own
         const first = try rx.recv();
         defer first.deinit();
@@ -268,3 +281,45 @@ test "egress then ingress carries a bus across a byte stream" {
         try testing.expectEqualStrings("{\"n\":8}", second.env().payload);
     }
 }
+
+test "stop is idempotent, and stopping with envelopes still queued leaks nothing" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bus_ = LocalBus.init(gpa, io);
+    defer bus_.deinit();
+
+    // A writer that never accepts a byte: the egress thread fails its first write and
+    // exits, so later envelopes stay queued in its inbox when stop runs.
+    var stuck_buf: [0]u8 = .{};
+    var stuck: std.Io.Writer = .fixed(&stuck_buf);
+    var out = try Bridge.egress(gpa, &bus_, &.{"x"}, &stuck);
+    for (0..8) |_| try bus_.publish("m", "x", "{\"n\":1}");
+    out.stop();
+    out.stop(); // second stop: no double join, no double free
+    try testing.expectEqual(@as(?*std.atomic.Value(bool), null), out.stop_flag);
+
+    var in: std.Io.Reader = .fixed("");
+    var inb = try Bridge.ingress(gpa, &bus_, &in);
+    inb.stop();
+    inb.stop();
+}
+
+test "a bridge that cannot finish starting leaves nothing behind" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bus_ = LocalBus.init(testing.allocator, io);
+    defer bus_.deinit();
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    // The bus allocates the subscription with ITS allocator; the bridge's own flag comes
+    // from the failing one: the subscription must be released (testing.allocator checks).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, Bridge.egress(failing.allocator(), &bus_, &.{"x"}, &sink.writer));
+    var in: std.Io.Reader = .fixed("");
+    var failing_in = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, Bridge.ingress(failing_in.allocator(), &bus_, &in));
+}
+

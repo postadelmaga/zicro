@@ -214,6 +214,7 @@ test "clock publishes ticks on its channel" {
     var bus = core_.LocalBus.init(std.testing.allocator, io);
     defer bus.deinit();
     var rt = try core_.Runtime.init(std.testing.allocator, io, &bus);
+    defer rt.deinit();
 
     var rx = try bus.subscribe("tick");
     defer rx.deinit();

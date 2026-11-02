@@ -42,6 +42,7 @@
 //! not always recoverable by the caller.
 
 const std = @import("std");
+const hooks = @import("hooks.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -57,8 +58,9 @@ pub const AudioBlock = types.AudioBlock;
 /// without importing each other); see there for the semantics.
 pub const Rc = @import("rc.zig").Rc;
 
+/// A payload's optional `pub fn deinit(self: *T) void` — it must be `pub` (hooks.zig).
 fn maybeDeinit(comptime T: type, value: *T) void {
-    if (comptime std.meta.hasFn(T, "deinit")) value.deinit();
+    if (comptime hooks.has(T, "deinit")) value.deinit();
 }
 
 // --- latest-wins single-slot mailbox (video) -------------------------------------------

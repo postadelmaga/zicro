@@ -146,6 +146,7 @@ test "inline pipeline applies every stage in order, capture to playback" {
     var bus = core.LocalBus.init(testing.allocator, io);
     defer bus.deinit();
     var rt = try core.Runtime.init(testing.allocator, io, &bus);
+    defer rt.deinit();
 
     var mic = FakeMic{ .data = &.{ 1, 1, 2, 2, 3, 3 }, .channels = 1, .chunk_frames = 2 };
     var recorder = audio.Recorder.init(testing.allocator, io);

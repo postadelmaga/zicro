@@ -94,6 +94,7 @@ test {
     _ = @import("message.zig");
     _ = @import("inbox.zig");
     _ = @import("worker_pool.zig");
+    _ = @import("hooks.zig");
     _ = protocol;
     _ = bus;
     _ = document;

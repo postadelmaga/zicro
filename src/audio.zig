@@ -12,6 +12,7 @@
 //! feature) is an app-side `AudioOut` implementation.
 
 const std = @import("std");
+const hooks = @import("hooks.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -48,7 +49,7 @@ pub const AudioOut = struct {
         return .{
             .ptr = instance,
             .playFn = Impl.play,
-            .playRawFn = if (@hasDecl(T, "playRaw")) Impl.playRaw else null,
+            .playRawFn = if (comptime hooks.has(T, "playRaw")) Impl.playRaw else null, // must be pub: hooks.zig
         };
     }
 
@@ -246,6 +247,7 @@ test "audio sink plays every block in order into the device" {
     var bus = core.LocalBus.init(testing.allocator, io);
     defer bus.deinit();
     var rt = try core.Runtime.init(testing.allocator, io, &bus);
+    defer rt.deinit();
 
     const tx, const rx = try media.bounded(AudioBlock, testing.allocator, io, 2);
 
@@ -307,6 +309,7 @@ test "audio source captures every block in order onto the data plane" {
     var bus = core.LocalBus.init(testing.allocator, io);
     defer bus.deinit();
     var rt = try core.Runtime.init(testing.allocator, io, &bus);
+    defer rt.deinit();
 
     const tx, const rx = try media.bounded(AudioBlock, testing.allocator, io, 8);
     defer rx.deinit();

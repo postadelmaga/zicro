@@ -36,6 +36,7 @@ pub fn main() !void {
     var bus = zicro.LocalBus.init(gpa, io);
     defer bus.deinit();
     var rt = try zicro.Runtime.init(gpa, io, &bus);
+    defer rt.deinit();
 
     // One in-place stage; a real monitor would chain denoise/EQ here the same way.
     var gain = zicro.audio_pipeline.Gain{ .factor = 0.3 };
