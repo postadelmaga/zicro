@@ -241,3 +241,105 @@ test "create cleans up when it cannot finish" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     try testing.expectError(error.OutOfMemory, WorkerPool.create(failing.allocator(), threaded.io(), .{ .threads = 2 }));
 }
+
+// --- concurrency stress ---------------------------------------------------------------------
+// These run real threads against the real pool. The properties are counted, not timed:
+// every ACCEPTED job runs EXACTLY once (a per-job counter, so a double run or a lost
+// job is caught individually), QueueFull/PoolClosed never lose an accepted job, and the
+// allocator sees no leak and no double free (testing.allocator is thread-safe).
+
+const Tally = struct {
+    runs: []std.atomic.Value(u8),
+    fn job(ctx: *anyopaque) void {
+        const slot: *std.atomic.Value(u8) = @ptrCast(@alignCast(ctx));
+        _ = slot.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "stress: many producers, tiny bound — every accepted job runs exactly once" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const pool = try WorkerPool.create(testing.allocator, threaded.io(), .{ .threads = 3, .max_queued = 8 });
+
+    const producers = 4;
+    const per = 5_000;
+    const runs = try testing.allocator.alloc(std.atomic.Value(u8), producers * per);
+    defer testing.allocator.free(runs);
+    for (runs) |*r| r.* = .init(0);
+    var full: std.atomic.Value(usize) = .init(0);
+
+    const P = struct {
+        fn produce(p: *WorkerPool, slots: []std.atomic.Value(u8), full_count: *std.atomic.Value(usize)) void {
+            for (slots) |*slot| {
+                // QueueFull is backpressure, not loss: retry until accepted.
+                while (true) {
+                    p.submit(.{ .call = Tally.job, .ctx = slot }) catch |e| switch (e) {
+                        error.QueueFull => {
+                            _ = full_count.fetchAdd(1, .monotonic);
+                            std.Thread.yield() catch {};
+                            continue;
+                        },
+                        else => unreachable,
+                    };
+                    break;
+                }
+            }
+        }
+    };
+    var threads: [producers]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, P.produce, .{ pool, runs[i * per .. (i + 1) * per], &full });
+    for (threads) |t| t.join();
+    pool.shutdownAndDestroy(); // drains whatever is still queued
+
+    for (runs, 0..) |*r, i| {
+        if (r.load(.acquire) != 1) {
+            std.debug.print("job {d} ran {d} times\n", .{ i, r.load(.acquire) });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // With 4 producers against a bound of 8 the backpressure path must have been taken —
+    // otherwise this test did not exercise what it claims to.
+    try testing.expect(full.load(.monotonic) > 0);
+}
+
+/// A job that keeps re-submitting itself: the shape of "offload during drain".
+const Chain = struct {
+    pool: *WorkerPool,
+    accepted: std.atomic.Value(usize) = .init(0),
+    ran: std.atomic.Value(usize) = .init(0),
+    closed_seen: std.atomic.Value(usize) = .init(0),
+
+    fn job(ctx: *anyopaque) void {
+        const c: *Chain = @ptrCast(@alignCast(ctx));
+        _ = c.ran.fetchAdd(1, .acq_rel);
+        c.pool.submit(.{ .call = job, .ctx = c }) catch |e| switch (e) {
+            error.PoolClosed => {
+                _ = c.closed_seen.fetchAdd(1, .monotonic);
+                return;
+            },
+            error.QueueFull => return, // this link of the chain ends; others continue
+            error.OutOfMemory => unreachable,
+        };
+        _ = c.accepted.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "stress: jobs offloading follow-ups across shutdown — accepted == ran, no hang" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    for (0..20) |_| {
+        const pool = try WorkerPool.create(testing.allocator, threaded.io(), .{ .threads = 4, .max_queued = 64 });
+        var chain: Chain = .{ .pool = pool };
+        for (0..16) |_| {
+            try pool.submit(.{ .call = Chain.job, .ctx = &chain });
+            _ = chain.accepted.fetchAdd(1, .acq_rel);
+        }
+        // Let the chains spin a little so shutdown lands mid-flight, then close.
+        while (chain.ran.load(.acquire) < 2_000) std.atomic.spinLoopHint();
+        pool.shutdownAndDestroy();
+        // Every accepted submission ran — the drain did not drop the follow-ups accepted
+        // just before close — and the chains that outlived close were told PoolClosed.
+        try testing.expectEqual(chain.accepted.load(.acquire), chain.ran.load(.acquire));
+        try testing.expect(chain.closed_seen.load(.monotonic) > 0);
+    }
+}

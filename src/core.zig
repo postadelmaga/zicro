@@ -1052,3 +1052,38 @@ test "lifecycle: a refused spawn leaves nothing behind, at every allocation fail
     }
     try testing.expect(refused > 0);
 }
+
+test "lifecycle: concurrent clone/deinit of shutdown handles while the owner triggers and drops" {
+    // Each thread holds its own handle and churns clones of it; the owner's handle is
+    // dropped mid-churn. The control block must be freed exactly once, by whoever
+    // releases last (testing.allocator: a double free or a leak fails the test), and a
+    // trigger must be visible through every surviving handle.
+    for (0..10) |_| {
+        var owner = try Shutdown.create(testing.allocator);
+        const n = 6;
+        var handles: [n]Shutdown = undefined;
+        for (&handles) |*h| h.* = owner.clone();
+        const W = struct {
+            fn churn(h: *Shutdown, seen: *std.atomic.Value(usize)) void {
+                // Churn at least 20k times AND until the trigger shows through a clone.
+                var saw = false;
+                var i: usize = 0;
+                while (i < 20_000 or !saw) : (i += 1) {
+                    var c = h.clone();
+                    if (c.isTriggered()) saw = true;
+                    c.deinit();
+                }
+                _ = seen.fetchAdd(1, .monotonic);
+                h.deinit();
+            }
+        };
+        var seen: std.atomic.Value(usize) = .init(0);
+        var threads: [n]std.Thread = undefined;
+        for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, W.churn, .{ &handles[i], &seen });
+        owner.trigger();
+        owner.deinit(); // while the others are still cloning
+        for (threads) |t| t.join();
+        // Every thread saw the trigger through a clone (or the test would hang here).
+        try testing.expectEqual(@as(usize, n), seen.load(.monotonic));
+    }
+}
