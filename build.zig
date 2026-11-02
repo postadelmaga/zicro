@@ -1,4 +1,5 @@
 const std = @import("std");
+const zicro_build = @import("zicro");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -156,7 +157,12 @@ pub fn build(b: *std.Build) void {
             .target = android_target,
             .optimize = .ReleaseSmall,
         });
-        zicro_android.addIncludePath(zicro.path("vendor/stb")); // stb_truetype.h for text.zig's cImport
+        // text.zig's C half (stb_truetype; no HarfBuzz on Android) is the `text_c` module
+        // since Zig 0.17 removed @cImport: zicro wires it, against bionic's headers from
+        // an NDK given EXPLICITLY (-Dndk) — zig ships no bionic, and Zig 0.17's configure
+        // cache does not track environment variables.
+        const ndk = b.option([]const u8, "ndk", "Android NDK path (required by `zig build android`)") orelse "";
+        _ = zicro_build.addTextCAndroid(zicro.builder, zicro_android, android_target, .small, ndk, 24);
         const check_mod = b.createModule(.{
             .root_source_file = b.path("src/android_check.zig"),
             .target = android_target,
