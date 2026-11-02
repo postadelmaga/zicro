@@ -27,6 +27,18 @@ const ZHost = struct {
         rt.sendWordsCarry(REQ, tag, words, carry);
     }
 
+    /// A request and its first answer in ONE directed call (rt.callWordsChecked), so a
+    /// server that dies holding the request endpoint is reported (`ServerGone`) instead
+    /// of leaving this client parked for ever — Z's plain receive has no peer-closed
+    /// verdict. The carried VMO is copied, as with `send`.
+    pub fn call(_: *ZHost, tag: u64, words: [4]u64, carry: ?usize) scenic_client.Error!scenic_client.Msg {
+        const r = rt.callWordsChecked(REQ, REP, tag, words, carry) catch |e| return switch (e) {
+            error.Abandoned => error.ServerGone,
+            error.CallFailed => error.RecvFailed,
+        };
+        return .{ .tag = r.tag, .words = r.words, .cap = r.cap };
+    }
+
     /// A refused receive is an error (rt.recvWordsChecked), never a message read out of
     /// an untouched buffer — the old `recvWords` here could hand the dispatcher garbage.
     pub fn recv(_: *ZHost) scenic_client.Error!scenic_client.Msg {

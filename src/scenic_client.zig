@@ -52,6 +52,9 @@ pub const Error = error{
     RecvFailed,
     /// The server closed the window while a request was pending: no reply will come.
     WindowClosed,
+    /// The server is gone while a request was pending (it died holding the request
+    /// endpoint): no reply will come. Only a transport with `call` can tell.
+    ServerGone,
 };
 
 /// A request's answer.
@@ -79,6 +82,13 @@ pub const Event = union(enum) {
 /// * `fn send(*Transport, tag: u64, words: [4]u64, carry: ?usize) void`
 /// * `fn recv(*Transport) Error!Msg` (blocking)
 /// * `fn closeHandle(*Transport, handle: usize) void`
+/// and optionally
+/// * `fn call(*Transport, tag: u64, words: [4]u64, carry: ?usize) Error!Msg` — send and
+///   wait for the FIRST inbound message in one step that reports `error.ServerGone`
+///   when the server dies meanwhile (Z's SYS_MSG_CALL). Without it a request is `send`
+///   then `recv`, and a dead server leaves the client waiting (Z's plain receive gets
+///   no peer-closed verdict). Messages after the first still come from `recv`: a push
+///   arriving before the reply leaves the rest of that wait unprotected.
 pub fn Client(comptime Transport: type) type {
     return struct {
         const Self = @This();
@@ -105,11 +115,16 @@ pub fn Client(comptime Transport: type) type {
         /// still owns its handle).
         pub fn call(self: *Self, tag: proto.Tag, words: [4]u64, carry: ?usize) Error!Reply {
             if (self.closed) return error.WindowClosed; // the window is gone: nothing to ask
-            self.transport.send(@backingInt(tag), words, carry);
+            var m = if (comptime @hasDecl(Transport, "call"))
+                try self.transport.call(@backingInt(tag), words, carry)
+            else blk: {
+                self.transport.send(@backingInt(tag), words, carry);
+                break :blk try self.transport.recv();
+            };
             while (true) {
-                const m = try self.transport.recv();
                 if (self.absorb(m)) |reply| return reply;
                 if (self.closed) return error.WindowClosed;
+                m = try self.transport.recv();
             }
         }
 
@@ -354,4 +369,46 @@ test "node_created and err replies decode" {
     const r = try c.call(.create_node, .{ 0, 0, 0, 0 }, null);
     try testing.expect(graph.NodeId.eql(id, r.node_created));
     try testing.expectEqual(Reply{ .err = .no_pool }, try c.call(.attach_surface, .{ 0, 0, 0, 0 }, null));
+}
+
+/// FakeTransport with `call`: the first message of each request comes from `call`,
+/// which reports the server's death at request number `gone_at`.
+const FakeCallTransport = struct {
+    inner: FakeTransport,
+    calls: usize = 0,
+    gone_at: ?usize = null,
+
+    pub fn send(t: *FakeCallTransport, tag: u64, words: [4]u64, carry: ?usize) void {
+        t.inner.send(tag, words, carry);
+    }
+    pub fn recv(t: *FakeCallTransport) Error!Msg {
+        return t.inner.recv();
+    }
+    pub fn call(t: *FakeCallTransport, tag: u64, words: [4]u64, carry: ?usize) Error!Msg {
+        t.inner.send(tag, words, carry);
+        defer t.calls += 1;
+        if (t.gone_at) |g| if (t.calls == g) return error.ServerGone;
+        return t.inner.recv();
+    }
+    pub fn closeHandle(t: *FakeCallTransport, h: usize) void {
+        t.inner.closeHandle(h);
+    }
+};
+
+test "call over a transport with call(): the reply, and pushes before it, as with send+recv" {
+    const script = [_]Msg{
+        tagged(.key_event, (proto.KeyEvent{ .code = 30, .pressed = true }).encode()),
+        tagged(.ok, .{ 0, 0, 0, 0 }),
+    };
+    var c = Client(FakeCallTransport).init(.{ .inner = .{ .inbound = &script } });
+    try testing.expectEqual(Reply.ok, try c.call(.commit, commit_req, 5));
+    try testing.expectEqual(@as(usize, 1), c.transport.calls);
+    try testing.expectEqual(@as(?usize, 5), c.transport.inner.sent[0].cap);
+    try testing.expectEqual(@as(u32, 30), (try c.nextEvent()).key.code);
+}
+
+test "a server that dies during a request is reported as ServerGone, not waited for" {
+    var c = Client(FakeCallTransport).init(.{ .inner = .{ .inbound = &.{} }, .gone_at = 0 });
+    try testing.expectError(error.ServerGone, c.call(.commit, commit_req, null));
+    try testing.expectEqual(@as(usize, 0), c.transport.inner.next); // nothing read: no reply
 }

@@ -283,11 +283,13 @@ const FakeHost = struct {
     next_handle: usize = 100,
     fail_alloc_at: ?usize = null, // 0-based surface allocation index to refuse
     allocs: usize = 0,
+    gone_at: ?usize = null, // inbound index at which the server "dies" (ServerGone)
 
     pub fn send(h: *FakeHost, tag: u64, words: [4]u64, carry: ?usize) void {
         h.sent.append(h.gpa, .{ .tag = tag, .words = words, .cap = carry }) catch @panic("test OOM");
     }
     pub fn recv(h: *FakeHost) scenic_client.Error!Msg {
+        if (h.gone_at) |g| if (h.next == g) return error.ServerGone;
         if (h.next == h.inbound.len) return error.RecvFailed; // a would-be hang fails instead
         defer h.next += 1;
         return h.inbound[h.next];
@@ -625,4 +627,30 @@ test "run: configures arriving during a resize coalesce into ONE more re-render"
     }
     try testing.expectEqual(@as(usize, 3), pools); // init + two resizes, not three
     try testing.expectEqual(@as(usize, 1), h.live);
+}
+
+test "run: a server dying during a commit ends run with ServerGone, surfaces freed" {
+    var h: Harness = .{};
+    defer h.deinit();
+    const script = [_]Msg{
+        ok(),                                                                       ok(), ok(),
+        push(.key_event, (proto.KeyEvent{ .code = 30, .pressed = true }).encode()),
+        // index 4: the commit's reply never comes — the server died
+    };
+    var host = h.host(&script);
+    host.gone_at = 4;
+    const w = try TestWindow.initHost(testing.allocator, undefined, h.opts(), host, 0);
+    try testing.expectError(error.ServerGone, w.run()); // abnormal end, reported, not a hang
+    w.deinit();
+    try testing.expectEqual(@as(usize, 0), h.live);
+}
+
+test "init: a server dying during the handshake fails init, nothing leaks" {
+    var h: Harness = .{};
+    defer h.deinit();
+    const script = [_]Msg{ ok(), ok() }; // register_pool, attach_surface answered; commit not
+    var host = h.host(&script);
+    host.gone_at = 2;
+    try testing.expectError(error.ServerGone, TestWindow.initHost(testing.allocator, undefined, h.opts(), host, 0));
+    try testing.expectEqual(@as(usize, 0), h.live);
 }

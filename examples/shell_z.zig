@@ -33,6 +33,7 @@ const zicro = @import("zicro");
 const paint = zicro.paint;
 const window = zicro.window;
 const font = @import("zfont");
+const rt = @import("zrt");
 // Z's native process entry is `export fn main(handle: usize) callconv(.c)
 // void` (zrt's `_start` calls it by that exact symbol/signature) — NOT
 // Zig's own `pub fn main() !void` convention shell.zig uses. Getting this
@@ -394,17 +395,42 @@ fn run(gpa: std.mem.Allocator) !void {
     try win.run();
 }
 
+/// The process exit code says HOW the session ended, so a supervisor (Z's KTEST
+/// zicro_session_*) can tell a clean close from each failure class instead of
+/// reading 0 for all of them.
+pub const Exit = enum(u8) {
+    /// The window was closed (close_request, even mid-request) and torn down.
+    ok = 0,
+    /// Anything else — e.g. OOM against the fixed heap.
+    other = 1,
+    /// The host answered a handshake request with `err` or an unexpected reply.
+    refused = 2,
+    /// The host died while a request was pending (no reply will ever come).
+    server_gone = 3,
+    /// The kernel refused a receive/call on our endpoints (closed/stale handle).
+    ipc_failed = 4,
+    /// The host closed the window before the first frame.
+    closed_during_init = 5,
+
+    pub fn of(e: anyerror) Exit {
+        return switch (e) {
+            error.ServerGone => .server_gone,
+            error.RecvFailed => .ipc_failed,
+            error.ClosedDuringInit => .closed_during_init,
+            error.AttachRefused, error.CommitRefused, error.UnexpectedReply => .refused,
+            else => .other,
+        };
+    }
+};
+
 // zrt's `_start` calls this exact symbol/signature — see the import note
 // above. `run()` keeps the original `!void` body so every `try` inside it
-// still works; only this boundary needs the C-convention adapter. Startup
-// failure (OOM against the fixed heap_buf, host rejecting the handshake)
-// has no sensible recovery — return and let `_start`'s own post-call exit
-// tear the process down, same as zicro_host.zig's early-return-on-
-// disconnect convention.
+// still works; only this boundary needs the C-convention adapter, and it
+// turns the error into the exit code (`Exit`).
 export fn main(arg: usize) callconv(.c) void {
     // The spawner packs our root node id into the argument (win_client.zig's layout);
     // zicro_host passes 0, which decodes to the root it creates first (scenic_window.zig).
     window.Window.spawn_arg = arg;
     var fba = std.heap.FixedBufferAllocator.init(&heap_buf);
-    run(fba.allocator()) catch return;
+    run(fba.allocator()) catch |e| rt.exitCode(@backingInt(Exit.of(e)));
 }
