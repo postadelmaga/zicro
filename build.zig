@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
     // linker consumes them directly.
     const macos_sysroot = b.option([]const u8, "macos-sysroot", "macOS-shaped root (System/Library/Frameworks, usr/lib) for cross-linking, e.g. /usr/libexec/darling");
 
+    // One `text_c` module per (target, optimize, flavor): modules that agree on all three
+    // share it (and its single stb object) instead of each re-translating hb.h. Modules
+    // that differ in optimize mode keep their own — the translation is NOT identical
+    // across modes (ReleaseFast's carries `NDEBUG`), so merging them would change it.
+    var text_c: TextCCache = .{ .b = b };
+
     // The zicro library module: the whole kernel + framework, one import.
     const zicro = b.addModule("zicro", .{
         .root_source_file = b.path("src/root.zig"),
@@ -18,7 +24,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    addNativeDeps(b, zicro, target, macos_sysroot);
+    addNativeDeps(b, &text_c, zicro, target, macos_sysroot);
 
     // The WebGPU device — its OWN module, not part of `zicro`.
     //
@@ -53,18 +59,10 @@ pub fn build(b: *std.Build) void {
             wgpu.addImport("webgpu_c", wgpu_c.createModule());
             wgpu.addIncludePath(wgpu_dep.path("include"));
             // gpu_wgpu.zig arriva a text.zig via paint_gl.zig: serve anche il suo
-            // modulo C (è il motivo per cui qui sotto c'è già stb_truetype).
-            addTextC(b, wgpu, target, optimize, true);
+            // modulo C, che porta con sé stb e (dove c'è) HarfBuzz — una volta sola.
+            text_c.attach(wgpu, target, optimize, .native);
             wgpu.addLibraryPath(wgpu_dep.path("lib"));
             wgpu.linkSystemLibrary("wgpu_native", .{});
-            wgpu.addIncludePath(b.path("vendor/stb"));
-            wgpu.addCSourceFile(.{
-                .file = b.path("vendor/stb/stb_truetype_impl.c"),
-                .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-            });
-            if (target.result.os.tag == .linux) {
-                wgpu.linkSystemLibrary("harfbuzz", .{});
-            }
 
             const wgpu_tests = b.addTest(.{ .root_module = wgpu });
             const run_wgpu_tests = b.addRunArtifact(wgpu_tests);
@@ -108,7 +106,7 @@ pub fn build(b: *std.Build) void {
         });
         // Come la forma desktop: text.zig è raggiungibile via paint_gl.zig.
         // webgpu.h invece lo traduce il consumatore (vedi il commento sopra).
-        addTextC(b, wgpu_browser, target, optimize, true);
+        text_c.attach(wgpu_browser, target, optimize, .native);
     }
 
     // `zig build test` — every `test` block in the library.
@@ -124,7 +122,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
-    addNativeDeps(b, zicro_fast, target, macos_sysroot);
+    addNativeDeps(b, &text_c, zicro_fast, target, macos_sysroot);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
@@ -174,12 +172,7 @@ pub fn build(b: *std.Build) void {
         });
         // stb_truetype for wasm: the web C shim predefines the STBTT_* hooks (no libc
         // headers) and routes malloc/libm to the Zig shims in wasm_shim.zig.
-        addTextC(b, web_zicro, wasm_target, .small, false);
-        web_zicro.addIncludePath(b.path("vendor/stb"));
-        web_zicro.addCSourceFile(.{
-            .file = b.path("vendor/stb/stb_truetype_web.c"),
-            .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-        });
+        text_c.attach(web_zicro, wasm_target, .small, .web);
         const web_mod = b.createModule(.{
             .root_source_file = b.path("examples/web_demo.zig"),
             .target = wasm_target,
@@ -216,39 +209,39 @@ pub fn build(b: *std.Build) void {
     // The Android module a dependent app (an APK's libmain.so) imports as "zicro":
     // `android_root.zig` — the CPU canvas + text + widgets + the NDK window backend, WITHOUT
     // the Wayland/ALSA/shm stack that doesn't exist on Android. The app owns the target (its
-    // own ABI/api-level) and the libandroid/liblog link, so this module carries only what is
-    // portable: the stb rasterizer. See Zuer's scripts/build-android-apk.sh for the packaging.
-    const zicro_android = b.addModule("zicro_android", .{
+    // own ABI/api-level) and the libandroid/liblog link, so this module has no target here —
+    // and therefore no `text_c` yet: the CONSUMER attaches it, with the same function this
+    // build uses, from its own build.zig (a dependency's build.zig IS importable):
+    //
+    //     const zicro_build = @import("zicro");
+    //     const tc = zicro_build.addTextC(dep.builder, dep.module("zicro_android"),
+    //         android_target, optimize, .native);
+    //     tc.addIncludePath(<NDK per-arch include>); // translation AND stb compile
+    //     tc.defineCMacro("__ANDROID_API__", "24");
+    //
+    // That brings the stb rasterizer (bionic is a real libc, so the native one compiles
+    // as-is) and leaves HarfBuzz out, exactly as `Features` decides for Android.
+    // See Zuer's build.zig for the live call, scripts/build-android-apk.sh for packaging.
+    _ = b.addModule("zicro_android", .{
         .root_source_file = b.path("src/android_root.zig"),
         .link_libc = true,
     });
-    // Bionic is a real libc, so the native stb_truetype rasterizer compiles as-is (unlike
-    // the wasm build). Same font path as every other platform.
-    zicro_android.addIncludePath(b.path("vendor/stb"));
-    zicro_android.addCSourceFile(.{
-        .file = b.path("vendor/stb/stb_truetype_impl.c"),
-        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-    });
+
+    addCheckZ(b, &text_c, target, optimize);
 }
 
 /// Everything a NATIVE zicro module links: the stb rasterizer plus the per-OS platform
 /// set. One function on purpose — the Debug `zicro` module and the bench's ReleaseFast
 /// twin call the same code, so they cannot drift apart (the bench once silently lost
 /// the PipeWire backend this way).
-fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, macos_sysroot: ?[]const u8) void {
-    // stb_truetype FONT RASTERIZER (Hack regular+bold fonts embedded)
-    addTextC(b, mod, target, mod.optimize orelse .debug, true);
-    mod.addIncludePath(b.path("vendor/stb"));
-    mod.addCSourceFile(.{
-        .file = b.path("vendor/stb/stb_truetype_impl.c"),
-        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-    });
+fn addNativeDeps(b: *std.Build, text_c: *TextCCache, mod: *std.Build.Module, target: std.Build.ResolvedTarget, macos_sysroot: ?[]const u8) void {
+    const features = Features.of(target.result);
+    // stb_truetype FONT RASTERIZER (Hack regular+bold fonts embedded) + HarfBuzz where
+    // the target has it: both travel inside the text_c module.
+    text_c.attach(mod, target, mod.optimize orelse .debug, .native);
 
-    if (target.result.os.tag == .linux) {
-        mod.linkSystemLibrary("wayland-client", .{});
-        mod.linkSystemLibrary("asound", .{}); // ALSA: backend audio (audio_device.zig)
-        mod.linkSystemLibrary("harfbuzz", .{}); // HarfBuzz: text shaping (src/text.zig)
-
+    if (features.alsa) mod.linkSystemLibrary("asound", .{}); // ALSA: backend audio (audio_device.zig)
+    if (features.pipewire) {
         // PipeWire: low-latency audio backend, preferred over ALSA at runtime when a
         // PipeWire graph is reachable. The pull-model pw_stream is bridged to zicro's
         // blocking device contract by the audio_pw.c shim (SPA format PODs live in C).
@@ -257,7 +250,10 @@ fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
             .file = b.path("src/audio_pw.c"),
             .flags = &.{ "-O2", "-D_REENTRANT", "-fno-sanitize=undefined" },
         });
+    }
 
+    if (features.wayland) {
+        mod.linkSystemLibrary("wayland-client", .{});
         // Wayland protocol glue, generated from the XMLs vendored in
         // vendor/wayland-protocols/ (MIT; system paths vary per distro — the appmenu
         // XML even required Qt6 dev files to be installed).
@@ -291,14 +287,14 @@ fn addNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
     }
 
     // winmm: backend audio waveOut (audio_device.zig) on Windows.
-    if (target.result.os.tag == .windows) mod.linkSystemLibrary("winmm", .{});
+    if (features.winmm) mod.linkSystemLibrary("winmm", .{});
 
     // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
     // Only libobjc and the CG functions are needed at LINK time — AppKit classes resolve
     // by name at runtime (objc_getClass), Cocoa is linked for its load command alone.
     // Without a sysroot the vendored .tbd stubs make the link SDK-free (the zig way:
     // zig itself links libSystem from a bundled stub).
-    if (target.result.os.tag == .macos) addMacosLinks(b, mod, macos_sysroot);
+    if (features.cocoa) addMacosLinks(b, mod, macos_sysroot);
 }
 
 /// The macOS link set for a module: libobjc + Cocoa (load command) + CoreGraphics.
@@ -323,32 +319,193 @@ fn addMacosLinks(b: *std.Build, mod: *std.Build.Module, sysroot: ?[]const u8) vo
     mod.linkFramework("CoreGraphics", .{});
 }
 
-/// The C half of `src/text.zig`, as a module.
+/// Which optional native libraries a target links — the ONE place these decisions live.
 ///
-/// Zig 0.17 removed `@cImport`, so stb_truetype (and HarfBuzz, where it exists)
-/// are translated by a build step and imported under the name "text_c". Every
-/// module that contains text.zig needs this. `zicro_android` is the exception:
-/// its target belongs to the CONSUMER, and a dependency's build.zig functions
-/// are not importable — so that one builds an equivalent step itself on
-/// `dep.builder` (see the android step in Zuer's build.zig).
+/// Every target-conditional dependency in this file asks here, and `src/text.zig` does not
+/// decide anything itself (it only asks whether the translated header declares HarfBuzz),
+/// so the build and the code cannot drift apart again. Android is `os.tag == .linux` but
+/// none of the desktop-Linux stack exists there (no Wayland, ALSA, PipeWire or system
+/// HarfBuzz in the NDK): testing `os.tag == .linux` alone used to link all four into an
+/// Android build of `zicro` while text.zig had already turned HarfBuzz off.
+pub const Features = struct {
+    harfbuzz: bool,
+    wayland: bool,
+    alsa: bool,
+    pipewire: bool,
+    winmm: bool,
+    cocoa: bool,
+
+    pub fn of(t: std.Target) Features {
+        const desktop_linux = t.os.tag == .linux and !t.abi.isAndroid();
+        return .{
+            .harfbuzz = desktop_linux,
+            .wayland = desktop_linux,
+            .alsa = desktop_linux,
+            .pipewire = desktop_linux,
+            .winmm = t.os.tag == .windows,
+            .cocoa = t.os.tag == .macos,
+        };
+    }
+};
+
+/// Which stb_truetype implementation the text module compiles: the libc-backed one (every
+/// native target, Android/bionic included) or the wasm shim (no libc headers; malloc and
+/// libm routed to `wasm_shim.zig`).
+pub const TextCFlavor = enum { native, web };
+
+/// The C half of `src/text.zig`, as one self-contained module imported as "text_c":
+/// the translated headers (stb_truetype + HarfBuzz where `Features` says so), the stb
+/// implementation object, and the HarfBuzz link. Everything text.zig needs from C travels
+/// together, so no caller can add the header without the object or the link (or add the
+/// object twice).
+///
+/// Zig 0.17 removed `@cImport`, hence the build step. Public on purpose: a CONSUMER whose
+/// module has no target until it picks one (`zicro_android`) calls it from its own
+/// build.zig with `@import("zicro").addTextC(dep.builder, …)` — a dependency's build.zig
+/// is importable — and adds target-specific include paths (an NDK's per-arch headers)
+/// where they are needed: on `step` for the translation, on `module` for the stb object.
 pub fn addTextC(
     b: *std.Build,
     mod: *std.Build.Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
-    link_libc: bool,
-) void {
-    const tc = b.addTranslateC(.{
+    optimize: std.builtin.OptimizeMode,
+    flavor: TextCFlavor,
+) TextC {
+    const made = makeTextC(b, target, optimize, flavor);
+    mod.addImport("text_c", made.module);
+    return made;
+}
+
+/// What [`addTextC`] made: the translate-c step and the module (translated headers + the
+/// stb object + the HarfBuzz link) it imported as "text_c".
+pub const TextC = struct {
+    step: *std.Build.Step.TranslateC,
+    module: *std.Build.Module,
+
+    /// Add an include directory to both the translation and the C compile (e.g. an NDK's
+    /// per-architecture headers, which neither finds on its own).
+    pub fn addIncludePath(tc: TextC, path: std.Build.LazyPath) void {
+        tc.step.addIncludePath(path);
+        tc.module.addIncludePath(path);
+    }
+
+    /// Define a C macro for both the translation and the C compile.
+    pub fn defineCMacro(tc: TextC, name: []const u8, value: ?[]const u8) void {
+        tc.step.defineCMacro(name, value);
+        tc.module.addCMacro(name, value orelse "1");
+    }
+};
+
+fn makeTextC(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, flavor: TextCFlavor) TextC {
+    const features = Features.of(target.result);
+    const step = b.addTranslateC(.{
         .root_source_file = b.path("src/c/text.h"),
         .target = target,
         .optimize = optimize,
-        .link_libc = link_libc,
+        .link_libc = flavor == .native,
     });
-    tc.addIncludePath(b.path("vendor/stb"));
-    // Same condition as `have_hb_lib` in text.zig — the two must not drift.
-    if (target.result.os.tag == .linux and target.result.abi != .android) {
-        tc.defineCMacro("ZICRO_HAVE_HARFBUZZ", "1");
-        tc.linkSystemLibrary("harfbuzz", .{}); // pkg-config brings hb.h's include dir
+    step.addIncludePath(b.path("vendor/stb"));
+    if (features.harfbuzz) {
+        step.defineCMacro("ZICRO_HAVE_HARFBUZZ", "1");
+        step.linkSystemLibrary("harfbuzz", .{}); // pkg-config brings hb.h's include dir
     }
-    mod.addImport("text_c", tc.createModule());
+    const module = step.createModule();
+    module.addIncludePath(b.path("vendor/stb"));
+    module.addCSourceFile(.{
+        .file = b.path(switch (flavor) {
+            .native => "vendor/stb/stb_truetype_impl.c",
+            .web => "vendor/stb/stb_truetype_web.c",
+        }),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
+    if (features.harfbuzz) module.linkSystemLibrary("harfbuzz", .{}); // HarfBuzz: text shaping
+    return .{ .step = step, .module = module };
+}
+
+/// This build's own `text_c` modules, one per (target, optimize, flavor) — see `build()`.
+const TextCCache = struct {
+    b: *std.Build,
+    entries: [8]struct { triple: []const u8, optimize: std.builtin.OptimizeMode, flavor: TextCFlavor, module: *std.Build.Module } = undefined,
+    len: usize = 0,
+
+    fn attach(cache: *TextCCache, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, flavor: TextCFlavor) void {
+        const triple = target.result.zigTriple(cache.b.allocator) catch @panic("OOM");
+        for (cache.entries[0..cache.len]) |e| {
+            if (e.optimize == optimize and e.flavor == flavor and std.mem.eql(u8, e.triple, triple)) {
+                mod.addImport("text_c", e.module);
+                return;
+            }
+        }
+        const made = makeTextC(cache.b, target, optimize, flavor);
+        cache.entries[cache.len] = .{ .triple = triple, .optimize = optimize, .flavor = flavor, .module = made.module };
+        cache.len += 1;
+        mod.addImport("text_c", made.module);
+    }
+};
+
+/// `zig build check-z [-Dz-src=<path>]` — keep the Z-Scenic backend honest without booting
+/// Z. `window_z.zig` is compiled by no other step (only Z's own build pulls it in, through
+/// `-Dzicro-src`), so it used to rot unseen. Against the REAL Z sources (no stubs):
+/// 1. the host tests of the protocol client and the generic window backend, built over
+///    Z's own `user/scenic/protocol.zig` (scripted fake server: handshake, events during
+///    a request, close, resize, refusals, leaks);
+/// 2. `examples/shell_z.zig` compiled for Z's userspace target exactly the way Z's
+///    build.zig wires it ("zicro" + "zrt" + "scenic_protocol" + "zfont").
+/// The Z repo is found at `../Z` unless `-Dz-src` says otherwise.
+fn addCheckZ(b: *std.Build, text_c: *TextCCache, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const step = b.step("check-z", "Test the Z-Scenic backend and compile shell_z against a Z checkout (-Dz-src, default ../Z)");
+    const z_src: ?[]const u8 = b.option([]const u8, "z-src", "Path to the Z repo for check-z (default: ../Z if it exists)") orelse blk: {
+        const guess = b.root.joinString(b.allocator, "../Z") catch @panic("OOM");
+        std.Io.Dir.cwd().access(b.graph.io, b.pathJoin(&.{ guess, "user", "scenic", "protocol.zig" }), .{}) catch break :blk null;
+        break :blk guess;
+    };
+    const z = z_src orelse {
+        step.dependOn(&b.addFail("check-z needs a Z checkout: pass -Dz-src=<path>").step);
+        return;
+    };
+    const zp = struct {
+        fn path(bb: *std.Build, root: []const u8, rel: []const u8) std.Build.LazyPath {
+            return .{ .cwd_relative = bb.pathJoin(&.{ root, rel }) };
+        }
+    }.path;
+
+    // 1. host tests over the real protocol module
+    const host_proto = b.createModule(.{ .root_source_file = zp(b, z, "user/scenic/protocol.zig"), .target = target, .optimize = optimize });
+    const host_mod = b.createModule(.{
+        .root_source_file = b.path("src/scenic_window.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    host_mod.addImport("scenic_protocol", host_proto);
+    text_c.attach(host_mod, target, optimize, .native);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host_mod })).step);
+
+    // 2. the real Z userspace build of the shell, minus the link (Z's crt and linker
+    //    script are its own business; type-checking and codegen are ours).
+    const zt = b.resolveTargetQuery(blk: {
+        const F = std.Target.x86.Feature;
+        var sub = std.Target.Cpu.Feature.Set.empty;
+        for ([_]F{ .mmx, .sse, .sse2, .sse3, .ssse3, .sse4_1, .sse4_2, .avx, .avx2 }) |f| sub.addFeature(@intFromEnum(f));
+        var add = std.Target.Cpu.Feature.Set.empty;
+        add.addFeature(@intFromEnum(F.soft_float));
+        break :blk .{ .cpu_arch = .x86_64, .os_tag = .freestanding, .abi = .none, .cpu_features_sub = sub, .cpu_features_add = add };
+    });
+    const zrt = b.createModule(.{ .root_source_file = zp(b, z, "user/rt.zig") });
+    const z_proto = b.createModule(.{ .root_source_file = zp(b, z, "user/scenic/protocol.zig") });
+    const zicro_pkg = b.createModule(.{ .root_source_file = b.path("src/root.zig") });
+    zicro_pkg.addImport("zrt", zrt);
+    zicro_pkg.addImport("scenic_protocol", z_proto);
+    const shell = b.createModule(.{
+        .root_source_file = b.path("examples/shell_z.zig"),
+        .target = zt,
+        .optimize = .safe,
+        .single_threaded = true,
+        .pic = true,
+    });
+    shell.addImport("zrt", zrt);
+    shell.addImport("zicro", zicro_pkg);
+    shell.addImport("zfont", b.createModule(.{ .root_source_file = zp(b, z, "user/font.zig") }));
+    const obj = b.addObject(.{ .name = "zicro_shell_z", .root_module = shell });
+    step.dependOn(&obj.step);
 }

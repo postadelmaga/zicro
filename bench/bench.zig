@@ -164,7 +164,7 @@ fn busThroughput(gpa: std.mem.Allocator, io: Io, watch: *const Stopwatch, iters:
     for (threads) |*t| t.* = try std.Thread.spawn(.{}, Drain.run, .{ &bus, iters });
     for (0..consumers) |_| (try ready.recv()).deinit();
 
-    const payload = "0123456789abcdef" ** 4; // 64 bytes, a typical control message
+    const payload = "0123456789abcdef" ++ "0123456789abcdef" ++ "0123456789abcdef" ++ "0123456789abcdef"; // 64 bytes, a typical control message (0.17 removed `**`)
     const t0 = watch.ns();
     for (0..iters) |_| try bus.publish("main", "data", payload);
     for (threads) |t| t.join();
@@ -198,7 +198,7 @@ fn busAllocsInRegime(io: Io, iters: u32) !u64 {
     const drain = try std.Thread.spawn(.{}, Drain.run, .{ &bus, warmup + iters });
     (try ready.recv()).deinit();
 
-    const payload = "0123456789abcdef" ** 4;
+    const payload = "0123456789abcdef" ++ "0123456789abcdef" ++ "0123456789abcdef" ++ "0123456789abcdef";
     for (0..warmup) |_| try bus.publish("main", "data", payload); // warm the slab rings
     const before = counting.calls.load(.monotonic);
     for (0..iters) |_| try bus.publish("main", "data", payload);

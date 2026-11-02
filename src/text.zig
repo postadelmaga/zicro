@@ -9,18 +9,18 @@
 //! (`Canvas.drawText`); here there is only rasterization, with no dependency on paint.
 
 const std = @import("std");
-const builtin = @import("builtin");
-
-// HarfBuzz is only linked for the Linux desktop build (`addNativeDeps` in build.zig);
-// macOS/Windows/wasm/Android don't have the header on their include path, so pulling it
-// in unconditionally breaks every cross-target build (`hb.h` not found).
-const have_hb_lib = builtin.target.os.tag == .linux and builtin.target.abi != .android;
 
 // Translated by the `addTextC` step in build.zig (see src/c/text.h): Zig 0.17
 // removed `@cImport`, so the headers arrive as a module instead of in-line.
 const c = @import("text_c");
 
-pub const has_harfbuzz = have_hb_lib and @hasDecl(c, "hb_buffer_create");
+// HarfBuzz exists exactly when the build translated (and linked) it — `Features` in
+// build.zig is the one place that decides, per target (desktop Linux only: macOS,
+// Windows, wasm and Android have no system hb.h). This file used to re-derive the same
+// condition from `builtin.target` and the two could drift; now it only asks the header.
+const have_hb_lib = @hasDecl(c, "hb_buffer_create");
+
+pub const has_harfbuzz = have_hb_lib;
 
 /// Available faces. The default embeds regular+bold; italic/bold_italic are
 /// optional and, when absent, fall back to bold/regular.
