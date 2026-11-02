@@ -11,11 +11,11 @@ const ShellState = struct {
     window: *window.Window = undefined,
     font: text.Font,
     bus: *bus_mod.LocalBus,
-    
+
     // Terminal lines history
     lines: std.ArrayList([]const u8),
     input_buf: std.ArrayList(u8),
-    
+
     // Keyboard modifiers
     shift_pressed: bool = false,
     ctrl_pressed: bool = false,
@@ -60,14 +60,14 @@ const ShellState = struct {
 
 fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const shell: *ShellState = @ptrCast(@alignCast(user.?));
-    
+
     // Translucent dark terminal panel
     const bg_color = paint.Color.rgba(18, 20, 26, 0.85);
     var y_pixel: i32 = 0;
     while (y_pixel < content.h) : (y_pixel += 1) {
         var x_pixel: i32 = 0;
         while (x_pixel < content.w) : (x_pixel += 1) {
-            canvas.pixels[@intCast(y_pixel * content.w + x_pixel)] = 
+            canvas.pixels[@intCast(y_pixel * content.w + x_pixel)] =
                 (@as(u32, @intFromFloat(bg_color.a * 255.0)) << 24) |
                 (@as(u32, @intFromFloat(bg_color.r * bg_color.a * 255.0)) << 16) |
                 (@as(u32, @intFromFloat(bg_color.g * bg_color.a * 255.0)) << 8) |
@@ -78,9 +78,9 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     const font_size = 16;
     const line_height = shell.font.lineHeight(font_size, .regular);
     const v = shell.font.vmetrics(font_size, .regular);
-    
+
     var text_y = 30 + v.ascent;
-    
+
     // Render lines history
     for (shell.lines.items) |line| {
         canvas.drawText(&shell.font, 25, text_y, line, .{
@@ -100,7 +100,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     });
 
     const prompt_w = shell.font.measure(font_size, .regular, prompt);
-    
+
     // Render current input
     canvas.drawText(&shell.font, 25 + prompt_w, text_y, shell.input_buf.items, .{
         .size = font_size,
@@ -111,7 +111,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
     // Blinking cursor simulation
     const input_w = shell.font.measure(font_size, .regular, shell.input_buf.items);
     const cursor_x = 25 + prompt_w + input_w;
-    
+
     {
         // Draw a vertical block cursor
         var cy = text_y - v.ascent + 2;
@@ -163,7 +163,7 @@ fn handleCommand(shell: *ShellState, cmd: []const u8) !void {
 
 fn onKey(win: *window.Window, key: u32, state: u32, user: ?*anyopaque) void {
     const shell: *ShellState = @ptrCast(@alignCast(user.?));
-    
+
     // Key codes and modifiers tracking
     if (key == 42 or key == 54) { // Shift
         shell.shift_pressed = (state == 1);

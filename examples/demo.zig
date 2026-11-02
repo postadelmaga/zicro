@@ -237,7 +237,7 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
                 ui.openDialog("demo_dialog");
             }
             ui.endRow();
-            
+
             ui.gap(20);
             ui.label("Hover the mouse over the button below to show a tooltip:");
             if (ui.button("Button with Tooltip")) {
@@ -258,15 +258,15 @@ fn onDraw(canvas: *paint.Canvas, content: window.Rect, user: ?*anyopaque) void {
             var i: usize = 0;
             while (i < 20) : (i += 1) {
                 ui.pushIdScopeIndex(i);
-                
+
                 var item_buf: [64]u8 = undefined;
                 const item_str = std.fmt.bufPrint(&item_buf, "List item {d} (Click to select)", .{i}) catch "Item";
-                
+
                 const sel_idx = i % 3;
                 if (ui.selectable(item_str, state.selectable_vals[sel_idx])) {
                     state.selectable_vals[sel_idx] = !state.selectable_vals[sel_idx];
                 }
-                
+
                 ui.popIdScope();
             }
             ui.endScroll();
@@ -332,13 +332,13 @@ fn onKey(win: *window.Window, key: u32, state_val: u32, user: ?*anyopaque) void 
 
 fn onTick(win: *window.Window, user: ?*anyopaque) void {
     const state = @as(*AppState, @ptrCast(@alignCast(user.?)));
-    
+
     // Slow animation for the progress bar
     state.progress_val += 0.002;
     if (state.progress_val > 1.0) {
         state.progress_val = 0.0;
     }
-    
+
     win.requestRedraw();
 }
 

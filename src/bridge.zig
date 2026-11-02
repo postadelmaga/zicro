@@ -322,4 +322,3 @@ test "a bridge that cannot finish starting leaves nothing behind" {
     var failing_in = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, Bridge.ingress(failing_in.allocator(), &bus_, &in));
 }
-

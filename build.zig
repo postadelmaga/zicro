@@ -486,9 +486,9 @@ fn addCheckZ(b: *std.Build, text_c: *TextCCache, target: std.Build.ResolvedTarge
     const zt = b.resolveTargetQuery(blk: {
         const F = std.Target.x86.Feature;
         var sub = std.Target.Cpu.Feature.Set.empty;
-        for ([_]F{ .mmx, .sse, .sse2, .sse3, .ssse3, .sse4_1, .sse4_2, .avx, .avx2 }) |f| sub.addFeature(@intFromEnum(f));
+        for ([_]F{ .mmx, .sse, .sse2, .sse3, .ssse3, .sse4_1, .sse4_2, .avx, .avx2 }) |f| sub.addFeature(@backingInt(f));
         var add = std.Target.Cpu.Feature.Set.empty;
-        add.addFeature(@intFromEnum(F.soft_float));
+        add.addFeature(@backingInt(F.soft_float));
         break :blk .{ .cpu_arch = .x86_64, .os_tag = .freestanding, .abi = .none, .cpu_features_sub = sub, .cpu_features_add = add };
     });
     const zrt = b.createModule(.{ .root_source_file = zp(b, z, "user/rt.zig") });
