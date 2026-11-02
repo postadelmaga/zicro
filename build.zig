@@ -214,10 +214,9 @@ pub fn build(b: *std.Build) void {
     // build uses, from its own build.zig (a dependency's build.zig IS importable):
     //
     //     const zicro_build = @import("zicro");
-    //     const tc = zicro_build.addTextC(dep.builder, dep.module("zicro_android"),
-    //         android_target, optimize, .native);
-    //     tc.addIncludePath(<NDK per-arch include>); // translation AND stb compile
-    //     tc.defineCMacro("__ANDROID_API__", "24");
+    //     const ndk = b.option([]const u8, "ndk", "Android NDK path") orelse ""; // explicit
+    //     _ = zicro_build.addTextCAndroid(dep.builder, dep.module("zicro_android"),
+    //         android_target, optimize, ndk, 24);
     //
     // That brings the stb rasterizer (bionic is a real libc, so the native one compiles
     // as-is) and leaves HarfBuzz out, exactly as `Features` decides for Android.
@@ -374,6 +373,59 @@ pub fn addTextC(
     const made = makeTextC(b, target, optimize, flavor);
     mod.addImport("text_c", made.module);
     return made;
+}
+
+/// [`addTextC`] for an ANDROID consumer, wired against an NDK — the one place that knows
+/// where bionic's headers live, so every app that ships zicro on Android (Zuer, Zrame,
+/// ZenFlow2) uses the same code instead of a copy of it:
+/// * `<ndk>/toolchains/llvm/prebuilt/<host>/sysroot/usr/include` and its per-arch
+///   subdirectory (asm/*.h) on both the translation and the stb compile;
+/// * `__ANDROID_API__` / `__ANDROID_MIN_SDK_VERSION__` = `api_level`.
+///
+/// `ndk` is an explicit path — take it from a `-Dndk` option, never from the environment:
+/// Zig 0.17's configure cache does NOT see environment reads (an `ANDROID_NDK_HOME`
+/// changed or unset after a build reuses the old configuration — reproduced), while a
+/// changed `-D` option re-configures. An empty path fails the build asking for `-Dndk`; a
+/// path that is not an NDK fails it naming the missing bionic header, instead of a
+/// missing `math.h` deep in stb.
+pub fn addTextCAndroid(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ndk: []const u8,
+    api_level: u32,
+) TextC {
+    const tc = addTextC(b, mod, target, optimize, .native);
+    const host_tag = switch (b.graph.host.result.os.tag) {
+        .macos => "darwin-x86_64", // the NDK ships x86_64 prebuilts for both Mac kinds
+        .windows => "windows-x86_64",
+        else => "linux-x86_64",
+    };
+    const inc = b.pathJoin(&.{ ndk, "toolchains", "llvm", "prebuilt", host_tag, "sysroot", "usr", "include" });
+    const arch_dir: []const u8 = switch (target.result.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        .arm, .thumb => "arm-linux-androideabi",
+        .x86 => "i686-linux-android",
+        else => @panic("addTextCAndroid: not an Android NDK architecture"),
+    };
+    if (ndk.len == 0) {
+        tc.step.step.dependOn(&b.addFail("Android NDK path missing: pass -Dndk=<path to the NDK>").step);
+        return tc;
+    }
+    // Checked when the build RUNS, not while configuring (a configure-time probe of the
+    // filesystem would be cached like an environment read): copying bionic's stdlib.h
+    // fails, naming the path, when `ndk` is not an NDK.
+    const probe = b.addWriteFiles();
+    _ = probe.addCopyFile(.{ .cwd_relative = b.pathJoin(&.{ inc, "stdlib.h" }) }, "ndk-check/stdlib.h");
+    tc.step.step.dependOn(&probe.step);
+    tc.addIncludePath(.{ .cwd_relative = inc });
+    tc.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ inc, arch_dir }) });
+    const api = b.fmt("{d}", .{api_level});
+    tc.defineCMacro("__ANDROID_API__", api);
+    tc.defineCMacro("__ANDROID_MIN_SDK_VERSION__", api);
+    return tc;
 }
 
 /// What [`addTextC`] made: the translate-c step and the module (translated headers + the
