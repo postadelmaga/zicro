@@ -99,7 +99,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
     extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.winapi) void;
     extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: i32) callconv(.winapi) i32;
-    extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: ?[*:0]const u16) callconv(.winapi) HCURSOR;
+    extern "user32" fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: ?[*:0]const u16) callconv(.winapi) HCURSOR;
     extern "user32" fn UpdateLayeredWindow(
         hWnd: HWND,
         hdcDst: HDC,
@@ -252,6 +252,14 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         // run() is a PeekMessage poll that redraws every idle cycle (≤16 ms),
         // so there is nothing to wake — the next cycle repaints regardless.
         _ = self;
+    }
+
+    /// Physical pixels per logical unit. This backend is not DPI-aware: the process is
+    /// never declared per-monitor aware, so Windows scales the window bitmap itself and
+    /// the canvas is 1:1 with what `presentRgba` blits.
+    pub fn scaleFactor(self: *const Window) f32 {
+        _ = self;
+        return 1;
     }
 
     /// Request the event loop to exit. Thread-safe.

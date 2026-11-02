@@ -553,6 +553,20 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         self.height = h;
     }
 
+    /// Signal the loop to repaint. `run()` redraws every iteration (~60 FPS pacing), so
+    /// the next one repaints regardless: nothing to wake.
+    pub fn requestRedraw(self: *Window) void {
+        _ = self;
+    }
+
+    /// Physical pixels per logical unit. The pixel buffer is sized from the view's
+    /// `bounds` (points) and presented 1:1 — never at `backingScaleFactor` — so the
+    /// canvas is in points: 1.
+    pub fn scaleFactor(self: *const Window) f32 {
+        _ = self;
+        return 1;
+    }
+
     pub fn beginMove(self: *Window) void {
         const pw = msgId(self.win orelse return, "platformWindow");
         if (pw) |p| msgVoid(p, "zartBeginMove");
