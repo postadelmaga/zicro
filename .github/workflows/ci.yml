@@ -1,6 +1,9 @@
 # Zicro CI. Every job FAILS when its component does not build or its tests fail —
-# nothing here is allowed to "pass" by skipping. Jobs that need something a stock
-# runner lacks (the Z checkout, an Android NDK, KVM) are separate, and say so.
+# nothing here may turn green by skipping. Jobs that need what a stock runner lacks are
+# separate and say so:
+#   * check-z needs the Z (and Zart) repositories at the refs pinned in ci/*.ref —
+#     grant a token with read access as Z_READ_TOKEN if they are private;
+#   * z-session needs KVM: a self-hosted runner labelled `kvm`, started manually.
 name: ci
 
 on:
@@ -12,9 +15,10 @@ env:
   ZIG_VERSION: 0.17.0
 
 jobs:
-  # The core gate: format, unit tests, every native artifact, both portable targets,
-  # and the benchmark binary (built AND run in --quick mode: `zig build bench` once
-  # silently stopped compiling and nobody noticed — the 0.17 port's `**`).
+  # The core gate: format, unit tests (a hang fails instead of blocking the runner:
+  # the pool's deadlock tests hang if the guard they check regresses), every native
+  # artifact, both portable targets, and the benchmark built AND run (`zig build bench`
+  # once stopped compiling and nobody noticed — the 0.17 port's `**`).
   linux:
     runs-on: ubuntu-24.04
     steps:
@@ -31,30 +35,63 @@ jobs:
       - name: Format
         run: zig fmt --check build.zig src bench examples
       - name: Unit tests
-        run: zig build test --summary all
+        run: zig build test --test-timeout 300s --summary all
       - name: Native build (library + examples)
         run: zig build install
-      - name: Android compile-check
+      - name: Android compile-check (window backend; no NDK needed)
         run: zig build android
       - name: Web (wasm32)
         run: zig build web
       - name: Benchmark (quick)
         run: zig build bench -- --quick
 
-  # The Z-Scenic backend (window_z.zig, scenic_window.zig, scenic_client.zig) is
-  # compiled by NO other step — only Z's build pulls it in. check-z runs its host
-  # tests over Z's REAL protocol.zig and compiles shell_z for Z's userspace target
-  # with Z's real rt.zig. It needs the Z repository; without access the job fails
-  # (it must not turn green by skipping).
+  # Windows and macOS: cross-compiled and linked from Linux (compile-only — nothing is
+  # run; there are no Windows/macOS runners in this workflow).
+  cross:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-windows-gnu, aarch64-macos, x86_64-macos]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: zig build install -Dtarget=${{ matrix.target }}
+        run: zig build install -Dtarget=${{ matrix.target }}
+
+  # The Z-Scenic backend as Z really builds it. window_z.zig is compiled by no step of
+  # this repo's own build, so:
+  #   1. Zicro's check-z: host tests of the protocol client/window over Z's REAL
+  #      protocol.zig, plus shell_z compiled for Z's userspace target;
+  #   2. Z's softfloat-test: the user soft-float runtime + libm against the host;
+  #   3. Z's zicro-apps: zicro_shell and zart_demo LINKED (a compiling object can still
+  #      fail to link — it did, with the 0.17 port) with this checkout as -Dzicro-src.
+  # Z and Zart are checked out at the refs pinned in ci/z.ref and ci/zart.ref: the
+  # protocol is versioned with Z, so "Z's default branch" is not a compatible Z.
   check-z:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: Zicro
+      - name: Pinned refs
+        id: refs
+        run: |
+          echo "z=$(tr -d ' \n' < Zicro/ci/z.ref)" >> "$GITHUB_OUTPUT"
+          echo "zart=$(tr -d ' \n' < Zicro/ci/zart.ref)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: postadelmaga/Z
+          ref: ${{ steps.refs.outputs.z }}
           path: Z
-          # Z may be private: grant a token with read access as Z_READ_TOKEN.
+          token: ${{ secrets.Z_READ_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: postadelmaga/Zart
+          ref: ${{ steps.refs.outputs.zart }}
+          path: Zart
           token: ${{ secrets.Z_READ_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with:
@@ -63,35 +100,56 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libharfbuzz-dev
-      - name: Z backend — host tests + shell_z for Z userspace
-        run: zig build check-z -Dz-src="$GITHUB_WORKSPACE/Z" --summary all
+      - name: check-z (Zicro)
+        working-directory: Zicro
+        run: zig build check-z -Dz-src="$GITHUB_WORKSPACE/Z" --test-timeout 300s --summary all
+      - name: softfloat-test (Z)
+        working-directory: Z
+        run: zig build softfloat-test --summary all
+      - name: zicro-apps (Z) — link zicro_shell and zart_demo
+        working-directory: Z
+        run: |
+          zig build zicro-apps -Dzicro-src="$GITHUB_WORKSPACE/Zicro" -Dzart-src="$GITHUB_WORKSPACE/Zart" -j2 --summary all
+          for f in zig-out/zicro-apps/zicro_shell zig-out/zicro-apps/zart_demo; do
+            test -s "$f" || { echo "missing $f"; exit 1; }
+            u=$(nm -u "$f" | wc -l); [ "$u" -eq 0 ] || { echo "$f: $u undefined symbols"; nm -u "$f"; exit 1; }
+          done
 
-  # The real session: Zicro's shell on Z's zicro_host under QEMU/KVM, scripted input
-  # (KTESTs zicro_session_*). Needs KVM and the Z tree: manual, or a self-hosted
-  # runner with /dev/kvm. A boot that does not print every gate as PASS fails.
+  # The real session: Zicro's shell on Z's zicro_host under QEMU/KVM, scripted input,
+  # plus the kernel-as-peer edge cases and Zart's demo (KTESTs zicro_session_*,
+  # zicro_kh_*, zicro_host_*, darwin_zart). Self-hosted runner with /dev/kvm, manual.
+  # Fails unless every gate is present and PASS and the boot ends in a clean summary.
   z-session:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, kvm]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           path: Zicro
+      - name: Pinned refs
+        id: refs
+        run: |
+          echo "z=$(tr -d ' \n' < Zicro/ci/z.ref)" >> "$GITHUB_OUTPUT"
+          echo "zart=$(tr -d ' \n' < Zicro/ci/zart.ref)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: postadelmaga/Z
+          ref: ${{ steps.refs.outputs.z }}
           path: Z
+          token: ${{ secrets.Z_READ_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: postadelmaga/Zart
+          ref: ${{ steps.refs.outputs.zart }}
+          path: Zart
           token: ${{ secrets.Z_READ_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86
-          sudo chmod 666 /dev/kvm
       - name: Boot the zicro-only lane
         working-directory: Z
         run: |
-          zig build run-x86_64-kvm -Dzicro-src="$GITHUB_WORKSPACE/Zicro" -Dzart-src= -Dzicro-only -j2 2>&1 | tee boot.log
+          set -o pipefail
+          zig build run-x86_64-kvm -Dzicro-src="$GITHUB_WORKSPACE/Zicro" -Dzart-src="$GITHUB_WORKSPACE/Zart" -Dzicro-only -j2 2>&1 | tee boot.log
           ../Zicro/scripts/check-z-session.sh boot.log
