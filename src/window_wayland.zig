@@ -2356,6 +2356,13 @@ pub const Window = struct {
 
     fn onToplevelClose(data: ?*anyopaque, _: *wl.XdgToplevel) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
+        // the app may veto (unsaved changes): it will call close() itself later
+        if (self.opts.on_close_request) |cb| {
+            if (!cb(self, self.opts.user)) {
+                self.invalidate(); // repaint so the app can show its own dialog
+                return;
+            }
+        }
         self.closed = true;
     }
 

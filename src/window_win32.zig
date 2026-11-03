@@ -997,6 +997,17 @@ pub const Window = struct {
                 return 0;
             },
             WM_CLOSE => {
+                // `close()` imposta `closed` PRIMA di postare WM_CLOSE: se non è impostato la
+                // richiesta viene dal sistema (Alt+F4, pulsante, barra delle applicazioni) e
+                // l'app può rifiutarla (es. "salvare le modifiche?") e chiudere poi da sé.
+                if (!self.closed) {
+                    if (self.opts.on_close_request) |cb| {
+                        if (!cb(self, self.opts.user)) {
+                            self.requestRedraw();
+                            return 0;
+                        }
+                    }
+                }
                 self.closed = true;
                 PostQuitMessage(0);
                 return 0;

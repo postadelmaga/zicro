@@ -86,6 +86,7 @@ pub const Window = struct {
             .on_draw = innerDraw,
             .on_key = innerKey,
             .on_mouse = innerMouse,
+            .on_close_request = if (opts.on_close_request != null) innerCloseRequest else null,
             .user = self,
         });
         return self;
@@ -99,6 +100,12 @@ pub const Window = struct {
         self.threaded.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    fn innerCloseRequest(_: *zicro.window.Window, user: ?*anyopaque) bool {
+        const self: *Window = @ptrCast(@alignCast(user.?));
+        const cb = self.opts.on_close_request orelse return true;
+        return cb(self, self.opts.user);
     }
 
     pub fn requestClose(self: *Window) void {

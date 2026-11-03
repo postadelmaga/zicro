@@ -257,6 +257,12 @@ pub const Options = struct {
     /// touch still arrives through `on_mouse`; two fingers here. See [`GestureEvent`].
     /// Web and Android only for now — Wayland/Win32/Cocoa never invoke this.
     on_gesture: ?*const fn (window: *Window, gesture: GestureEvent, user: ?*anyopaque) void = null,
+    /// Optional veto on a close requested by the system (compositor close / Alt+F4 /
+    /// taskbar). Return `true` to let the window close, `false` to keep it open (e.g. to
+    /// ask "save changes?" and close later with `close()`). Not consulted for `close()`
+    /// itself. Wayland, Win32 and Cocoa (macOS re-shows the window it just ordered out). Web
+    /// and Android have no veto: the page/activity lifecycle is the browser's/OS's.
+    on_close_request: ?*const fn (window: *Window, user: ?*anyopaque) bool = null,
     /// Optional system-tray icon (StatusNotifierItem over DBus). Linux-only; a no-op
     /// elsewhere.
     tray: ?TrayConfig = null,
