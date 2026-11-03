@@ -58,6 +58,10 @@ pub const Options = struct {
     /// valid only for the duration of the callback; it is destroyed right
     /// after. Root windows signal close by `run()` returning, as before.
     on_close: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
+    /// Veto sulla chiusura chiesta dall'utente col pulsante della finestra: `false` la
+    /// rifiuta (la finestra resta/torna visibile) e l'app chiuderà poi con `close()`.
+    /// Solo Cocoa per ora (Wayland/Win32 li gestisce zrame direttamente).
+    on_close_request: ?*const fn (window: *Window, user: ?*anyopaque) bool = null,
     user: ?*anyopaque = null,
 };
 

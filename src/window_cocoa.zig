@@ -377,6 +377,9 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
 
         msgVoidId(win, "setTitle:", nsString(opts.title.ptr));
         msgVoidBool(win, "setAcceptsMouseMovedEvents:", true);
+        // Il pulsante rosso deve solo nascondere la finestra (non deallocarla): così
+        // `on_close_request` può rifiutare la chiusura e rimostrarla, e `self.win` resta valido.
+        msgVoidBool(win, "setReleasedWhenClosed:", false);
 
         // Our own content view: drawRect: presents the framebuffer (see the class builder).
         const vcls = ensureViewClass();
@@ -603,7 +606,12 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
             // A miniaturized window also reports !isVisible, so check it too — minimizing
             // must not quit the app.
             if (self.win) |w| {
-                if (!msgBool(w, "isVisible") and !msgBool(w, "isMiniaturized")) self.closed = true;
+                if (!msgBool(w, "isVisible") and !msgBool(w, "isMiniaturized")) {
+                    // l'app può rifiutare (modifiche non salvate): rimostra la finestra e
+                    // lascia che sia lei a chiudere più tardi con `close()`.
+                    const veto = if (self.opts.on_close_request) |cb| !cb(self, self.opts.user) else false;
+                    if (veto) msgVoidId(w, "makeKeyAndOrderFront:", null) else self.closed = true;
+                }
             }
             if (self.closed) break;
 
