@@ -21,6 +21,7 @@ pub const scroll = @import("scroll.zig");
 /// The immediate-mode widget toolkit — the whole point of the web port: the same
 /// button/checkbox/toggle/slider/dropdown/textField that run natively, in a canvas.
 pub const widget = @import("widget.zig");
+pub const density = @import("density.zig");
 /// The window facade — its comptime switch resolves to the web backend
 /// (`window_web.zig`) on wasm, so `zicro.window` reads the same here as natively.
 pub const window = @import("window.zig");

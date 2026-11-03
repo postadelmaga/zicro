@@ -23,6 +23,7 @@ pub const clipboard = @import("clipboard.zig");
 pub const proportion = @import("proportion.zig");
 pub const phi = proportion.phi;
 pub const widget = @import("widget.zig");
+pub const density = @import("density.zig");
 pub const window = @import("window.zig"); // facade → window_android on android
 /// The NDK backend module — exposes `android_app` for an app's `android_main` entry.
 pub const android = @import("window_android.zig");

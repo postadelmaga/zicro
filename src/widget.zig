@@ -29,6 +29,7 @@
 //! Text editing is byte-oriented UTF-8 (cursor never lands inside a sequence); the
 //! character map is US-layout for now (see `keymap.zig` for the limit).
 
+const density = @import("density.zig");
 const std = @import("std");
 const paint = @import("paint.zig");
 const text = @import("text.zig");
@@ -234,6 +235,24 @@ pub const Theme = struct {
         r.font_size = scaleFont(t.font_size, f);
         r.font_small = scaleFont(t.font_small, f);
         r.font_heading = scaleFont(t.font_heading, f);
+        return r;
+    }
+
+    /// A copy with the interactive geometry of density `d` (see `density.zig`): control
+    /// height, checkbox/toggle/knob, gaps, scrollbar and icons. Look (colors, radii,
+    /// surfaces) is untouched, so it composes with any preset: `Theme.macos().withDensity(.touch)`.
+    /// Apply BEFORE `scaled(f)`: the density tokens are logical px at scale 1.
+    pub fn withDensity(t: Theme, d: density.Density) Theme {
+        const m = d.metrics();
+        var r = t;
+        r.ctl_h = m.ctl_h;
+        r.gap = m.gap;
+        r.check_size = m.check;
+        r.knob_d = m.knob_d;
+        r.toggle_w = m.toggle_w;
+        r.toggle_h = m.toggle_h;
+        r.scrollbar_w = m.scrollbar_w;
+        r.icon = m.icon;
         return r;
     }
 
