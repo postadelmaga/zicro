@@ -18,3 +18,14 @@ Reproduce locally (repos side by side):
     (cd ../Z && zig build zicro-apps -Dzicro-src=../Zicro -Dzart-src=../Zart)
     (cd ../Z && zig build run-x86_64-kvm -Dzicro-src=../Zicro -Dzart-src=../Zart -Dzicro-only -j2 2>&1 | tee boot.log)
     scripts/check-z-session.sh ../Z/boot.log
+
+## Why `z-session` has no runner
+
+The real QEMU session (`z-session` in `.github/workflows/ci.yml`) needs `/dev/kvm`, which
+GitHub's hosted runners do not offer, so it targets a self-hosted runner labelled
+`self-hosted, linux, kvm`. None is registered, deliberately: this repository is public,
+and a pull request from a fork can rewrite the workflow and run arbitrary code on any
+self-hosted runner attached to it — GitHub advises against them on public repositories.
+The job stays in the workflow (manual dispatch only) for the day the repository is
+private or the runner is an isolated, disposable VM; until then the session gate is the
+last two lines above, run locally before bumping `z.ref`.

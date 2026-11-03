@@ -3,7 +3,8 @@
 # separate and say so:
 #   * check-z needs the Z (and Zart) repositories at the refs pinned in ci/*.ref —
 #     grant a token with read access as Z_READ_TOKEN if they are private;
-#   * z-session needs KVM: a self-hosted runner labelled `kvm`, started manually.
+#   * z-session needs KVM: a self-hosted runner labelled `kvm`, started manually. None is
+#     registered on purpose (public repo: a fork PR could run code on it) — see ci/README.md.
 name: ci
 
 on:
