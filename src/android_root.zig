@@ -7,6 +7,7 @@ const zicro = @import("zicro");
 pub const paint = zicro.paint;
 pub const text = zicro.text;
 pub const widget = zicro.widget;
+pub const density = zicro.density; // compact / regular / touch geometry presets
 pub const keymap = zicro.keymap;
 pub const clipboard = zicro.clipboard;
 pub const proportion = zicro.proportion;

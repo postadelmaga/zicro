@@ -277,6 +277,10 @@ pub const Window = struct {
     repeat_delay: i32 = 400,
     /// evdev keycode currently held and repeating (0 = none).
     repeat_key: u32 = 0,
+    /// Tasti (evdev) premuti e non ancora rilasciati: se il focus se ne va (dialog di
+    /// sistema aperto da Ctrl+S, Alt+Tab…) il rilascio non arriverebbe mai e l'app
+    /// crederebbe Ctrl ancora giù — la "w" digitata dopo diventerebbe Ctrl+W.
+    held_keys: std.StaticBitSet(256) = .empty,
     repeat_fd: posix.fd_t = -1,
 
     // --- clipboard (wl_data_device selection) -----------------------------------------
@@ -2452,15 +2456,25 @@ pub const Window = struct {
 
     fn onKeyEnter(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface, _: ?*anyopaque) callconv(.c) void {}
     fn onKeyLeave(data: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface) callconv(.c) void {
-        // Focus gone: the release for a held key will never arrive — stop repeating.
+        // Focus gone: the release for a held key will never arrive — stop repeating, and
+        // deliver the releases ourselves so the app's modifier state is not left stuck.
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.cancelRepeat();
+        var it = self.held_keys.iterator(.{});
+        while (it.next()) |k| {
+            const key: u32 = @intCast(k);
+            if (!self.routeInput(.{ .key = .{ .key = key, .pressed = false } })) {
+                if (self.opts.on_key) |cb| cb(self, key, 0, self.opts.user);
+            }
+        }
+        self.held_keys = .empty;
     }
 
     fn onKey(data: ?*anyopaque, _: *wl.Keyboard, serial: u32, _: u32, key: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.input_serial = serial;
         const pressed = state == wl.KEYBOARD_KEY_STATE_PRESSED;
+        if (key < 256) self.held_keys.setValue(key, pressed);
         if (!pressed and key == self.repeat_key) self.cancelRepeat();
         if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed } })) return;
         // Repeat is armed only once a panel has had first refusal: a panel-owned

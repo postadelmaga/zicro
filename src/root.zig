@@ -34,6 +34,7 @@ pub const runtime = @import("runtime.zig");
 // The immediate-mode toolkit lives in zicro (it only needs paint/text/anim and the
 // normalized input events); re-exported so zrame apps keep their spelling.
 pub const widget = zicro.widget;
+pub const density = zicro.density; // compact / regular / touch geometry presets
 pub const keymap = zicro.keymap;
 pub const proportion = zicro.proportion;
 pub const phi = zicro.phi; // substrate's golden ratio (proportion default)

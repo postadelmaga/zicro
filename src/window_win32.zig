@@ -229,6 +229,8 @@ const WM_CLOSE: u32 = 0x0010;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
+const WM_SYSKEYDOWN: u32 = 0x0104; // tasti con Alt premuto (e F10)
+const WM_SYSKEYUP: u32 = 0x0105;
 const WM_CHAR: u32 = 0x0102;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -242,6 +244,7 @@ const WM_TIMER: u32 = 0x0113;
 const WM_NCCALCSIZE: u32 = 0x0083;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 const WM_SETCURSOR: u32 = 0x0020;
+const WM_KILLFOCUS: u32 = 0x0008;
 const WM_SYSCOMMAND: u32 = 0x0112;
 const WM_APP_PRESENT: u32 = 0x8001; // WM_APP + 1: a freshly staged frame is ready
 
@@ -317,6 +320,13 @@ pub const Window = struct {
     panels: plugin.Registry,
     scrollbars: scroll.Scroll = .{ .follow_content = true },
     timer_armed: bool = false,
+    /// Tasti (evdev) premuti e non ancora rilasciati: alla perdita del focus (dialog
+    /// modale aperto da Ctrl+S, Alt+Tab…) il WM_KEYUP va alla finestra che ha il focus,
+    /// non a noi; senza i rilasci sintetici l'app crederebbe Ctrl ancora premuto.
+    held_keys: std.StaticBitSet(256) = .empty,
+    /// Un ridisegno chiesto (app o pannelli) non ancora servito dal timer: il tick non
+    /// deve spegnere il timer finché c'è, anche se la richiesta arriva DENTRO il frame.
+    redraw_pending: bool = false,
     last_tick_ms: u64 = 0,
 
     // Cross-thread frame mailbox (same shape as the Wayland backend): producers write
@@ -778,8 +788,15 @@ pub const Window = struct {
         self.requestRedraw();
     }
 
+    /// Chiede un frame. Una finestra layered (vetro, il default) non riceve WM_PAINT
+    /// utili: `InvalidateRect` da solo non ridisegnava mai, quindi tutto ciò che l'app
+    /// anima o aggiorna senza input (toast, dialog aperti da un callback, rete, timer)
+    /// restava fermo. Il frame passa dal timer d'animazione (~60 Hz, si spegne da solo).
     fn requestRedraw(self: *Window) void {
-        if (self.hwnd) |h| _ = InvalidateRect(h, null, 0);
+        const h = self.hwnd orelse return;
+        self.redraw_pending = true;
+        self.armTimer();
+        if (self.opaque_mode) _ = InvalidateRect(h, null, 0);
     }
 
     /// Ensure the buffers match the current `buf_w`×`buf_h`: the heap compose target `frame`
@@ -902,8 +919,9 @@ pub const Window = struct {
             0.016;
         self.last_tick_ms = now;
         const active = self.panels.tick(dt, self.host());
+        self.redraw_pending = false; // servito ora; on_draw può richiederne un altro
         self.present();
-        if (!active) self.disarmTimer();
+        if (!active and !self.redraw_pending) self.disarmTimer();
     }
 
     /// WM_CHAR → `on_text`: TranslateMessage already ran the active keyboard layout, so
@@ -1060,14 +1078,31 @@ pub const Window = struct {
                 if (wparam == ANIM_TIMER_ID) self.onTimerTick();
                 return 0;
             },
-            WM_KEYDOWN, WM_KEYUP => {
-                const pressed: u32 = if (msg == WM_KEYDOWN) 1 else 0;
-                const key = mapVk(wparam);
+            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP => {
+                const pressed: u32 = if (msg == WM_KEYDOWN or msg == WM_SYSKEYDOWN) 1 else 0;
+                // bit 24 di lparam = tasto "esteso": distingue Ctrl/Alt destri e Invio del
+                // tastierino dai gemelli sinistri (stesso VK).
+                const extended = (@as(usize, @bitCast(lparam)) >> 24) & 1 == 1;
+                const key = mapVkExt(wparam, extended);
+                if (key != 0 and key < 256) self.held_keys.setValue(key, pressed == 1);
                 if (key != 0) {
                     if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed == 1 } })) return 0;
                     if (self.opts.on_key) |cb| cb(self, key, pressed, self.opts.user);
                 }
+                // Alt+… resta al sistema (Alt+F4 → WM_CLOSE, Alt+Spazio → menu finestra)
+                if (msg == WM_SYSKEYDOWN or msg == WM_SYSKEYUP) return DefWindowProcW(hwnd, msg, wparam, lparam);
                 return 0;
+            },
+            WM_KILLFOCUS => {
+                var it = self.held_keys.iterator(.{});
+                while (it.next()) |k| {
+                    const key: u32 = @intCast(k);
+                    if (!self.routeInput(.{ .key = .{ .key = key, .pressed = false } })) {
+                        if (self.opts.on_key) |cb| cb(self, key, 0, self.opts.user);
+                    }
+                }
+                self.held_keys = .empty;
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
             },
             WM_CHAR => {
                 self.onChar(@truncate(wparam));
@@ -1165,6 +1200,17 @@ fn makeBitmapInfo(w: u32, h: u32) BITMAPINFO {
     };
 }
 
+/// Come `mapVk`, ma con il flag "esteso" di lparam: Ctrl/Alt destri e Invio del tastierino.
+fn mapVkExt(vk: WPARAM, extended: bool) u32 {
+    if (extended) switch (vk) {
+        0x11 => return 97, // Ctrl destro -> KEY_RIGHTCTRL
+        0x12 => return 100, // Alt destro (AltGr) -> KEY_RIGHTALT
+        0x0D => return 96, // Invio del tastierino -> KEY_KPENTER
+        else => {},
+    };
+    return mapVk(vk);
+}
+
 /// Translate a Win32 virtual-key code to the evdev keycode the Wayland path emits, so
 /// `on_key` handlers are identical across platforms.
 fn mapVk(vk: WPARAM) u32 {
@@ -1222,6 +1268,43 @@ fn mapVk(vk: WPARAM) u32 {
         0xA1 => 54, // VK_RSHIFT
         0x11, 0xA2 => 29, // VK_CONTROL / VK_LCONTROL -> KEY_LEFTCTRL
         0xA3 => 97, // VK_RCONTROL
+        0x12, 0xA4 => 56, // VK_MENU / VK_LMENU -> KEY_LEFTALT
+        0xA5 => 100, // VK_RMENU -> KEY_RIGHTALT
+        0x5B => 125, // VK_LWIN -> KEY_LEFTMETA
+        0x5C => 126, // VK_RWIN -> KEY_RIGHTMETA
+        0x14 => 58, // VK_CAPITAL -> KEY_CAPSLOCK
+        0x2E => 111, // VK_DELETE
+        0x2D => 110, // VK_INSERT
+        0x24 => 102, // VK_HOME
+        0x23 => 107, // VK_END
+        0x70...0x79 => @as(u32, @intCast(vk - 0x70)) + 59, // VK_F1..F10 -> KEY_F1..F10
+        0x7A => 87, // VK_F11
+        0x7B => 88, // VK_F12
+        0xC0 => 41, // VK_OEM_3 (` ~) -> KEY_GRAVE
+        0xBA => 39, // VK_OEM_1 (; :) -> KEY_SEMICOLON
+        0xDE => 40, // VK_OEM_7 (' ") -> KEY_APOSTROPHE
+        0xDB => 26, // VK_OEM_4 ([ {) -> KEY_LEFTBRACE
+        0xDD => 27, // VK_OEM_6 (] }) -> KEY_RIGHTBRACE
+        0xDC => 43, // VK_OEM_5 (\ |) -> KEY_BACKSLASH
+        0xE2 => 86, // VK_OEM_102 (< > delle tastiere ISO) -> KEY_102ND
+        0xBC => 51, // VK_OEM_COMMA
+        0xBE => 52, // VK_OEM_PERIOD
+        0xBF => 53, // VK_OEM_2 (/ ?) -> KEY_SLASH
+        0x60 => 82, // VK_NUMPAD0 -> KEY_KP0
+        0x61 => 79,
+        0x62 => 80,
+        0x63 => 81,
+        0x64 => 75,
+        0x65 => 76,
+        0x66 => 77,
+        0x67 => 71,
+        0x68 => 72,
+        0x69 => 73, // VK_NUMPAD9 -> KEY_KP9
+        0x6A => 55, // VK_MULTIPLY -> KEY_KPASTERISK
+        0x6B => 78, // VK_ADD -> KEY_KPPLUS
+        0x6D => 74, // VK_SUBTRACT -> KEY_KPMINUS
+        0x6E => 83, // VK_DECIMAL -> KEY_KPDOT
+        0x6F => 98, // VK_DIVIDE -> KEY_KPSLASH
         else => 0,
     };
 }
