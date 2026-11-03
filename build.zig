@@ -120,11 +120,9 @@ pub fn build(b: *std.Build) void {
             .target = wasm_target,
             .optimize = .ReleaseSmall,
         });
-        zicro_web.addIncludePath(zicro.path("vendor/stb"));
-        zicro_web.addCSourceFile(.{
-            .file = zicro.path("vendor/stb/stb_truetype_web.c"),
-            .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-        });
+        // stb_truetype for wasm: zicro's `text_c` module (Zig 0.17 removed @cImport), web
+        // flavour — STBTT_* hooks without libc headers, malloc/libm from wasm_shim.zig.
+        _ = zicro_build.addTextC(zicro.builder, zicro_web, wasm_target, .small, .web);
         const zrame_web = b.createModule(.{
             .root_source_file = b.path("src/web_root.zig"),
             .target = wasm_target,
