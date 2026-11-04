@@ -313,8 +313,13 @@ test "reader never sees a torn frame under concurrent writes" {
     var seen: u64 = 0;
     var reads: usize = 0;
     var i: usize = 0;
-    while (i < 50_000) : (i += 1) {
-        if (try r.readLatest(gpa, &seen)) |frame| {
+    // 50k reads, and past them for as long as none has landed yet (bounded): on a
+    // 2-core CI runner the 50k can run out before the writer thread is even scheduled,
+    // and `reads > 0` below is a liveness check, not what this test is about.
+    while (i < 50_000 or (reads == 0 and i < 20_000_000)) : (i += 1) {
+        const got = try r.readLatest(gpa, &seen);
+        if (got == null) std.Thread.yield() catch {}; // let the writer run
+        if (got) |frame| {
             defer gpa.free(frame);
             try testing.expectEqual(@as(usize, 4096), frame.len);
             const first = frame[0];
