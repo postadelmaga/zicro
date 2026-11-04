@@ -325,7 +325,11 @@ pub const GlRecorder = struct {
     }
     fn strokeRoundedRect(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: Color, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));
-        self.quad(x, y, w, h, shapeProto(x, y, w, h, Corners.all(radius), 1, stroke, clip), color, color);
+        // The ring is centred on the edge (as the CPU canvas draws it): half of it lies
+        // OUTSIDE the rect, so the quad grows by stroke/2 — `quad`'s 1px pad alone cut
+        // the outer half off. The SDF (cx/cy/hw/hh) stays the rect's own.
+        const hs = stroke / 2;
+        self.quad(x - hs, y - hs, w + stroke, h + stroke, shapeProto(x, y, w, h, Corners.all(radius), 1, stroke, clip), color, color);
     }
     fn blitImage(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, clip: ?Clip) void {
         const self: *GlRecorder = @ptrCast(@alignCast(ptr));

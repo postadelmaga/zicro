@@ -32,11 +32,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libwayland-dev wayland-protocols libasound2-dev \
-            libharfbuzz-dev libpipewire-0.3-dev
+            libharfbuzz-dev libpipewire-0.3-dev mesa-vulkan-drivers
       - name: Format
         run: zig fmt --check build.zig src bench examples
       - name: Unit tests
         run: zig build test --test-timeout 300s --summary all
+      # The WebGPU 2D backend draws, reads back and compares with the CPU canvas.
+      # The runner has no GPU: mesa-vulkan-drivers' lavapipe (software Vulkan) is the
+      # device, so the pixels really come out of wgpu-native, not a skip.
+      - name: WebGPU backend (wgpu-native on lavapipe)
+        run: zig build test-wgpu -Dwgpu --test-timeout 300s --summary all
       - name: Native build (library + examples)
         run: zig build install
       - name: Android compile-check (window backend; no NDK needed)

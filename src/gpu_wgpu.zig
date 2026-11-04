@@ -247,149 +247,556 @@ test "a headless device comes up, and says whether it will take our SPIR-V" {
 const paint = @import("paint.zig");
 const paint_gl = @import("paint_gl.zig");
 
-/// GPU Backend implementation for WebGPU / Vulkan / DX12 / Metal via wgpu-native.
+/// `paint.GlBackend` on a WebGPU device: the 2D canvas drawn by the GPU.
 ///
-/// NOT YET WIRED INTO Canvas.gl, and not yet a working GPU backend even if it were: every
-/// vtable method below only forwards to `recorder` (a `paint_gl.GlRecorder`), which
-/// accumulates vertices/atlas data in CPU memory — the same code path the software GL
-/// backend uses. Nothing here creates `pipeline`/`bind_group`/`texture`/`vertex_buf` (they
-/// stay null; `deinit`'s release-if-set calls are dead code today) or ever calls
-/// wgpuQueueWriteBuffer/wgpuRenderPassEncoderDraw/wgpuQueueSubmit — so `recorder`'s output is
-/// never actually uploaded or drawn. Assigning `backend()` to `Canvas.gl` today would
-/// reproduce the "primitives vanish with no error" failure this vtable shape has hit before:
-/// finish the upload+submit step first (feed recorder.vertexBytes()/atlasPtr() to
-/// vertex_buf/texture via a real pipeline) before wiring this into Canvas.gl.
+/// It is the same split the browser's WebGL2 path uses, with the platform half moved from
+/// JavaScript into this file. Drawing (`Canvas` with `gl = &backend.iface`) only RECORDS:
+/// every primitive becomes six vertices of `paint_gl.Vertex` in `recorder`, and every
+/// bitmap (glyph, icon, mask) is copied once into the recorder's shared 2048² atlas.
+/// Then `encode`/`submit` does what the page's `drawUber` does: upload the atlas rows that
+/// changed and the frame's vertices, and draw the WHOLE frame in one call with the
+/// ubershader below (a WGSL port of the WebGL2 one, mode for mode).
+///
+/// A frame:
+///
+///     backend.reset();                       // forget last frame's vertices (atlas stays)
+///     canvas.gl = &backend.iface;            // primitives now record instead of raster
+///     ... draw with canvas ...
+///     try backend.submit(target_view, w, h, clear_color);
+///
+/// What the CPU canvas has and this does not: the primitives `paint.GlBackend` lists as
+/// CPU-only (`drawChrome`, `blitRgba`, shadows, arcs) assert `gl == null` in debug builds,
+/// and `fillConcaveCorner` draws a plain square (the ubershader has no outside-a-circle
+/// mode) — the same limits as the WebGL2 backend, because it is the same recorder.
 pub const WgpuBackend = struct {
     gpu: *Gpu,
-    gpa: std.mem.Allocator,
     recorder: paint_gl.GlRecorder,
+    /// The vtable `Canvas.gl` points at. Stable for the backend's lifetime (do not copy
+    /// the backend after `init`: this points into it).
+    iface: paint.GlBackend,
+    format: c.WGPUTextureFormat,
 
-    // Placeholders for the not-yet-implemented submission path — never created, so always
-    // null; `deinit`'s release-if-set is future-proofing for when init actually builds these.
-    pipeline: c.WGPURenderPipeline = null,
-    bind_group_layout: c.WGPUBindGroupLayout = null,
-    bind_group: c.WGPUBindGroup = null,
-    texture: c.WGPUTexture = null,
-    texture_view: c.WGPUTextureView = null,
-    sampler: c.WGPUSampler = null,
-    uniform_buf: c.WGPUBuffer = null,
+    pipeline: c.WGPURenderPipeline,
+    pipeline_layout: c.WGPUPipelineLayout,
+    bind_group_layout: c.WGPUBindGroupLayout,
+    bind_group: c.WGPUBindGroup,
+    atlas: c.WGPUTexture,
+    atlas_view: c.WGPUTextureView,
+    sampler: c.WGPUSampler,
+    uniform_buf: c.WGPUBuffer,
     vertex_buf: c.WGPUBuffer = null,
-    vertex_buf_cap: usize = 0,
+    vertex_buf_cap: u64 = 0,
 
-    pub fn init(gpu: *Gpu, gpa: std.mem.Allocator) WgpuBackend {
-        return .{
-            .gpu = gpu,
-            .gpa = gpa,
-            .recorder = paint_gl.GlRecorder.init(gpa),
+    pub const DrawError = error{ ShaderFailed, PipelineFailed, OutOfGpuMemory, SubmitFailed };
+
+    /// Build the pipeline for render targets of `format` (the surface's or the offscreen
+    /// texture's). The atlas texture is allocated here, once, at its full size: it is the
+    /// recorder's, which never shrinks either.
+    pub fn init(self: *WgpuBackend, gpu: *Gpu, gpa: std.mem.Allocator, format: c.WGPUTextureFormat) DrawError!void {
+        const dev = gpu.device;
+        var wgsl = c.WGPUShaderSourceWGSL{
+            .chain = .{ .sType = c.WGPUSType_ShaderSourceWGSL },
+            .code = sv(uber_wgsl),
         };
+        const module = c.wgpuDeviceCreateShaderModule(dev, &.{ .nextInChain = &wgsl.chain, .label = sv("zicro uber2d") }) orelse return error.ShaderFailed;
+        defer c.wgpuShaderModuleRelease(module);
+
+        const entries = [3]c.WGPUBindGroupLayoutEntry{
+            .{ .binding = 0, .visibility = c.WGPUShaderStage_Vertex, .buffer = .{ .type = c.WGPUBufferBindingType_Uniform, .minBindingSize = 16 } },
+            .{ .binding = 1, .visibility = c.WGPUShaderStage_Fragment, .texture = .{ .sampleType = c.WGPUTextureSampleType_Float, .viewDimension = c.WGPUTextureViewDimension_2D } },
+            .{ .binding = 2, .visibility = c.WGPUShaderStage_Fragment, .sampler = .{ .type = c.WGPUSamplerBindingType_Filtering } },
+        };
+        const bgl = c.wgpuDeviceCreateBindGroupLayout(dev, &.{ .entryCount = entries.len, .entries = &entries }) orelse return error.PipelineFailed;
+        errdefer c.wgpuBindGroupLayoutRelease(bgl);
+        const layout = c.wgpuDeviceCreatePipelineLayout(dev, &.{ .bindGroupLayoutCount = 1, .bindGroupLayouts = &bgl }) orelse return error.PipelineFailed;
+        errdefer c.wgpuPipelineLayoutRelease(layout);
+
+        // `paint_gl.Vertex` as six attributes — the WebGL2 page's `attribSpec`, byte for byte.
+        const F4 = c.WGPUVertexFormat_Float32x4;
+        const attrs = [6]c.WGPUVertexAttribute{
+            .{ .format = F4, .offset = 0, .shaderLocation = 0 }, // x y u v
+            .{ .format = F4, .offset = 16, .shaderLocation = 1 }, // r g b a
+            .{ .format = F4, .offset = 32, .shaderLocation = 2 }, // cx cy hw hh
+            .{ .format = F4, .offset = 48, .shaderLocation = 3 }, // corner radii
+            .{ .format = F4, .offset = 64, .shaderLocation = 4 }, // mode stroke clip_x0 clip_y0
+            .{ .format = c.WGPUVertexFormat_Float32x3, .offset = 80, .shaderLocation = 5 }, // clip_x1 clip_y1 tex
+        };
+        const vbl = c.WGPUVertexBufferLayout{
+            .stepMode = c.WGPUVertexStepMode_Vertex,
+            .arrayStride = @sizeOf(paint_gl.Vertex),
+            .attributeCount = attrs.len,
+            .attributes = &attrs,
+        };
+        // Straight-alpha source-over, as the WebGL2 path blends (SRC_ALPHA, ONE_MINUS_SRC_ALPHA
+        // on all four channels) — so the two GPU backends agree pixel for pixel.
+        const over = c.WGPUBlendComponent{
+            .operation = c.WGPUBlendOperation_Add,
+            .srcFactor = c.WGPUBlendFactor_SrcAlpha,
+            .dstFactor = c.WGPUBlendFactor_OneMinusSrcAlpha,
+        };
+        const blend = c.WGPUBlendState{ .color = over, .alpha = over };
+        const target = c.WGPUColorTargetState{ .format = format, .blend = &blend, .writeMask = c.WGPUColorWriteMask_All };
+        const frag = c.WGPUFragmentState{ .module = module, .entryPoint = sv("fs_main"), .targetCount = 1, .targets = &target };
+        const pipeline = c.wgpuDeviceCreateRenderPipeline(dev, &.{
+            .label = sv("zicro uber2d"),
+            .layout = layout,
+            .vertex = .{ .module = module, .entryPoint = sv("vs_main"), .bufferCount = 1, .buffers = &vbl },
+            .primitive = .{
+                .topology = c.WGPUPrimitiveTopology_TriangleList,
+                .frontFace = c.WGPUFrontFace_CCW,
+                .cullMode = c.WGPUCullMode_None,
+            },
+            .multisample = .{ .count = 1, .mask = 0xFFFF_FFFF },
+            .fragment = &frag,
+        }) orelse return error.PipelineFailed;
+        errdefer c.wgpuRenderPipelineRelease(pipeline);
+
+        const atlas = c.wgpuDeviceCreateTexture(dev, &.{
+            .label = sv("zicro atlas"),
+            .usage = c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
+            .dimension = c.WGPUTextureDimension_2D,
+            .size = .{ .width = paint_gl.atlas_dim, .height = paint_gl.atlas_dim, .depthOrArrayLayers = 1 },
+            .format = c.WGPUTextureFormat_RGBA8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+        }) orelse return error.OutOfGpuMemory;
+        errdefer c.wgpuTextureRelease(atlas);
+        const atlas_view = c.wgpuTextureCreateView(atlas, null) orelse return error.OutOfGpuMemory;
+        errdefer c.wgpuTextureViewRelease(atlas_view);
+        // NEAREST: glyphs and icons are drawn 1:1 in device pixels, as on the page.
+        const sampler = c.wgpuDeviceCreateSampler(dev, &.{
+            .addressModeU = c.WGPUAddressMode_ClampToEdge,
+            .addressModeV = c.WGPUAddressMode_ClampToEdge,
+            .addressModeW = c.WGPUAddressMode_ClampToEdge,
+            .magFilter = c.WGPUFilterMode_Nearest,
+            .minFilter = c.WGPUFilterMode_Nearest,
+            .mipmapFilter = c.WGPUMipmapFilterMode_Nearest,
+            .lodMinClamp = 0,
+            .lodMaxClamp = 32,
+            .maxAnisotropy = 1,
+        }) orelse return error.OutOfGpuMemory;
+        errdefer c.wgpuSamplerRelease(sampler);
+        const uniform_buf = c.wgpuDeviceCreateBuffer(dev, &.{
+            .label = sv("zicro uber2d res"),
+            .usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst,
+            .size = 16,
+        }) orelse return error.OutOfGpuMemory;
+        errdefer c.wgpuBufferRelease(uniform_buf);
+
+        const bg_entries = [3]c.WGPUBindGroupEntry{
+            .{ .binding = 0, .buffer = uniform_buf, .size = 16 },
+            .{ .binding = 1, .textureView = atlas_view },
+            .{ .binding = 2, .sampler = sampler },
+        };
+        const bind_group = c.wgpuDeviceCreateBindGroup(dev, &.{ .layout = bgl, .entryCount = bg_entries.len, .entries = &bg_entries }) orelse return error.PipelineFailed;
+
+        self.* = .{
+            .gpu = gpu,
+            .recorder = paint_gl.GlRecorder.init(gpa),
+            .iface = undefined,
+            .format = format,
+            .pipeline = pipeline,
+            .pipeline_layout = layout,
+            .bind_group_layout = bgl,
+            .bind_group = bind_group,
+            .atlas = atlas,
+            .atlas_view = atlas_view,
+            .sampler = sampler,
+            .uniform_buf = uniform_buf,
+        };
+        self.iface = self.recorder.iface();
+        // `iface.ptr` must point at THIS recorder (the one inside self), not the
+        // temporary `init` built — hence assigned after `self.*` is in place.
+        self.iface.ptr = &self.recorder;
     }
 
     pub fn deinit(self: *WgpuBackend) void {
         self.recorder.deinit();
         if (self.vertex_buf) |b| c.wgpuBufferRelease(b);
-        if (self.uniform_buf) |b| c.wgpuBufferRelease(b);
-        if (self.texture_view) |v| c.wgpuTextureViewRelease(v);
-        if (self.texture) |t| c.wgpuTextureRelease(t);
-        if (self.sampler) |s| c.wgpuSamplerRelease(s);
-        if (self.bind_group) |bg| c.wgpuBindGroupRelease(bg);
-        if (self.bind_group_layout) |bgl| c.wgpuBindGroupLayoutRelease(bgl);
-        if (self.pipeline) |p| c.wgpuRenderPipelineRelease(p);
+        c.wgpuBindGroupRelease(self.bind_group);
+        c.wgpuBufferRelease(self.uniform_buf);
+        c.wgpuSamplerRelease(self.sampler);
+        c.wgpuTextureViewRelease(self.atlas_view);
+        c.wgpuTextureRelease(self.atlas);
+        c.wgpuRenderPipelineRelease(self.pipeline);
+        c.wgpuPipelineLayoutRelease(self.pipeline_layout);
+        c.wgpuBindGroupLayoutRelease(self.bind_group_layout);
+        self.* = undefined;
     }
 
-    pub fn backend(self: *WgpuBackend) paint.GlBackend {
-        return .{
-            .ptr = @ptrCast(self),
-            .vtable = &vtable,
-        };
-    }
-
+    /// Start a new frame: drop the recorded vertices. The atlas (and what is on the GPU
+    /// of it) persists — glyphs and icons are uploaded once per session.
     pub fn reset(self: *WgpuBackend) void {
         self.recorder.reset();
-    }
-
-    pub fn vertexBytes(self: *const WgpuBackend) []const u8 {
-        return self.recorder.vertexBytes();
     }
 
     pub fn vertexCount(self: *const WgpuBackend) usize {
         return self.recorder.vertexCount();
     }
 
-    const vtable = paint.GlBackend.VTable{
-        .fillRoundedRect = fillRoundedRectImpl,
-        .fillRoundedRectPerCorner = fillRoundedRectPerCornerImpl,
-        .fillRoundedRectVGradient = fillRoundedRectVGradientImpl,
-        .fillConcaveCorner = fillConcaveCornerImpl,
-        .strokeSegment = strokeSegmentImpl,
-        .strokeRoundedRect = strokeRoundedRectImpl,
-        .blitImage = blitImageImpl,
-        .blitMask = blitMaskImpl,
-        .blitImageRot = blitImageRotImpl,
-        .drawText = drawTextImpl,
-    };
+    /// Record the frame into `encoder` as ONE render pass on `target` (`width`×`height`,
+    /// of the format given to `init`): the atlas rows touched since the last frame and the
+    /// frame's vertices are written to the queue first, then a single draw. `clear` = the
+    /// pass's clear colour; `null` loads what the target already holds (drawing the UI
+    /// over a 3D frame rendered into the same texture).
+    pub fn encode(self: *WgpuBackend, encoder: c.WGPUCommandEncoder, target: c.WGPUTextureView, width: u32, height: u32, clear: ?paint.Color) DrawError!void {
+        const queue = self.gpu.queue;
+        const rec = &self.recorder;
 
-    fn fillRoundedRectImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.fillRoundedRect(b.ptr, x, y, w, h, radius, color, clip);
+        // The atlas band the recorder dirtied (whole rows, as the page uploads it).
+        if (rec.atlasReady() and rec.dirtyHi() > rec.dirtyLo()) {
+            const lo = rec.dirtyLo();
+            const rows = rec.dirtyHi() - lo;
+            const row_bytes: u32 = paint_gl.atlas_dim * 4;
+            c.wgpuQueueWriteTexture(
+                queue,
+                &.{ .texture = self.atlas, .mipLevel = 0, .origin = .{ .x = 0, .y = lo, .z = 0 }, .aspect = c.WGPUTextureAspect_All },
+                rec.atlasPtr() + @as(usize, lo) * row_bytes,
+                @as(usize, rows) * row_bytes,
+                &.{ .offset = 0, .bytesPerRow = row_bytes, .rowsPerImage = rows },
+                &.{ .width = paint_gl.atlas_dim, .height = rows, .depthOrArrayLayers = 1 },
+            );
+            rec.clearDirty();
+        }
+
+        const res = [4]f32{ @floatFromInt(width), @floatFromInt(height), 0, 0 };
+        c.wgpuQueueWriteBuffer(queue, self.uniform_buf, 0, &res, @sizeOf(@TypeOf(res)));
+
+        const verts = rec.vertexBytes();
+        if (verts.len > 0) try self.ensureVertexCapacity(verts.len);
+        if (verts.len > 0) c.wgpuQueueWriteBuffer(queue, self.vertex_buf, 0, verts.ptr, verts.len);
+
+        const cc = clear orelse paint.Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
+        const attachment = c.WGPURenderPassColorAttachment{
+            .view = target,
+            .depthSlice = std.math.maxInt(u32), // WGPU_DEPTH_SLICE_UNDEFINED: a 2D target
+            .loadOp = if (clear != null) c.WGPULoadOp_Clear else c.WGPULoadOp_Load,
+            .storeOp = c.WGPUStoreOp_Store,
+            .clearValue = .{ .r = cc.r, .g = cc.g, .b = cc.b, .a = cc.a },
+        };
+        const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &.{
+            .label = sv("zicro uber2d"),
+            .colorAttachmentCount = 1,
+            .colorAttachments = &attachment,
+        }) orelse return error.SubmitFailed;
+        if (verts.len > 0) {
+            c.wgpuRenderPassEncoderSetPipeline(pass, self.pipeline);
+            c.wgpuRenderPassEncoderSetBindGroup(pass, 0, self.bind_group, 0, null);
+            c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.vertex_buf, 0, verts.len);
+            c.wgpuRenderPassEncoderDraw(pass, @intCast(rec.vertexCount()), 1, 0, 0); // the whole frame
+        }
+        c.wgpuRenderPassEncoderEnd(pass);
+        c.wgpuRenderPassEncoderRelease(pass);
     }
-    fn fillRoundedRectPerCornerImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, corners: paint.Corners, color: paint.Color, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.fillRoundedRectPerCorner(b.ptr, x, y, w, h, corners, color, clip);
+
+    /// `encode` in an encoder of its own, submitted. For a caller with nothing else to
+    /// put in the frame's command buffer.
+    pub fn submit(self: *WgpuBackend, target: c.WGPUTextureView, width: u32, height: u32, clear: ?paint.Color) DrawError!void {
+        const encoder = c.wgpuDeviceCreateCommandEncoder(self.gpu.device, &.{}) orelse return error.SubmitFailed;
+        defer c.wgpuCommandEncoderRelease(encoder);
+        try self.encode(encoder, target, width, height, clear);
+        const cmd = c.wgpuCommandEncoderFinish(encoder, &.{}) orelse return error.SubmitFailed;
+        defer c.wgpuCommandBufferRelease(cmd);
+        c.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
     }
-    fn fillRoundedRectVGradientImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, top: paint.Color, bottom: paint.Color, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.fillRoundedRectVGradient(b.ptr, x, y, w, h, radius, top, bottom, clip);
-    }
-    fn fillConcaveCornerImpl(ptr: *anyopaque, x: f32, y: f32, size: f32, cx: f32, cy: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.fillConcaveCorner(b.ptr, x, y, size, cx, cy, color, clip);
-    }
-    fn strokeSegmentImpl(ptr: *anyopaque, ax: f32, ay: f32, bx: f32, by: f32, width: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.strokeSegment(b.ptr, ax, ay, bx, by, width, color, clip);
-    }
-    fn strokeRoundedRectImpl(ptr: *anyopaque, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: paint.Color, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.strokeRoundedRect(b.ptr, x, y, w, h, radius, stroke, color, clip);
-    }
-    fn blitImageImpl(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.blitImage(b.ptr, dst_x, dst_y, dst_w, dst_h, src, src_w, src_h, clip);
-    }
-    fn blitMaskImpl(ptr: *anyopaque, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32, src: []const u8, src_w: u32, src_h: u32, tint: paint.Color, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.blitMask(b.ptr, dst_x, dst_y, dst_w, dst_h, src, src_w, src_h, tint, clip);
-    }
-    fn blitImageRotImpl(ptr: *anyopaque, dx: f32, dy: f32, dw: f32, dh: f32, src: []const u8, src_w: u32, src_h: u32, angle: f32, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.blitImageRot(b.ptr, dx, dy, dw, dh, src, src_w, src_h, angle, clip);
-    }
-    fn drawTextImpl(ptr: *anyopaque, font: *paint.text.Font, x: i32, baseline_y: i32, s: []const u8, opts: paint.TextOpts, clip: ?paint.Canvas.Clip) void {
-        const self: *WgpuBackend = @ptrCast(@alignCast(ptr));
-        const b = self.recorder.iface();
-        b.vtable.drawText(b.ptr, font, x, baseline_y, s, opts, clip);
+
+    /// Grow the vertex buffer to the next power of two that holds `bytes` (never shrinks:
+    /// a UI's frames are all about the same size, and reallocating each frame is waste).
+    fn ensureVertexCapacity(self: *WgpuBackend, bytes: usize) DrawError!void {
+        if (self.vertex_buf != null and self.vertex_buf_cap >= bytes) return;
+        const cap = std.math.ceilPowerOfTwo(u64, @max(bytes, 64 * 1024)) catch return error.OutOfGpuMemory;
+        const buf = c.wgpuDeviceCreateBuffer(self.gpu.device, &.{
+            .label = sv("zicro uber2d vertices"),
+            .usage = c.WGPUBufferUsage_Vertex | c.WGPUBufferUsage_CopyDst,
+            .size = cap,
+        }) orelse return error.OutOfGpuMemory;
+        if (self.vertex_buf) |old| c.wgpuBufferRelease(old);
+        self.vertex_buf = buf;
+        self.vertex_buf_cap = cap;
     }
 };
 
-test "WgpuBackend's vtable records draws into its CPU-side GlRecorder (no GPU upload yet)" {
-    var fake_gpu: Gpu = undefined;
-    var wgpu_b = WgpuBackend.init(&fake_gpu, std.testing.allocator);
-    defer wgpu_b.deinit();
-    const gb = wgpu_b.backend();
-    try std.testing.expect(@as(?*const anyopaque, @ptrCast(gb.vtable.fillRoundedRect)) != null);
-    try std.testing.expect(@as(?*const anyopaque, @ptrCast(gb.vtable.drawText)) != null);
+fn sv(s: []const u8) c.WGPUStringView {
+    return .{ .data = s.ptr, .length = s.len };
+}
 
-    gb.vtable.fillRoundedRect(gb.ptr, 10, 20, 100, 40, 8, .{ .r = 1, .g = 0, .b = 0, .a = 1 }, null);
-    try std.testing.expectEqual(@as(usize, 6), wgpu_b.vertexCount());
-    wgpu_b.reset();
-    try std.testing.expectEqual(@as(usize, 0), wgpu_b.vertexCount());
+/// The 2D ubershader, WGSL. A port of the WebGL2 page's, mode for mode, so the browser's
+/// GPU path and this one draw the same pixels from the same vertex stream:
+///   0 rounded-rect fill · 1 rounded-rect stroke (SDF) · 2 atlas RGBA × colour (icons)
+///   3 plain quad (segments) · 4 atlas coverage in alpha, tinted (glyphs, masks)
+/// Positions arrive in pixels with a top-left origin; `res` maps them to clip space.
+const uber_wgsl =
+    \\struct Res { size: vec2f, pad: vec2f };
+    \\@group(0) @binding(0) var<uniform> res: Res;
+    \\@group(0) @binding(1) var atlas: texture_2d<f32>;
+    \\@group(0) @binding(2) var samp: sampler;
+    \\
+    \\struct VIn {
+    \\  @location(0) a0: vec4f, @location(1) a1: vec4f, @location(2) a2: vec4f,
+    \\  @location(3) a3: vec4f, @location(4) a4: vec4f, @location(5) a5: vec3f,
+    \\};
+    \\struct VOut {
+    \\  @builtin(position) pos: vec4f,
+    \\  @location(0) p: vec2f, @location(1) uv: vec2f, @location(2) col: vec4f,
+    \\  @location(3) rect: vec4f, @location(4) corners: vec4f,
+    \\  @location(5) mode: vec2f, @location(6) clip: vec4f,
+    \\};
+    \\
+    \\@vertex fn vs_main(i: VIn) -> VOut {
+    \\  var o: VOut;
+    \\  o.p = i.a0.xy; o.uv = i.a0.zw; o.col = i.a1; o.rect = i.a2; o.corners = i.a3;
+    \\  o.mode = i.a4.xy; o.clip = vec4f(i.a4.z, i.a4.w, i.a5.x, i.a5.y);
+    \\  let c = (i.a0.xy / res.size) * 2.0 - 1.0;
+    \\  o.pos = vec4f(c.x, -c.y, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\
+    \\fn sdRR(p: vec2f, c: vec2f, h: vec2f, r: vec4f) -> f32 {
+    \\  let d = p - c;
+    \\  var rad: f32;
+    \\  if (d.x > 0.0) { rad = select(r.y, r.z, d.y > 0.0); } else { rad = select(r.x, r.w, d.y > 0.0); }
+    \\  let q = abs(d) - h + rad;
+    \\  return min(max(q.x, q.y), 0.0) + length(max(q, vec2f(0.0))) - rad;
+    \\}
+    \\
+    \\@fragment fn fs_main(i: VOut) -> @location(0) vec4f {
+    \\  let t = textureSampleLevel(atlas, samp, i.uv, 0.0);
+    \\  if (i.clip.x >= 0.0) {
+    \\    if (i.p.x < i.clip.x || i.p.y < i.clip.y || i.p.x > i.clip.z || i.p.y > i.clip.w) { discard; }
+    \\  }
+    \\  let m = i.mode.x;
+    \\  var o: vec4f;
+    \\  if (m < 0.5) {
+    \\    let d = sdRR(i.p, i.rect.xy, i.rect.zw, i.corners);
+    \\    o = vec4f(i.col.rgb, i.col.a * clamp(0.5 - d, 0.0, 1.0));
+    \\  } else if (m < 1.5) {
+    \\    let d = sdRR(i.p, i.rect.xy, i.rect.zw, i.corners);
+    \\    // Centred on the edge, `stroke` wide — the CPU canvas's ring (|d| - stroke/2).
+    \\    o = vec4f(i.col.rgb, i.col.a * clamp(0.5 - (abs(d) - 0.5 * i.mode.y), 0.0, 1.0));
+    \\  } else if (m < 2.5) {
+    \\    o = t * i.col;
+    \\  } else if (m < 3.5) {
+    \\    o = i.col;
+    \\  } else {
+    \\    o = vec4f(i.col.rgb, i.col.a * t.a);
+    \\  }
+    \\  if (o.a <= 0.003) { discard; }
+    \\  return o;
+    \\}
+;
+
+// ── GPU tests: draw, read back, compare with the CPU canvas ─────────────────────────
+//
+// The point of these is the one the scaffold this replaced could not pass: the pixels
+// have to come out of the GPU. Each scene is drawn twice — by `paint.Canvas` on the CPU
+// and by this backend on whatever device the machine has — and the two images compared.
+
+const Readback = struct {
+    tex: c.WGPUTexture,
+    view: c.WGPUTextureView,
+    buf: c.WGPUBuffer,
+    w: u32,
+    h: u32,
+    const fmt = c.WGPUTextureFormat_RGBA8Unorm;
+
+    fn init(gpu: *Gpu, w: u32, h: u32) !Readback {
+        std.debug.assert((w * 4) % 256 == 0); // copy rows must be 256-byte aligned
+        const tex = c.wgpuDeviceCreateTexture(gpu.device, &.{
+            .usage = c.WGPUTextureUsage_RenderAttachment | c.WGPUTextureUsage_CopySrc,
+            .dimension = c.WGPUTextureDimension_2D,
+            .size = .{ .width = w, .height = h, .depthOrArrayLayers = 1 },
+            .format = fmt,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+        }) orelse return error.OutOfGpuMemory;
+        const buf = c.wgpuDeviceCreateBuffer(gpu.device, &.{
+            .usage = c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst,
+            .size = @as(u64, w) * h * 4,
+        }) orelse return error.OutOfGpuMemory;
+        return .{ .tex = tex, .view = c.wgpuTextureCreateView(tex, null).?, .buf = buf, .w = w, .h = h };
+    }
+
+    fn deinit(r: *Readback) void {
+        c.wgpuBufferRelease(r.buf);
+        c.wgpuTextureViewRelease(r.view);
+        c.wgpuTextureRelease(r.tex);
+    }
+
+    const Mapped = struct { done: bool = false, ok: bool = false };
+    fn onMapped(status: c.WGPUMapAsyncStatus, _: c.WGPUStringView, ud1: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const m: *Mapped = @ptrCast(@alignCast(ud1.?));
+        m.done = true;
+        m.ok = status == c.WGPUMapAsyncStatus_Success;
+    }
+
+    /// Copy the target into the map buffer and read it out as RGBA8, `out.len == w*h*4`.
+    fn read(r: *Readback, gpu: *Gpu, out: []u8) !void {
+        const enc = c.wgpuDeviceCreateCommandEncoder(gpu.device, &.{}).?;
+        defer c.wgpuCommandEncoderRelease(enc);
+        c.wgpuCommandEncoderCopyTextureToBuffer(
+            enc,
+            &.{ .texture = r.tex, .mipLevel = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = c.WGPUTextureAspect_All },
+            &.{ .layout = .{ .offset = 0, .bytesPerRow = r.w * 4, .rowsPerImage = r.h }, .buffer = r.buf },
+            &.{ .width = r.w, .height = r.h, .depthOrArrayLayers = 1 },
+        );
+        const cmd = c.wgpuCommandEncoderFinish(enc, &.{}).?;
+        defer c.wgpuCommandBufferRelease(cmd);
+        c.wgpuQueueSubmit(gpu.queue, 1, &cmd);
+
+        var m: Mapped = .{};
+        const size: usize = @as(usize, r.w) * r.h * 4;
+        _ = c.wgpuBufferMapAsync(r.buf, c.WGPUMapMode_Read, 0, size, .{
+            .mode = c.WGPUCallbackMode_AllowProcessEvents,
+            .callback = onMapped,
+            .userdata1 = &m,
+        });
+        var spins: usize = 0;
+        while (!m.done and spins < 100_000) : (spins += 1) c.wgpuInstanceProcessEvents(gpu.instance);
+        if (!m.ok) return error.MapFailed;
+        const p: [*]const u8 = @ptrCast(c.wgpuBufferGetConstMappedRange(r.buf, 0, size).?);
+        @memcpy(out, p[0..size]);
+        c.wgpuBufferUnmap(r.buf);
+    }
+};
+
+/// Draw `scene` on both backends at `w`×`h` and return how many pixels differ by more
+/// than `tol` in any channel. `gpu_px`/`cpu_px` receive the two images (RGBA8).
+fn drawBoth(gpu: *Gpu, w: u32, h: u32, scene: *const fn (*paint.Canvas) void, gpu_px: []u8, cpu_px: []u8, tol: u8) !usize {
+    const gpa = std.testing.allocator;
+
+    // CPU: straight RGBA8, the same byte layout the GPU target reads back in.
+    const cpu = try gpa.alloc(u32, @as(usize, w) * h);
+    defer gpa.free(cpu);
+    @memset(cpu, 0xFF00_0000); // opaque black (R,G,B,A bytes = 0,0,0,255 little-endian)
+    var cv = paint.Canvas.initRgba8(cpu, w, h);
+    scene(&cv);
+    @memcpy(cpu_px, std.mem.sliceAsBytes(cpu));
+
+    var be: WgpuBackend = undefined;
+    try be.init(gpu, gpa, Readback.fmt);
+    defer be.deinit();
+    var rb = try Readback.init(gpu, w, h);
+    defer rb.deinit();
+    var gv = paint.Canvas.initRgba8(cpu, w, h); // pixels unused: every primitive records
+    gv.gl = &be.iface;
+    scene(&gv);
+    try std.testing.expect(be.vertexCount() > 0);
+    try be.submit(rb.view, w, h, .{ .r = 0, .g = 0, .b = 0, .a = 1 });
+    try rb.read(gpu, gpu_px);
+
+    var bad: usize = 0;
+    var i: usize = 0;
+    while (i < gpu_px.len) : (i += 4) {
+        for (0..3) |k| {
+            const d = @abs(@as(i16, gpu_px[i + k]) - @as(i16, cpu_px[i + k]));
+            if (d > tol) {
+                bad += 1;
+                break;
+            }
+        }
+    }
+    return bad;
+}
+
+fn testGpu() !Gpu {
+    return init(null) catch |e| {
+        std.debug.print("wgpu: no device ({s}) — skipping\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+}
+
+fn px(img: []const u8, w: u32, x: u32, y: u32) [4]u8 {
+    const o = (@as(usize, y) * w + x) * 4;
+    return img[o..][0..4].*;
+}
+
+const shapes_scene = struct {
+    fn draw(cv: *paint.Canvas) void {
+        cv.fillRoundedRect(8, 8, 48, 40, 10, .{ .r = 1, .g = 0, .b = 0, .a = 1 });
+        cv.strokeRoundedRect(4, 52, 56, 10, 4, 2, .{ .r = 0, .g = 1, .b = 0, .a = 1 });
+        cv.fillRoundedRect(20, 20, 24, 16, 0, .{ .r = 0, .g = 0, .b = 1, .a = 0.5 });
+    }
+}.draw;
+
+test "WgpuBackend draws shapes the CPU canvas draws" {
+    var gpu = try testGpu();
+    defer gpu.deinit();
+    const w = 64;
+    const h = 64;
+    var g: [w * h * 4]u8 = undefined;
+    var k: [w * h * 4]u8 = undefined;
+    const bad = try drawBoth(&gpu, w, h, shapes_scene, &g, &k, 40);
+
+    // Not "a vertex count came out" — the pixels: red inside the rect, black outside,
+    // the half-alpha blue blended over red, the green stroke band.
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, px(&g, w, 12, 40));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, px(&g, w, 1, 1));
+    const mixed = px(&g, w, 30, 28);
+    try std.testing.expect(mixed[0] > 100 and mixed[0] < 160 and mixed[2] > 100 and mixed[2] < 160);
+    try std.testing.expect(px(&g, w, 30, 51)[1] > 200); // the ring straddles y = 52: half outside
+    try std.testing.expect(px(&g, w, 30, 52)[1] > 200);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, px(&g, w, 30, 56)); // inside the ring: untouched
+    // And the two backends agree everywhere but a thin anti-aliased rim.
+    try std.testing.expect(bad < w * h / 50);
+}
+
+const mask_scene = struct {
+    // A static 8×8 RGBA mask (a filled square with a 1px clear border): the atlas keys
+    // bitmaps by address, which this keeps stable for the whole test binary.
+    const mask: [8 * 8 * 4]u8 = blk: {
+        var m: [8 * 8 * 4]u8 = @splat(0);
+        for (1..7) |y| for (1..7) |x| {
+            m[(y * 8 + x) * 4 + 3] = 255;
+        };
+        break :blk m;
+    };
+    const icon: [2 * 2 * 4]u8 = .{ 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255 };
+    fn draw(cv: *paint.Canvas) void {
+        cv.blitMask(4, 4, 8, 8, &mask, 8, 8, .{ .r = 0, .g = 1, .b = 1, .a = 1 });
+        cv.blitImage(40, 40, 16, 16, &icon, 2, 2);
+        // The scissor: half of this rect falls outside it and must not appear.
+        const prev = cv.setClip(0, 0, 32, 64);
+        cv.fillRoundedRect(24, 24, 16, 8, 0, .{ .r = 1, .g = 1, .b = 1, .a = 1 });
+        cv.clip = prev;
+    }
+}.draw;
+
+test "WgpuBackend samples the atlas (masks, icons) and honours the clip" {
+    var gpu = try testGpu();
+    defer gpu.deinit();
+    const w = 64;
+    const h = 64;
+    var g: [w * h * 4]u8 = undefined;
+    var k: [w * h * 4]u8 = undefined;
+    const bad = try drawBoth(&gpu, w, h, mask_scene, &g, &k, 40);
+
+    try std.testing.expectEqual([4]u8{ 0, 255, 255, 255 }, px(&g, w, 8, 8)); // mask, tinted
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, px(&g, w, 4, 4)); // its clear border
+    try std.testing.expectEqual([4]u8{ 255, 255, 0, 255 }, px(&g, w, 48, 48)); // icon, scaled
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, px(&g, w, 28, 28)); // inside the clip
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, px(&g, w, 36, 28)); // clipped away
+    try std.testing.expect(bad < w * h / 50);
+}
+
+test "WgpuBackend keeps the atlas across frames and re-records only vertices" {
+    var gpu = try testGpu();
+    defer gpu.deinit();
+    var be: WgpuBackend = undefined;
+    try be.init(&gpu, std.testing.allocator, Readback.fmt);
+    defer be.deinit();
+    var rb = try Readback.init(&gpu, 64, 64);
+    defer rb.deinit();
+    var scratch: [64 * 64]u32 = undefined;
+    var out: [64 * 64 * 4]u8 = undefined;
+    for (0..3) |frame| {
+        be.reset();
+        var cv = paint.Canvas.initRgba8(&scratch, 64, 64);
+        cv.gl = &be.iface;
+        mask_scene(&cv);
+        // After the first frame nothing new enters the atlas: no rows to upload.
+        if (frame > 0) try std.testing.expect(be.recorder.dirtyHi() <= be.recorder.dirtyLo());
+        try be.submit(rb.view, 64, 64, .{ .r = 0, .g = 0, .b = 0, .a = 1 });
+        try rb.read(&gpu, &out);
+        try std.testing.expectEqual([4]u8{ 0, 255, 255, 255 }, px(&out, 64, 8, 8));
+    }
 }
