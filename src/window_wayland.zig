@@ -151,9 +151,15 @@ pub const Window = struct {
     text_input: ?*wl.ZwpTextInputV3 = null,
     data_device_manager: ?*wl.DataDeviceManager = null,
     text_input_enabled: bool = false,
+    /// The field the app last enabled the IME for. text-input-v3 ties `enable` to
+    /// keyboard focus: an enable sent while the surface lacks focus is void, and a
+    /// `leave` drops it — so `enter` re-sends this one (see `onTextInputEnter`).
+    text_input_spec: ?plugin.TextInputSpec = null,
     /// IME preedit staged by `preedit_string` events; `on_preedit` fires from
     /// this same buffer once `done` commits the text-input transaction — the
-    /// protocol never reads it in between, so one buffer suffices.
+    /// protocol never reads it in between, so one buffer suffices. It is PENDING
+    /// state: a `done` whose batch carried no `preedit_string` means "no preedit",
+    /// so `done` empties it after applying it.
     preedit_buf: [256]u8 = undefined,
     preedit_len: usize = 0,
     preedit_cursor_begin: i32 = -1,
@@ -1282,6 +1288,11 @@ pub const Window = struct {
     }
 
     pub fn enableTextInput(self: *Window, spec: plugin.TextInputSpec) void {
+        self.text_input_spec = spec;
+        self.sendTextInputEnable(spec);
+    }
+
+    fn sendTextInputEnable(self: *Window, spec: plugin.TextInputSpec) void {
         if (self.text_input) |ti| {
             ti.enable();
             ti.setCursorRectangle(spec.x, spec.y, @intCast(spec.w), @intCast(spec.h));
@@ -1296,6 +1307,7 @@ pub const Window = struct {
     }
 
     pub fn disableTextInput(self: *Window) void {
+        self.text_input_spec = null;
         if (self.text_input) |ti| {
             if (self.text_input_enabled) {
                 ti.disable();
@@ -1412,16 +1424,24 @@ pub const Window = struct {
         .done = onTextInputDone,
     };
 
+    /// Keyboard focus arrived: a field that was being edited when the window lost
+    /// focus gets its IME back. Without this an alt-tab away and back left the IME
+    /// off until the user clicked into the field again.
     fn onTextInputEnter(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, surface: *wl.Surface) callconv(.c) void {
         _ = text_input;
         _ = surface;
-        _ = data;
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (self.text_input_spec) |spec| self.sendTextInputEnable(spec);
     }
 
     fn onTextInputLeave(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, surface: *wl.Surface) callconv(.c) void {
         _ = text_input;
         _ = surface;
         const self: *Window = @ptrCast(@alignCast(data.?));
+        // The compositor disabled the text input with the focus; `enter` re-enables
+        // it from `text_input_spec`, which the app's focus still owns.
+        self.text_input_enabled = false;
+        self.pending_commit_len = 0;
         self.preedit_len = 0;
         self.preedit_cursor_begin = -1;
         self.preedit_cursor_end = -1;
@@ -1433,7 +1453,7 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         if (txt) |t| {
             const span = std.mem.span(t);
-            const len = @min(span.len, self.preedit_buf.len);
+            const len = utf8Prefix(span, self.preedit_buf.len);
             @memcpy(self.preedit_buf[0..len], span[0..len]);
             self.preedit_len = len;
         } else {
@@ -1448,7 +1468,7 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         if (txt) |t| {
             const span = std.mem.span(t);
-            const len = @min(span.len, self.pending_commit_buf.len);
+            const len = utf8Prefix(span, self.pending_commit_buf.len);
             @memcpy(self.pending_commit_buf[0..len], span[0..len]);
             self.pending_commit_len = len;
         } else {
@@ -1482,7 +1502,21 @@ pub const Window = struct {
         if (self.opts.on_preedit) |cb| {
             cb(self, self.preedit_buf[0..self.preedit_len], self.preedit_cursor_begin, self.preedit_cursor_end, self.opts.user);
         }
+        // Applied: the next batch starts from "no preedit" (text-input-v3: the
+        // preedit is pending state, absent from a batch = empty).
+        self.preedit_len = 0;
+        self.preedit_cursor_begin = -1;
+        self.preedit_cursor_end = -1;
         self.redrawAll();
+    }
+
+    /// The longest prefix of `s` that fits in `cap` bytes without splitting a UTF-8
+    /// sequence (an IME string over the buffer must not end in half a character).
+    fn utf8Prefix(s: []const u8, cap: usize) usize {
+        if (s.len <= cap) return s.len;
+        var n = cap;
+        while (n > 0 and s[n] & 0xC0 == 0x80) n -= 1; // back off continuation bytes
+        return n;
     }
 
     const PanelCoords = struct { px: f32, py: f32, w: f32, h: f32 };
@@ -2806,4 +2840,12 @@ fn addRoundedRegion(region: *wl.Region, margin: u32, pw: u32, ph: u32, radius: f
         region.add(m + inset, m + h - 1 - y, span, 1); // bottom arc row
     }
     if (h > 2 * rows) region.add(m, m + rows, w, h - 2 * rows);
+}
+
+test "an IME string over the buffer is cut on a character boundary" {
+    const s = "aé€"; // 1 + 2 + 3 bytes
+    try std.testing.expectEqual(@as(usize, 6), Window.utf8Prefix(s, 16));
+    try std.testing.expectEqual(@as(usize, 3), Window.utf8Prefix(s, 5)); // not inside '€'
+    try std.testing.expectEqual(@as(usize, 1), Window.utf8Prefix(s, 2)); // not inside 'é'
+    try std.testing.expectEqual(@as(usize, 0), Window.utf8Prefix("€", 2));
 }
