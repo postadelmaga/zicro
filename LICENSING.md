@@ -1,6 +1,7 @@
 # Licensing — zicro
 
-**zicro** (the micro-kernel + CPU-rasterized UI framework of the Frame stack) is **dual-licensed**. You may
+**zicro** (the micro-kernel + CPU-rasterized UI framework of the Frame stack), together with
+**zrame** (the window layer, in `zrame/`), is **dual-licensed**. You may
 use it under EITHER of the two licenses below — your choice.
 
 ## 1. Open source — GNU AGPL v3.0

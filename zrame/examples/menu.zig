@@ -61,11 +61,14 @@ const menu = [_]zrame.dbusmenu.Item{
         .{ .separator = true },
         .{ .label = "Quit", .on_click = onQuit },
     } },
-    .{ .label = "Edit", .children = &.{
-        .{ .label = "Cut", .on_click = onCut },
-        .{ .label = "Copy", .on_click = onCopy },
-        .{ .label = "Paste", .enabled = false }, // greyed out, no handler
-    } },
+    .{
+        .label = "Edit",
+        .children = &.{
+            .{ .label = "Cut", .on_click = onCut },
+            .{ .label = "Copy", .on_click = onCopy },
+            .{ .label = "Paste", .enabled = false }, // greyed out, no handler
+        },
+    },
     .{ .label = "Help", .children = &.{
         .{ .label = "About zrame", .on_click = onAbout },
     } },

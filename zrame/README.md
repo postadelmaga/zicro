@@ -3,7 +3,11 @@
 # ▢ zrame
 
 **The window layer of the Frame architecture — a cross-platform window for
-[zicro](../Zicro), in Zig.**
+[zicro](..), in Zig.**
+
+> zrame lives in the zicro repository (`zrame/`) and is published by its package as the
+> `zrame` module: `zicro_dep.module("zrame")`. It is built, tested and released together
+> with the zicro it sits on.
 
 zicro deliberately stops at the `FrameSink` contract ("the actual GPU/window backend is
 the app's job"). zrame is that backend, and it owns the OS: the app hands it a
@@ -20,7 +24,7 @@ adapters over zicro's own window for that platform. Same public API everywhere �
 
 ## Cross-platform by design
 
-zrame (and [zicro](../Zicro) beneath it) exist so that **Frame apps stay OS-agnostic**.
+zrame (and [zicro](..) beneath it) exist so that **Frame apps stay OS-agnostic**.
 The window is one type with a per-OS backend, selected at compile time — the same shape
 zicro uses for its own `Window`:
 
@@ -108,8 +112,10 @@ src/
 
 ## Try it
 
+From the repository root:
+
 ```sh
-zig build test         # unit tests (SDF, panel routing, scroll math, easing)
+zig build test         # unit tests, zicro's and zrame's (SDF, panel routing, scroll math, easing)
 zig build run-hello    # four styled glass windows with title-bar controls, drag/resize
 zig build run-frames   # 60 Hz plasma in the animated border band; Space cycles presets
 zig build run-scroll   # a long list with the thin fluid scrollbars
@@ -154,7 +160,7 @@ Requirements: Linux + Wayland, `libwayland-client`, `wayland-scanner`,
 
 `zrame` is **dual-licensed** — pick the one that fits you:
 
-- **Open source** · GNU **AGPL v3.0** (see [`LICENSE`](LICENSE)). Free to use, study and
+- **Open source** · GNU **AGPL v3.0** (see [`LICENSE`](../LICENSE)). Free to use, study and
   modify, but derivative works — **including services offered over a network** — must also be
   released under the AGPLv3 with complete source available.
 - **Commercial** · for use in a **proprietary / closed-source** product, without the AGPL

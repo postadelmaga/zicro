@@ -32,9 +32,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libwayland-dev wayland-protocols libasound2-dev \
-            libharfbuzz-dev libpipewire-0.3-dev mesa-vulkan-drivers
+            libharfbuzz-dev libpipewire-0.3-dev mesa-vulkan-drivers \
+            libxkbcommon-dev libsystemd-dev
       - name: Format
-        run: zig fmt --check build.zig src bench examples
+        run: zig fmt --check build.zig src bench examples zrame
       - name: Unit tests
         run: zig build test --test-timeout 300s --summary all
       # The WebGPU 2D backend draws, reads back and compares with the CPU canvas.
@@ -48,6 +49,10 @@ jobs:
         run: zig build android
       - name: Web (wasm32)
         run: zig build web
+      - name: zrame web (wasm32)
+        run: zig build web-zrame
+      - name: zrame Android compile-check (the runner's NDK)
+        run: zig build android-zrame -Dndk="$ANDROID_NDK_LATEST_HOME"
       - name: Benchmark (quick)
         run: zig build bench -- --quick
 

@@ -227,6 +227,157 @@ pub fn build(b: *std.Build) void {
     });
 
     addCheckZ(b, &text_c, target, optimize);
+    addZrame(b, &text_c, zicro, target, optimize, test_step);
+}
+
+/// zrame — the window layer (glass chrome, panels, menus, tray, IME) — lives in this
+/// repository under `zrame/` and is published from this package as the `zrame` module,
+/// importing THIS build's `zicro`: one zicro instance per consumer, no second package to
+/// keep in step. A consumer that wants the window layer does
+///
+///     const zicro_dep = b.dependency("zicro", .{ .target = target, .optimize = optimize });
+///     exe.root_module.addImport("zrame", zicro_dep.module("zrame"));
+///
+/// and takes the web/Android roots from `zicro_dep.builder.path("zrame/src/...")`.
+fn addZrame(
+    b: *std.Build,
+    text_c: *TextCCache,
+    zicro: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+) void {
+    const zrame = b.addModule("zrame", .{
+        .root_source_file = b.path("zrame/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zicro", .module = zicro }},
+    });
+    // The window transport is per-OS: Wayland on Linux (client-side glass chrome, sd-bus
+    // tray/menu, dmabuf video), a native GDI window on Windows. The Wayland protocol
+    // tables come with `zicro` (one source of truth, no duplicate interface symbols).
+    if (target.result.os.tag == .linux and target.result.abi != .android) {
+        zrame.linkSystemLibrary("wayland-client", .{});
+        // evdev code + compositor keymap → UTF-8 for `on_text` (FFI hand-declared in xkb.zig).
+        zrame.linkSystemLibrary("xkbcommon", .{});
+        // Tray (StatusNotifierItem) over sd-bus; FFI hand-declared, so only the library.
+        zrame.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
+    } else if (target.result.os.tag == .windows) {
+        zrame.linkSystemLibrary("user32", .{});
+        // GDI: the DIB section + memory DC behind the layered-window glass presentation.
+        zrame.linkSystemLibrary("gdi32", .{});
+    }
+
+    // Its tests run with zicro's: `zig build test` covers both modules.
+    const zrame_tests = b.addTest(.{ .root_module = zrame });
+    test_step.dependOn(&b.addRunArtifact(zrame_tests).step);
+
+    // Examples: `zig build run-hello`, `run-frames`, … `tray`, `menu` and `runtime` drive
+    // Linux-desktop-only surfaces (StatusNotifierItem, KDE global menu, the Wayland poll
+    // loop), so they build on Linux only.
+    const Example = struct {
+        fn add(bb: *std.Build, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, zr: *std.Build.Module, zi: *std.Build.Module, comptime name: []const u8) void {
+            const exe = bb.addExecutable(.{
+                .name = name,
+                .root_module = bb.createModule(.{
+                    .root_source_file = bb.path("zrame/examples/" ++ name ++ ".zig"),
+                    .target = t,
+                    .optimize = o,
+                    .imports = &.{
+                        .{ .name = "zrame", .module = zr },
+                        .{ .name = "zicro", .module = zi },
+                    },
+                }),
+            });
+            bb.installArtifact(exe);
+            const run_step = bb.step("run-" ++ name, "Run the zrame " ++ name ++ " example");
+            run_step.dependOn(&bb.addRunArtifact(exe).step);
+        }
+    };
+    const desktop_linux = target.result.os.tag == .linux and target.result.abi != .android;
+    inline for (.{ "hello", "frames", "scroll", "widgets" }) |name| Example.add(b, target, optimize, zrame, zicro, name);
+    if (desktop_linux) {
+        inline for (.{ "tray", "menu", "runtime" }) |name| Example.add(b, target, optimize, zrame, zicro, name);
+
+        // A loadable plugin built as a shared library, plus a host that dlopens it:
+        // `zig build run-plugin` (the host hardcodes a `.so` path: Linux only).
+        const clock = b.addLibrary(.{
+            .name = "zrame_clock",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("zrame/examples/plugin_clock.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zrame", .module = zrame }},
+            }),
+        });
+        b.installArtifact(clock);
+        const host_exe = b.addExecutable(.{
+            .name = "plugin_host",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("zrame/examples/plugin_host.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zrame", .module = zrame }},
+            }),
+        });
+        b.installArtifact(host_exe);
+        const host_run = b.addRunArtifact(host_exe);
+        host_run.step.dependOn(b.getInstallStep()); // it dlopens zig-out/lib/libzrame_clock.so
+        host_run.addPassthruArgs();
+        b.step("run-plugin", "Run the zrame dlopen plugin host example").dependOn(&host_run.step);
+    }
+
+    // `zig build web-zrame` — the glass window in a browser tab: zicro's web root (paint +
+    // text + the web Window backend) under zrame's web root (chrome + panels).
+    {
+        const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+        const zicro_web = b.createModule(.{
+            .root_source_file = b.path("src/web_root.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        });
+        text_c.attach(zicro_web, wasm_target, .small, .web);
+        const zrame_web = b.createModule(.{
+            .root_source_file = b.path("zrame/src/web_root.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zicro", .module = zicro_web }},
+        });
+        const web_exe = b.addExecutable(.{ .name = "zrame", .root_module = b.createModule(.{
+            .root_source_file = b.path("zrame/examples/web.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zrame", .module = zrame_web }},
+        }) });
+        web_exe.entry = .disabled;
+        web_exe.rdynamic = true;
+        const web_step = b.step("web-zrame", "Build the zrame WebAssembly glass-window demo into zig-out/web-zrame");
+        web_step.dependOn(&b.addInstallArtifact(web_exe, .{ .dest_dir = .{ .override = .{ .custom = "web-zrame" } } }).step);
+        web_step.dependOn(&b.addInstallFileWithDir(b.path("zrame/web/index.html"), .{ .custom = "web-zrame" }, "index.html").step);
+    }
+
+    // `zig build android-zrame -Dndk=<path>` — compile-check zrame's Android backend for
+    // aarch64-linux-android against zicro's Android root (stb from the NDK's bionic headers;
+    // the NDK path is explicit — Zig 0.17's configure cache does not track the environment).
+    {
+        const android_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android });
+        const zicro_android = b.createModule(.{
+            .root_source_file = b.path("src/android_root.zig"),
+            .target = android_target,
+            .optimize = .ReleaseSmall,
+        });
+        const ndk = b.option([]const u8, "ndk", "Android NDK path (required by `zig build android-zrame`)") orelse "";
+        _ = addTextCAndroid(b, zicro_android, android_target, .small, ndk, 24);
+        const and_obj = b.addObject(.{ .name = "zrame-android", .root_module = b.createModule(.{
+            .root_source_file = b.path("zrame/src/android_check.zig"),
+            .target = android_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zicro", .module = zicro_android }},
+        }) });
+        b.step("android-zrame", "Compile-check zrame's Android backend for aarch64-linux-android (-Dndk=<path>)").dependOn(&and_obj.step);
+    }
 }
 
 /// Everything a NATIVE zicro module links: the stb rasterizer plus the per-OS platform

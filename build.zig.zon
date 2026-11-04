@@ -87,6 +87,9 @@
         "src",
         "vendor",
         "examples",
+        "zrame",
         "README.md",
+        "LICENSE",
+        "LICENSING.md",
     },
 }
