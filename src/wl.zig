@@ -231,8 +231,16 @@ pub const Output = opaque {
         addListener(self, listener, data);
     }
 
+    /// `release` (opcode 0) exists only from wl_output v3; a v1/v2 output — bound on a
+    /// compositor that old, since the bind asks for `@min(ver, 4)` — has no destructor
+    /// request at all, and sending opcode 0 there is a protocol error. Destroy the proxy
+    /// locally instead.
     pub fn destroy(self: *Output) void {
-        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+        if (version(self) >= 3) {
+            _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+        } else {
+            wl_proxy_destroy(proxy(self));
+        }
     }
 };
 
@@ -600,6 +608,10 @@ pub const XdgWmBase = opaque {
     }
 };
 
+// Popups (xdg_positioner/xdg_popup) and the IME (zwp_text_input_v3, below): zicro's
+// own window does not use them — its Wayland window is the minimal shell surface — but
+// zrame's does (context menus, dropdowns, tooltips; `on_text`/`on_preedit`). They live
+// here so both windows share ONE set of protocol bindings.
 pub const XdgPositioner = opaque {
     pub fn destroy(self: *XdgPositioner) void {
         _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
