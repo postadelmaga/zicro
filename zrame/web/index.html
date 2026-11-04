@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>zrame · web</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0c12; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; outline: none; }
+  #err { position: fixed; inset: 0; display: none; place-content: center; color: #f78; font: 14px monospace; padding: 2rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+<div id="err"></div>
+<script type="module">
+// zicro on the web: the wasm module is a `zicro.window` app (on_draw/on_key/on_mouse).
+// This harness instantiates it, calls zicroBoot() once to open the window, then drives
+// requestAnimationFrame, blits the RGBA buffer with putImageData, and forwards DOM
+// pointer/wheel/keyboard events into the exported ABI the web Window backend owns.
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d", { alpha: false });
+const errEl = document.getElementById("err");
+const fail = (m) => { errEl.style.display = "grid"; errEl.textContent = "zicro web error:\n" + m; };
+
+let x, mem;
+try {
+  const { instance } = await WebAssembly.instantiateStreaming(fetch("zrame.wasm"), { env: {} });
+  x = instance.exports; mem = x.memory;
+  x.zicroBoot();
+} catch (e) { fail(String(e)); throw e; }
+
+// HiDPI: render into a PHYSICAL-pixel buffer (CSS size × devicePixelRatio) and hand the
+// ratio to the wasm side, which scales the widget theme so everything stays the right
+// visual size but crisp at native resolution. Pointer coords (CSS px) are ×dpr to match.
+let dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const cssW = Math.max(1, window.innerWidth | 0), cssH = Math.max(1, window.innerHeight | 0);
+  x.zicroResize(Math.round(cssW * dpr), Math.round(cssH * dpr), dpr);
+  canvas.width = x.zicroWidth();   // what the wasm side actually took (clamped to its buffer)
+  canvas.height = x.zicroHeight(); // CSS 100vw/100vh then displays it at the right size
+}
+window.addEventListener("resize", resize);
+resize();
+canvas.focus();
+if (x.zicroSetTouch) x.zicroSetTouch((navigator.maxTouchPoints > 0 || "ontouchstart" in window) ? 1 : 0);
+
+// --- pointer (CSS px → physical px) ---
+// A touch pointer goes to the shared gesture recognizer (zicroTouch: 0=down 1=move
+// 2=up/cancel) instead of the mouse ABI — one finger still drives on_mouse (the
+// recognizer forwards it), two fingers become a pinch (on_gesture).
+const pos = (e) => { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) * dpr, (e.clientY - r.top) * dpr]; };
+const isTouch = (e) => e.pointerType === "touch" && x.zicroTouch;
+canvas.addEventListener("pointermove", (e) => { const [px, py] = pos(e); if (isTouch(e)) { x.zicroTouch(e.pointerId, 1, px, py); return; } x.zicroPointerMove(px, py); });
+canvas.addEventListener("pointerdown", (e) => { canvas.focus(); const [px, py] = pos(e); if (isTouch(e)) { x.zicroTouch(e.pointerId, 0, px, py); return; } canvas.setPointerCapture(e.pointerId); x.zicroPointerMove(px, py); x.zicroPointerButton(272, 1); });
+canvas.addEventListener("pointerup",   (e) => { const [px, py] = pos(e); if (isTouch(e)) { x.zicroTouch(e.pointerId, 2, px, py); return; } x.zicroPointerMove(px, py); x.zicroPointerButton(272, 0); });
+canvas.addEventListener("pointercancel", (e) => { if (isTouch(e)) { const [px, py] = pos(e); x.zicroTouch(e.pointerId, 2, px, py); } });
+canvas.addEventListener("wheel", (e) => { e.preventDefault(); x.zicroScroll(-e.deltaY * dpr); }, { passive: false });
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// --- keyboard: physical key (event.code) → evdev code. The wasm side turns codes into
+// text via the same US-layout keymap the native windows use. ---
+const EVDEV = {
+  KeyA:30,KeyB:48,KeyC:46,KeyD:32,KeyE:18,KeyF:33,KeyG:34,KeyH:35,KeyI:23,KeyJ:36,KeyK:37,KeyL:38,KeyM:50,
+  KeyN:49,KeyO:24,KeyP:25,KeyQ:16,KeyR:19,KeyS:31,KeyT:20,KeyU:22,KeyV:47,KeyW:17,KeyX:45,KeyY:21,KeyZ:44,
+  Digit1:2,Digit2:3,Digit3:4,Digit4:5,Digit5:6,Digit6:7,Digit7:8,Digit8:9,Digit9:10,Digit0:11,
+  Space:57,Minus:12,Equal:13,Comma:51,Period:52,Slash:53,Semicolon:39,Quote:40,
+  BracketLeft:26,BracketRight:27,Backslash:43,Backquote:41,
+  Backspace:14,Tab:15,Enter:28,Escape:1,Delete:111,Home:102,End:107,
+  ArrowLeft:105,ArrowRight:106,ArrowUp:103,ArrowDown:108,
+  ShiftLeft:42,ShiftRight:54,
+};
+canvas.addEventListener("keydown", (e) => {
+  const code = EVDEV[e.code];
+  if (code === undefined) return;
+  if (e.code !== "F5" && e.code !== "F12") e.preventDefault();
+  x.zicroKey(code, 1);
+});
+canvas.addEventListener("keyup", (e) => {
+  const code = EVDEV[e.code];
+  if (code !== undefined) x.zicroKey(code, 0);
+});
+
+function frame(tMs) {
+  x.zicroFrame(tMs);
+  const w = x.zicroWidth(), h = x.zicroHeight();
+  if (w > 0 && h > 0) {
+    const bytes = new Uint8ClampedArray(mem.buffer, x.zicroPixels(), w * h * 4);
+    ctx.putImageData(new ImageData(bytes, w, h), 0, 0);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
