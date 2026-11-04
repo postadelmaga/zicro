@@ -91,6 +91,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// `margin` on every side.
     width: u32,
     height: u32,
+    /// The buffer is ARGB with per-pixel alpha (always, on Wayland; Win32 has an
+    /// opaque mode). Clients that paint their own background read it.
+    layered: bool = true,
     margin: u32 = 0,
     blur_shape: ?window.Blur = null,
     min_size: u32 = 0,
@@ -639,6 +642,17 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// Window-thread `requestClose`.
     pub fn close(self: *Window) void {
         self.closed = true;
+    }
+
+    /// Window-thread redraw request: the loop paints at the end of this turn.
+    pub fn scheduleRedraw(self: *Window) void {
+        self.needs_redraw = true;
+    }
+
+    /// `on_tick` at least every `ms` (0 = only when events arrive): the loop's poll
+    /// timeout. `on_tick` runs every loop turn regardless. Window thread.
+    pub fn setTick(self: *Window, ms: u32) void {
+        self.opts.tick_ms = ms;
     }
 
     /// Stage a straight-alpha RGBA frame for the default composition (centered over
@@ -2224,6 +2238,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (key < 256) self.held_keys.setValue(key, pressed);
         if (!pressed and key == self.repeat_key) self.cancelRepeat();
         if (t.opts.on_key) |cb| cb(t, key, state, t.opts.user);
+        t.inputRedraw();
         if (pressed) {
             self.armRepeat(key, t);
             self.emitText(t, key);
@@ -2277,6 +2292,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         while (i < @min(expirations, 8)) : (i += 1) {
             if (self.repeat_key == 0) break; // a callback released it
             if (t.opts.on_key) |cb| cb(t, self.repeat_key, wl.KEYBOARD_KEY_STATE_PRESSED, t.opts.user);
+            t.inputRedraw();
             self.emitText(t, self.repeat_key);
         }
     }
@@ -2374,6 +2390,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             }
         }
         if (t.opts.on_mouse) |cb| cb(t, .{ .kind = if (pressed) .press else .release, .x = self.pointer_x, .y = self.pointer_y, .button = button }, t.opts.user);
+        t.inputRedraw();
     }
 
     fn onPointerAxis(data: ?*anyopaque, _: *wl.Pointer, _: u32, axis: u32, value: wl.Fixed) callconv(.c) void {
@@ -2387,6 +2404,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             .scroll_dy = if (axis == 0) v else 0,
             .scroll_dx = if (axis == 1) v else 0,
         }, t.opts.user);
+        t.inputRedraw();
     }
 
     fn onPointerFrame(_: ?*anyopaque, _: *wl.Pointer) callconv(.c) void {}
@@ -2411,6 +2429,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     fn touchMouse(self: *Window, kind: window.MouseEvent.Kind) void {
         const t = self.touch_target orelse self;
         if (t.opts.on_mouse) |cb| cb(t, .{ .kind = kind, .x = self.pointer_x, .y = self.pointer_y, .button = if (kind == .motion) 0 else wl.BTN_LEFT }, t.opts.user);
+        if (kind != .motion) t.inputRedraw();
+    }
+
+    /// An `on_draw` client is immediate-mode: a key, a click or a scroll may have changed
+    /// what it draws, so the frame is redrawn after it (as on every backend). A client
+    /// with `on_compose` owns its damage and asks itself.
+    fn inputRedraw(self: *Window) void {
+        if (self.opts.on_compose == null) self.needs_redraw = true;
     }
 
     fn onTouchDown(data: ?*anyopaque, _: *wl.Touch, serial: u32, _: u32, surface: ?*wl.Surface, id: i32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {

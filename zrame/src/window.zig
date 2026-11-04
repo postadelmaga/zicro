@@ -4,16 +4,16 @@
 //!
 //! | os/target       | backend                | transport                                                          |
 //! |-----------------|-------------------------|---------------------------------------------------------------------|
-//! | linux (desktop) | `window_wayland.zig`    | glass chrome over zicro's Wayland window (frameless, compositor blur) |
-//! | windows         | `window_win32.zig`      | native decorated window, GDI blit                                 |
+//! | linux (desktop) | `window_native.zig`     | glass chrome over zicro's Wayland window (frameless, compositor blur) |
+//! | windows         | `window_native.zig`     | the same glass over zicro's Win32 window (frameless, layered GDI)  |
 //! | macos           | `window_cocoa.zig`      | thin adapter delegating to zicro's Cocoa window                   |
 //! | wasm            | `window_web.zig`        | thin adapter over zicro's web window, glass chrome in `<canvas>`  |
 //! | android         | `window_android.zig`    | thin adapter over zicro's NDK window                               |
 //!
 //! Every backend exposes the SAME core surface (`init`/`run`/`presentRgba`/`waitFrame`/
 //! `toggleFullscreen`/`setStyle`/`close` + the `panel_w`/`panel_h`/`closed` fields), so
-//! callers — and zrame's own `sink.zig` — are backend-agnostic; a handful of Linux-only
-//! extras (tray, dbusmenu, plugin dlopen) exist only on Wayland and are no-ops elsewhere.
+//! callers — and zrame's own `sink.zig` — are backend-agnostic; the Linux-only extras
+//! (tray, dbusmenu) exist only on Wayland and are no-ops elsewhere.
 //! `waitFrame(timeout_ms)` blocks any thread until the compositor's next frame callback
 //! (Wayland); other backends return false at once and callers fall back to their own
 //! software pacer.
@@ -98,7 +98,7 @@ pub fn physPxScale(scale: f32, logical_dp: u32) u32 {
 /// mutually import this file for the shared types below, so `*Window` in a callback
 /// signature is exactly the backend struct the caller receives.
 pub const Window = switch (builtin.os.tag) {
-    .windows => @import("window_win32.zig").Window,
+    .windows => @import("window_native.zig").Window,
     .macos => @import("window_cocoa.zig").Window,
     // WebAssembly: a thin adapter over zicro's web window that paints the glass chrome
     // into a browser <canvas>. (freestanding wasm falls here, not the Wayland else.)
@@ -107,7 +107,7 @@ pub const Window = switch (builtin.os.tag) {
     else if (builtin.abi == .android or builtin.abi == .androideabi)
         @import("window_android.zig").Window
     else
-        @import("window_wayland.zig").Window,
+        @import("window_native.zig").Window,
 };
 
 comptime {

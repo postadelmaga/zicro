@@ -1,27 +1,28 @@
-//! # zrame.window (Linux backend) — the glass window over zicro's Wayland window
+//! # zrame.window (Linux desktop + Windows) — the glass window over zicro's window
 //!
-//! The Wayland transport is zicro's (`zicro/src/window_wayland.zig`): connection, xdg
-//! toplevel, shm buffers, HiDPI, input, IME, popups, clipboard, the dmabuf video plane
-//! and frame pacing all live there, once for the whole stack. This file adds what zrame
-//! owns, exactly as the macOS / web / Android adapters do:
+//! The transport is zicro's: on Linux its Wayland window (connection, xdg toplevel, shm
+//! buffers, HiDPI, input, IME, popups, clipboard, the dmabuf video plane, frame pacing),
+//! on Windows its Win32 window (a frameless layered window, GDI presentation, input
+//! translated to the same evdev/Wayland vocabulary). Both expose the same contract, so
+//! this ONE file adds what zrame owns on either OS — as the macOS / web / Android
+//! adapters do over their zicro windows:
 //!
 //! - the frameless glass chrome (rounded panel, drop shadow in a transparent margin,
-//!   compositor blur), painted into the buffer zicro hands to `on_compose`, cached and
-//!   recomposed only where something changed;
+//!   compositor blur where there is one), painted into the buffer zicro hands to
+//!   `on_compose`, cached and recomposed only where something changed;
 //! - the panel stack (title bar, context menu, floating scrollbars, dlopen plugins),
-//!   which gets every input before the app and animates off its own timerfd;
+//!   which gets every input before the app and animates off zicro's tick;
 //! - the staged-frame mailbox behind `presentRgba`, app-space mouse coordinates, ESC
 //!   dismissal, the resize band and drag-to-move;
-//! - the Linux desktop integrations: StatusNotifierItem tray and the KDE global menu,
-//!   whose sd-bus fds zicro's loop polls.
+//! - on Linux, the desktop integrations: StatusNotifierItem tray and the KDE global
+//!   menu, whose sd-bus fds zicro's loop polls.
 //!
 //! Threading: as zicro — everything runs on the thread that calls `run`; `presentRgba`
 //! and the `request*` doors are safe from any thread.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
-const linux = std.os.linux;
 
 const zicro = @import("zicro");
 const wl = zicro.wl;
@@ -47,8 +48,18 @@ pub const DmabufPlane = facade.DmabufPlane;
 
 const chrome = @import("chrome.zig");
 
-/// zicro's Wayland window: the transport underneath.
+/// zicro's window: the transport underneath (Wayland or Win32).
 const Inner = zicro.window.Window;
+
+/// The tray and the global menu are sd-bus: Linux only.
+const is_linux = builtin.os.tag == .linux;
+const TrayT = if (is_linux) tray_mod.Tray else opaque {};
+const MenuT = if (is_linux) dbusmenu.Server else opaque {};
+const plugin_ext = switch (builtin.os.tag) {
+    .windows => ".dll",
+    .macos => ".dylib",
+    else => ".so",
+};
 
 pub const Window = struct {
     gpa: Allocator,
@@ -78,13 +89,12 @@ pub const Window = struct {
     /// Floating egui-style scrollbars, the bottom-most panel on every window; dormant
     /// until the app calls `win.scrollbars.setContent(w, h)`.
     scrollbars: scroll.Scroll = .{ .follow_content = true },
-    /// Beats the panel animation clock (~60 Hz) while a panel animates; disarmed when
-    /// everything settled, so an idle window blocks.
-    timer_fd: posix.fd_t = -1,
+    /// The panel animation clock (zicro's tick, ~60 Hz) runs while a panel animates and
+    /// stops once everything settled, so an idle window blocks.
     timer_armed: bool = false,
-    last_tick_ns: i64 = 0,
-    tray: ?*tray_mod.Tray = null,
-    menu: ?*dbusmenu.Server = null,
+    last_tick_ms: i64 = 0,
+    tray: ?*TrayT = null,
+    menu: ?*MenuT = null,
     /// dlopen'd plugin libraries, closed after the panels (their code lives inside).
     plugin_libs: std.ArrayList(std.DynLib) = .empty,
 
@@ -124,11 +134,6 @@ pub const Window = struct {
     };
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
-        const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
-        if (linux.errno(tfd) != .SUCCESS) return error.TimerFdFailed;
-        const timer_fd: posix.fd_t = @intCast(tfd);
-        errdefer _ = linux.close(timer_fd);
-
         const self = try gpa.create(Window);
         errdefer gpa.destroy(self);
         const min = 4 * opts.style.margin;
@@ -138,7 +143,6 @@ pub const Window = struct {
             .threaded = .init(gpa, .{}),
             .panel_w = @max(opts.width, min),
             .panel_h = @max(opts.height, min),
-            .timer_fd = timer_fd,
             .panels = plugin.Registry.init(gpa),
         };
         errdefer {
@@ -179,24 +183,29 @@ pub const Window = struct {
             .on_compose = innerCompose,
             .on_wake = innerWake,
             .on_configure = innerConfigure,
+            .on_tick = innerTick,
             .user = self,
         });
-        try self.inner.addPoller(.{ .fd = timer_fd, .ctx = self, .process = onTimerTick });
         return self;
     }
 
     pub fn deinit(self: *Window) void {
-        if (self.menu) |mnu| mnu.deinit();
-        if (self.tray) |t| t.deinit();
+        if (is_linux) {
+            if (self.menu) |mnu| mnu.deinit();
+            if (self.tray) |t| t.deinit();
+        }
         // Panels first (runs plugin `deinit`s), then the libraries that hold them.
         self.panels.deinit();
-        for (self.plugin_libs.items) |*lib| lib.close();
+        // This std's DynLib cannot close on Windows: the libraries stay mapped until
+        // exit, as they always have there.
+        if (builtin.os.tag != .windows) {
+            for (self.plugin_libs.items) |*lib| lib.close();
+        }
         self.plugin_libs.deinit(self.gpa);
         self.inner.deinit();
         if (self.font) |*f| f.deinit();
         if (self.decor.len > 0) self.gpa.free(self.decor);
         self.mailbox.deinit(self.gpa);
-        _ = linux.close(self.timer_fd);
         self.threaded.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
@@ -266,9 +275,20 @@ pub const Window = struct {
         return .{ .x = c.x, .y = c.y, .w = c.w - g, .h = c.h };
     }
 
-    /// The chrome style in buffer px (geometry fields only).
+    /// The chrome style in buffer px (geometry fields only). On an opaque window (Win32's
+    /// escape hatch) every mask/fade is zeroed: a square window wants no rounded clip.
     fn paintStyle(self: *const Window) Style {
         var s = self.opts.style;
+        if (!self.inner.layered) {
+            s.margin = 0;
+            s.corner_radius = 0;
+            s.content_radius = 0;
+            s.content_fade_width = 0;
+            s.corner_fade_width = 0;
+            s.edge_ring_alpha = 0;
+            s.border_anim_width = 0;
+            return s;
+        }
         s.margin = self.physPx(s.margin);
         s.corner_radius = self.physPxF(s.corner_radius);
         s.shadow_blur = self.physPxF(s.shadow_blur);
@@ -313,7 +333,7 @@ pub const Window = struct {
         self.inner.hideVideo();
     }
 
-    pub fn presentDmabuf(self: *Window, slot: u8, fd: posix.fd_t, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64) bool {
+    pub fn presentDmabuf(self: *Window, slot: u8, fd: i32, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64) bool {
         return self.inner.presentDmabuf(slot, fd, width, height, stride, fourcc, modifier);
     }
 
@@ -334,11 +354,13 @@ pub const Window = struct {
 
     /// The event loop: blocks until the window is closed or the connection drops.
     pub fn run(self: *Window) !void {
-        if (self.tray == null) {
-            if (self.opts.tray) |tc| self.setupTray(tc);
-        }
-        if (self.menu == null) {
-            if (self.opts.menu) |items| self.setupMenu(items);
+        if (is_linux) {
+            if (self.tray == null) {
+                if (self.opts.tray) |tc| self.setupTray(tc);
+            }
+            if (self.menu == null) {
+                if (self.opts.menu) |items| self.setupMenu(items);
+            }
         }
         defer self.closed = true;
         try self.inner.run();
@@ -396,7 +418,7 @@ pub const Window = struct {
     /// Any trigger other than a new app frame repaints everything.
     fn redrawAll(self: *Window) void {
         self.dirty_full = true;
-        self.inner.needs_redraw = true;
+        self.inner.scheduleRedraw();
     }
 
     // --- public API: text, panels, plugins -------------------------------------------------
@@ -441,7 +463,7 @@ pub const Window = struct {
         defer dir.close();
         var it = dir.iterate();
         while (try it.next()) |ent| {
-            if (ent.kind != .file or !std.mem.endsWith(u8, ent.name, ".so")) continue;
+            if (ent.kind != .file or !std.mem.endsWith(u8, ent.name, plugin_ext)) continue;
             const full = try std.fs.path.join(self.gpa, &.{ dir_path, ent.name });
             defer self.gpa.free(full);
             self.loadPlugin(full) catch |e| std.log.warn("zrame: plugin {s} failed to load: {}", .{ ent.name, e });
@@ -557,12 +579,12 @@ pub const Window = struct {
     }
 
     fn trayProcess(ctx: ?*anyopaque) void {
-        const t: *tray_mod.Tray = @ptrCast(@alignCast(ctx.?));
+        const t: *TrayT = @ptrCast(@alignCast(ctx.?));
         t.process();
     }
 
     fn trayFlush(ctx: ?*anyopaque) void {
-        const t: *tray_mod.Tray = @ptrCast(@alignCast(ctx.?));
+        const t: *TrayT = @ptrCast(@alignCast(ctx.?));
         t.flush();
     }
 
@@ -596,41 +618,36 @@ pub const Window = struct {
     }
 
     fn menuProcess(ctx: ?*anyopaque) void {
-        const s: *dbusmenu.Server = @ptrCast(@alignCast(ctx.?));
+        const s: *MenuT = @ptrCast(@alignCast(ctx.?));
         s.process();
     }
 
     fn menuFlush(ctx: ?*anyopaque) void {
-        const s: *dbusmenu.Server = @ptrCast(@alignCast(ctx.?));
+        const s: *MenuT = @ptrCast(@alignCast(ctx.?));
         s.flush();
     }
 
     // --- the panel animation clock ----------------------------------------------------------
 
-    fn monotonicNs() i64 {
-        var ts: linux.timespec = undefined;
-        _ = linux.clock_gettime(.MONOTONIC, &ts);
-        return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
-    }
-
-    /// Drain the timerfd, tick every panel with the real `dt`, repaint; disarm when
-    /// nothing animates any more.
-    fn onTimerTick(ctx: ?*anyopaque) void {
-        const self: *Window = @ptrCast(@alignCast(ctx.?));
-        var expirations: u64 = 0;
-        _ = posix.read(self.timer_fd, std.mem.asBytes(&expirations)) catch {};
-        const now = monotonicNs();
-        const dt: f32 = if (self.last_tick_ns != 0)
-            @min(@as(f32, @floatFromInt(now - self.last_tick_ns)) / 1_000_000_000.0, 0.1)
+    /// One tick of the panel clock: tick every panel with the real `dt`, repaint; stop
+    /// the clock when nothing animates any more. zicro may tick more often than asked
+    /// (on Wayland every loop turn): turns closer than 8 ms are skipped.
+    fn innerTick(win: *Inner, user: ?*anyopaque) void {
+        const self = from(win, user);
+        if (!self.timer_armed) return;
+        const now = zicro.time.monotonicMs();
+        if (self.last_tick_ms != 0 and now - self.last_tick_ms < 8) return;
+        const dt: f32 = if (self.last_tick_ms != 0)
+            @min(@as(f32, @floatFromInt(now - self.last_tick_ms)) / 1000.0, 0.1)
         else
             0.016;
-        self.last_tick_ns = now;
+        self.last_tick_ms = now;
         const active = self.panels.tick(dt, self.host());
         // Partial damage only if EVERY panel can declare its own area.
         switch (self.panels.dirtyBounds(self.host())) {
             .rect => |r| {
                 self.dirty_rect = if (self.dirty_rect) |cur| plugin.unionOf(cur, r) else r;
-                self.inner.needs_redraw = true;
+                win.scheduleRedraw();
             },
             .unknown => self.redrawAll(),
             .none => if (active) self.redrawAll(),
@@ -640,21 +657,16 @@ pub const Window = struct {
 
     fn armTimer(self: *Window) void {
         if (self.timer_armed) return;
-        const spec = linux.itimerspec{
-            .it_interval = .{ .sec = 0, .nsec = 16_666_667 },
-            .it_value = .{ .sec = 0, .nsec = 16_666_667 },
-        };
-        _ = linux.timerfd_settime(self.timer_fd, .{}, &spec, null);
         self.timer_armed = true;
-        self.last_tick_ns = monotonicNs();
+        self.last_tick_ms = zicro.time.monotonicMs();
+        self.inner.setTick(16); // ~60 Hz
     }
 
     fn disarmTimer(self: *Window) void {
         if (!self.timer_armed) return;
-        const spec = std.mem.zeroes(linux.itimerspec);
-        _ = linux.timerfd_settime(self.timer_fd, .{}, &spec, null);
         self.timer_armed = false;
-        self.last_tick_ns = 0;
+        self.last_tick_ms = 0;
+        self.inner.setTick(0);
     }
 
     /// Route an input event through the panels (true = a panel consumed it). Any input
@@ -704,6 +716,19 @@ pub const Window = struct {
     fn innerCompose(win: *Inner, pixels: []u32, bw: u32, bh: u32, region: ?zicro.window.PxRect, user: ?*anyopaque) void {
         const self = from(win, user);
         var canvas = paint.Canvas.init(pixels, bw, bh);
+        if (!self.inner.layered) {
+            // Opaque window: a flat background, no glass, no mask (see `paintStyle`).
+            if (region) |r0| {
+                const x1 = @min(bw, r0.x +| r0.w);
+                const y1 = @min(bh, r0.y +| r0.h);
+                if (r0.x >= x1 or r0.y >= y1) return;
+                var y: u32 = r0.y;
+                while (y < y1) : (y += 1) @memset(pixels[@as(usize, y) * bw + r0.x ..][0 .. x1 - r0.x], 0xFF141414);
+                _ = canvas.setClip(r0.x, r0.y, x1 - r0.x, y1 - r0.y);
+            } else @memset(pixels, 0xFF141414);
+            chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+            return;
+        }
         const stale = self.decor_dirty or self.decor.len != pixels.len or self.decor_scale != self.scaleFactor();
         if (region != null and !stale) {
             const r0 = region.?;
@@ -743,11 +768,11 @@ pub const Window = struct {
         if (self.mailbox.isFresh()) {
             // A new app frame: damage = its rect, derived after the swap.
             self.dirty_staged = true;
-            win.needs_redraw = true;
+            win.scheduleRedraw();
         } else if (video and self.opts.on_draw != null) {
             // A HUD over a live dmabuf video repaints at ~15 Hz, not at video rate: the
             // parent repaint shares this thread with input dispatch.
-            const now_ms = @divTrunc(monotonicNs(), 1_000_000);
+            const now_ms = zicro.time.monotonicMs();
             if (now_ms - self.last_overlay_ms >= 66) {
                 self.last_overlay_ms = now_ms;
                 self.redrawAll();

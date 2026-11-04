@@ -4,12 +4,13 @@
 //! frame mailbox (`Staged` + `SpinLock`, staged under `presentRgba`, swapped on the window
 //! thread) and the composition itself (`composeContent`: the app `on_draw` overlay, the
 //! newest staged content frame blitted into the content rect, then the panel stack on
-//! top). Both `window_wayland.zig` and `window_win32.zig` share this, so the one thing most
-//! likely to drift between platforms — *how a frame is composited* — lives in one place.
+//! top). Every adapter (`window_native.zig` for Wayland and Win32, the macOS / web /
+//! Android ones) shares this, so the one thing most likely to drift between platforms —
+//! *how a frame is composited* — lives in one place.
 //!
-//! Backends keep only the transport: acquiring a writable pixel buffer, filling its
-//! background (glass chrome on Wayland, an opaque fill on Win32), calling `composeContent`,
-//! and presenting the result however the OS allows.
+//! The transport — acquiring a writable pixel buffer, pumping events, presenting — is
+//! zicro's window on every OS; an adapter fills the background (glass chrome, or an
+//! opaque fill), calls `composeContent`, and hands the buffer back.
 
 const std = @import("std");
 const zicro = @import("zicro");

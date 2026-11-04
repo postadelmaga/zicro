@@ -119,7 +119,7 @@ pub const Options = struct {
     on_close: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
     /// Veto sulla chiusura chiesta dall'utente col pulsante della finestra: `false` la
     /// rifiuta (la finestra resta/torna visibile) e l'app chiuderà poi con `close()`.
-    /// Solo Cocoa per ora (Wayland/Win32 li gestisce zrame direttamente).
+    /// Cocoa, Wayland e Win32 (sul web/Android la chiusura è del sistema).
     on_close_request: ?*const fn (window: *Window, user: ?*anyopaque) bool = null,
     /// Layout-correct text of a key press (xkbcommon) or an IME commit: one UTF-8
     /// codepoint, `bytes[0..len]`. Additive to `on_key`. Wayland only for now.

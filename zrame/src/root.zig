@@ -6,7 +6,7 @@
 //! | file            | role                                                              |
 //! |-----------------|--------------------------------------------------------------------|
 //! | `window.zig`    | the public facade (`Options`/`MouseEvent`/`Style`) + per-OS dispatch |
-//! | `window_*.zig`  | the five backends (Wayland/Win32/Cocoa/web/Android), thin adapters over zicro's window |
+//! | `window_*.zig`  | the adapters over zicro's window: `window_native` (Wayland + Win32), Cocoa, web, Android |
 //! | `chrome.zig`    | shared composition: the frame mailbox, glass panel + content blit |
 //! | `plugin.zig`    | the `Panel`/`Host`/`Registry` extension seam (title bar, menu, scrollbars, dlopen plugins) |
 //! | `sink.zig`      | zicro `video.FrameSink` adapter                                  |

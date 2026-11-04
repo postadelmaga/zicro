@@ -14,9 +14,9 @@ the app's job"). zrame is that backend, and it owns the OS: the app hands it a
 premultiplied-ARGB frame and hooks `on_key` / `on_mouse` / `on_scroll`, and zrame does
 whatever each platform needs to put a window on screen. On Linux that's a frameless
 Wayland glass toplevel (rounded translucent chrome, drop shadow, real compositor blur)
-painted over zicro's Wayland window; on Windows it's a native decorated GDI window;
-macOS, the web and Android get thin adapters over zicro's own window for that
-platform. Same public API everywhere —
+painted over zicro's Wayland window; on Windows the same glass over zicro's frameless
+layered Win32 window; macOS, the web and Android get thin adapters over zicro's own
+window for that platform. Same public API everywhere —
 **apps built on zrame don't know which OS they're running on.**
 
 </div>
@@ -31,8 +31,8 @@ zicro uses for its own `Window`:
 
 | OS/target | backend               | how it presents                                             |
 |-----------|------------------------|-------------------------------------------------------------|
-| Linux     | `window_wayland.zig`   | glass chrome, panels, sd-bus tray + KDE global menu over zicro's Wayland window (which owns the protocol: input, IME, popups, clipboard, HiDPI, `ext-background-effect-v1` blur, dmabuf zero-copy video) |
-| Windows   | `window_win32.zig`     | native decorated, resizable window; the composed ARGB frame blitted via GDI (`SetDIBitsToDevice`) |
+| Linux     | `window_native.zig`    | glass chrome, panels, sd-bus tray + KDE global menu over zicro's Wayland window (which owns the protocol: input, IME, popups, clipboard, HiDPI, `ext-background-effect-v1` blur, dmabuf zero-copy video) |
+| Windows   | `window_native.zig`    | the same file over zicro's Win32 window: frameless layered window, per-pixel alpha via `UpdateLayeredWindow` (`ZRAME_OPAQUE=1`: opaque, fast under Wine) |
 | macOS     | `window_cocoa.zig`     | thin adapter delegating to zicro's own Cocoa `Window` backend — native decorations |
 | Web       | `window_web.zig`       | thin adapter over zicro's wasm canvas backend; the glass chrome paints into the `<canvas>` |
 | Android   | `window_android.zig`   | thin adapter over zicro's NDK `Window` backend               |
@@ -40,8 +40,8 @@ zicro uses for its own `Window`:
 The whole compositing pipeline — chrome, panels (title bar, context menu, floating
 scrollbars), fonts, animation — is pure-CPU and platform-independent (`composeFrame` is
 the documented seam). Only the *transport* differs: how each backend acquires a writable
-pixel buffer, pumps events, and presents — and on every OS but Windows that transport is
-zicro's window, so there is one Wayland implementation in the whole stack. Input is normalized so callbacks are identical
+pixel buffer, pumps events, and presents — and on every OS that transport is zicro's
+window, so there is one Wayland and one Win32 implementation in the whole stack. Input is normalized so callbacks are identical
 everywhere — Win32 `VK` codes are translated to the same evdev keycodes Wayland emits,
 wheel deltas to the same 1/256 axis units. Linux-desktop-only surfaces (tray, global
 menu, compositor blur) degrade to no-ops where the OS has no equivalent.
@@ -96,10 +96,10 @@ fractional-scale, appmenu…) is generated once, by zicro's `build.zig`. What li
 ```
 src/
   window.zig       the public facade (Options/MouseEvent/Style) + per-OS backend dispatch
-  window_wayland.zig / window_win32.zig / window_cocoa.zig / window_web.zig / window_android.zig
-                   the five backends — Win32 owns its transport; the other four are
-                   adapters over zicro's window for that OS (on Wayland: the chrome,
-                   the panels and the desktop integrations; the protocol is zicro's)
+  window_native.zig / window_cocoa.zig / window_web.zig / window_android.zig
+                   adapters over zicro's window for each OS — window_native serves
+                   Wayland and Win32 (the chrome, the panels, plugins, and on Linux the
+                   tray and global menu; the protocol is zicro's)
   chrome.zig       shared composition: the cross-thread frame mailbox, glass panel + content blit
   plugin.zig       the extension seam: Panel / Registry / Host, and the dlopen loader
   ui.zig           shared widget math (frame-rate-independent fades, easing)

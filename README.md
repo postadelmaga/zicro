@@ -81,7 +81,8 @@ src/
                      xkb text + key repeat, IME, popups, clipboard, dmabuf video,
                      frame pacing; zrame paints its glass chrome on top of it
   xkb.zig            hand-declared libxkbcommon FFI (keymap → UTF-8, repeat table)
-  window_win32.zig   Win32 backend (layered popup)                    (Windows)
+  window_win32.zig   THE Win32 window (Windows): frameless layered (per-pixel alpha)
+                     or framed, evdev keys, clipboard; zrame's glass paints on it
   wl.zig             hand-written Wayland client bindings  (xdg-shell via wayland-scanner)
   paint.zig          Canvas: software rasterizer          (rects, strokes, text blit)
   text.zig           stb_truetype font wrapper (Hack embedded)
