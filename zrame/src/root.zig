@@ -10,7 +10,7 @@
 //! | `chrome.zig`    | shared composition: the frame mailbox, glass panel + content blit |
 //! | `plugin.zig`    | the `Panel`/`Host`/`Registry` extension seam (title bar, menu, scrollbars, dlopen plugins) |
 //! | `sink.zig`      | zicro `video.FrameSink` adapter                                  |
-//! | `sdbus.zig`/`tray.zig`/`dbusmenu.zig`/`xkb.zig` | Linux-desktop-only integrations, Wayland backend only |
+//! | `sdbus.zig`/`tray.zig`/`dbusmenu.zig` | Linux-desktop-only integrations, Wayland backend only |
 //!
 //! `wl.zig`/`paint.zig`/`paint_gl.zig`/`text.zig`/`widget.zig` are re-exports of zicro's
 //! own modules (below) — zrame reuses the substrate rather than duplicating it.

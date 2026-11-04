@@ -4,7 +4,7 @@
 //!
 //! | os/target       | backend                | transport                                                          |
 //! |-----------------|-------------------------|---------------------------------------------------------------------|
-//! | linux (desktop) | `window_wayland.zig`    | frameless Wayland toplevel, client-side glass chrome, compositor blur |
+//! | linux (desktop) | `window_wayland.zig`    | glass chrome over zicro's Wayland window (frameless, compositor blur) |
 //! | windows         | `window_win32.zig`      | native decorated window, GDI blit                                 |
 //! | macos           | `window_cocoa.zig`      | thin adapter delegating to zicro's Cocoa window                   |
 //! | wasm            | `window_web.zig`        | thin adapter over zicro's web window, glass chrome in `<canvas>`  |
@@ -39,12 +39,7 @@ pub const TitlebarStyle = controls.Layout;
 pub const Rect = plugin.Rect;
 
 /// A single memory plane of a dmabuf GPU buffer export (fd, offset, stride, modifier).
-pub const DmabufPlane = struct {
-    fd: std.posix.fd_t,
-    offset: u32 = 0,
-    stride: u32,
-    modifier: u64 = 0,
-};
+pub const DmabufPlane = zicro.window.DmabufPlane;
 
 /// Device form factor, classified from the logical (dp) content width. Apps reflow
 /// their layout on this — collapse side panels, shrink the toolbar to essentials —

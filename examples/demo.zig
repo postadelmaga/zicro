@@ -318,7 +318,11 @@ fn onMouse(win: *window.Window, event: window.MouseEvent, user: ?*anyopaque) voi
         .motion => state.queue.push(.{ .motion = .{ .x = event.x, .y = event.y } }),
         .press => state.queue.push(.{ .button = .{ .button = event.button, .pressed = true } }),
         .release => state.queue.push(.{ .button = .{ .button = event.button, .pressed = false } }),
-        .scroll => state.queue.push(.{ .scroll = .{ .axis = 0, .px = event.scroll_dy * 24.0 } }),
+        .scroll => if (event.scroll_dx != 0)
+            state.queue.push(.{ .scroll = .{ .axis = 1, .px = event.scroll_dx * 24.0 } })
+        else
+            state.queue.push(.{ .scroll = .{ .axis = 0, .px = event.scroll_dy * 24.0 } }),
+        .leave => return,
     }
     win.requestRedraw();
 }

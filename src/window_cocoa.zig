@@ -457,6 +457,11 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         self.closed = true;
     }
 
+    /// Thread-safe `close`: the run loop polls `closed` every frame.
+    pub fn requestClose(self: *Window) void {
+        @atomicStore(bool, &self.closed, true, .release);
+    }
+
     /// Resize so the *content* area becomes w×h (the OS frame grows around it).
     pub fn setContentSize(self: *Window, w: u32, h: u32) void {
         const win = self.win orelse return;

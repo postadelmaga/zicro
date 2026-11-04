@@ -79,78 +79,10 @@ pub const Action = union(enum) {
     disable_text_input,
 };
 
-/// Platform-neutral popup specification.
-pub const PopupSpec = struct {
-    pub const Anchor = enum {
-        none,
-        top,
-        bottom,
-        left,
-        right,
-        top_left,
-        bottom_left,
-        top_right,
-        bottom_right,
-    };
-
-    pub const Gravity = enum {
-        none,
-        top,
-        bottom,
-        left,
-        right,
-        top_left,
-        bottom_left,
-        top_right,
-        bottom_right,
-    };
-
-    id: u32 = 0,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    anchor: Anchor = .none,
-    gravity: Gravity = .none,
-    grab: bool = true,
-};
-
-/// Platform-neutral IME/text input specification.
-pub const TextInputSpec = struct {
-    pub const Hint = struct {
-        completion: bool = false,
-        spellcheck: bool = false,
-        auto_capitalization: bool = false,
-        lowercase: bool = false,
-        uppercase: bool = false,
-        titlecase: bool = false,
-        hidden_text: bool = false,
-        sensitive_data: bool = false,
-        latin: bool = false,
-        multiline: bool = false,
-    };
-
-    pub const Purpose = enum {
-        normal,
-        alpha,
-        digits,
-        number,
-        phone,
-        url,
-        email,
-        name,
-        password,
-        pin,
-        terminal,
-    };
-
-    x: i32 = 0,
-    y: i32 = 0,
-    w: u32 = 0,
-    h: u32 = 0,
-    purpose: Purpose = .normal,
-    hint: Hint = .{},
-};
+/// Popup and IME requests are the window transport's types (zicro), shared by every
+/// backend.
+pub const PopupSpec = zicro.window.PopupSpec;
+pub const TextInputSpec = zicro.window.TextInputSpec;
 
 /// A snapshot of window geometry and state, handed to panels each draw/input so they can
 /// lay themselves out without holding a reference to the window.

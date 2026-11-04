@@ -14,15 +14,74 @@ pub const Rect = struct {
 /// A pointer event in surface (content) coordinates, y growing downward.
 pub const MouseEvent = struct {
     kind: Kind,
-    x: f32,
-    y: f32,
+    x: f32 = 0,
+    y: f32 = 0,
     /// evdev BTN_* code for press/release (272 = left, 273 = right, 274 = middle).
     button: u32 = 0,
     /// Vertical scroll amount for `.scroll` (positive = content up).
     scroll_dy: f32 = 0,
+    /// Horizontal scroll amount for `.scroll` (positive = content left). Wayland only
+    /// for now; the other backends leave it 0.
+    scroll_dx: f32 = 0,
 
-    pub const Kind = enum { motion, press, release, scroll };
+    /// `.leave`: the pointer left the window — drop hover state. No position.
+    pub const Kind = enum { motion, press, release, scroll, leave };
 };
+
+/// A single memory plane of a dmabuf GPU buffer export (fd, offset, stride, modifier).
+pub const DmabufPlane = struct {
+    fd: i32,
+    offset: u32 = 0,
+    stride: u32,
+    modifier: u64 = 0,
+};
+
+/// Platform-neutral popup (`xdg_popup` on Wayland): menus, tooltips, IME candidates.
+pub const PopupSpec = struct {
+    pub const Anchor = enum { none, top, bottom, left, right, top_left, bottom_left, top_right, bottom_right };
+    pub const Gravity = Anchor;
+
+    id: u32 = 0,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    anchor: Anchor = .none,
+    gravity: Gravity = .none,
+    grab: bool = true,
+};
+
+/// Platform-neutral IME request for the focused text field (`zwp_text_input_v3`).
+pub const TextInputSpec = struct {
+    pub const Hint = struct {
+        completion: bool = false,
+        spellcheck: bool = false,
+        auto_capitalization: bool = false,
+        lowercase: bool = false,
+        uppercase: bool = false,
+        titlecase: bool = false,
+        hidden_text: bool = false,
+        sensitive_data: bool = false,
+        latin: bool = false,
+        multiline: bool = false,
+    };
+
+    pub const Purpose = enum { normal, alpha, digits, number, phone, url, email, name, password, pin, terminal };
+
+    x: i32 = 0,
+    y: i32 = 0,
+    w: u32 = 0,
+    h: u32 = 0,
+    purpose: Purpose = .normal,
+    hint: Hint = .{},
+};
+
+/// A rectangle in buffer pixels (damage, video placement) — unsigned, unlike `Rect`.
+pub const PxRect = struct { x: u32, y: u32, w: u32, h: u32 };
+
+/// Compositor background blur over the window geometry: a rounded rectangle, inset
+/// `inset` px from the geometry's edges (Wayland `ext-background-effect-v1`).
+pub const Blur = struct { radius: f32 = 0, inset: f32 = 0 };
 
 pub const Options = struct {
     title: [:0]const u8 = "zicro-shell",
@@ -62,7 +121,48 @@ pub const Options = struct {
     /// rifiuta (la finestra resta/torna visibile) e l'app chiuderà poi con `close()`.
     /// Solo Cocoa per ora (Wayland/Win32 li gestisce zrame direttamente).
     on_close_request: ?*const fn (window: *Window, user: ?*anyopaque) bool = null,
+    /// Layout-correct text of a key press (xkbcommon) or an IME commit: one UTF-8
+    /// codepoint, `bytes[0..len]`. Additive to `on_key`. Wayland only for now.
+    on_text: ?*const fn (window: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void = null,
+    /// IME pre-edit (composition in progress): `text` is empty when it ends. Wayland only.
+    on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,
     user: ?*anyopaque = null,
+
+    // --- Wayland transport, for a client that paints its own chrome (zrame) -------------
+    // Other backends ignore these.
+
+    /// `xdg_toplevel.set_app_id` (the desktop-file id). Empty = not set.
+    app_id: [:0]const u8 = "",
+    /// Transparent gutter around the window geometry, in logical px (a client-side
+    /// shadow): the buffer grows by it on each side, the window geometry and the input
+    /// region do not. Change it at runtime with `setSurfaceShape`.
+    margin: u32 = 0,
+    /// Compositor blur behind the geometry, or none. See `setSurfaceShape`.
+    blur: ?Blur = null,
+    /// Minimum window geometry, logical px (0 = none).
+    min_size: u32 = 0,
+    /// Render at PHYSICAL resolution on scaled outputs (`wp_viewporter` +
+    /// `wp_fractional_scale_v1`): the canvas, `on_draw`'s rect and pointer coordinates
+    /// are then in buffer pixels. Off: the buffer is logical and the compositor scales it.
+    hidpi: bool = false,
+    /// Borderless windows resize from an 8 px band at their edge, with the matching
+    /// cursor. Off for a client that decides itself (zrame routes its panels first).
+    resize_band: bool = true,
+    /// A dmabuf frame is shown at its own size, centered in the video area, instead of
+    /// filling it (see `presentDmabufPlanes`).
+    video_native: bool = false,
+    /// Called on the window thread before a redraw picks its buffer: the client declares
+    /// what changed with `damage`/`damageAll` (no call = the whole buffer).
+    on_before_compose: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
+    /// Replaces the default composition (clear + `on_draw` + staged frame): paint
+    /// `pixels` (premultiplied ARGB, `width`×`height`). `region` null = all of it; else
+    /// only that rect needs repainting — the rest still holds this buffer's last frame.
+    on_compose: ?*const fn (window: *Window, pixels: []u32, width: u32, height: u32, region: ?PxRect, user: ?*anyopaque) void = null,
+    /// The loop was woken (`wake`, a staged frame, a dmabuf present): `video` = a dmabuf
+    /// frame was just committed. Window thread.
+    on_wake: ?*const fn (window: *Window, video: bool, user: ?*anyopaque) void = null,
+    /// After every `xdg_toplevel.configure` (size, fullscreen, maximized). Window thread.
+    on_configure: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
 };
 
 pub const Window = switch (builtin.os.tag) {

@@ -46,6 +46,10 @@ pub fn forwardMouse(self: anytype, event: anytype) void {
             if (self.opts.on_mouse) |cb| _ = cb(self, .{ .button = .{ .button = event.button, .state = @intFromBool(pressed) } }, self.opts.user);
         },
         .scroll => {}, // backend-specific scale — the caller handles this case itself
+        .leave => {
+            _ = self.panels.route(.leave, self.host());
+            if (self.opts.on_mouse) |cb| _ = cb(self, .leave, self.opts.user);
+        },
     }
 }
 

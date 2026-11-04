@@ -76,7 +76,11 @@ src/
 
   # graphics & windowing — a software-rendered shell (Wayland / Win32)
   window.zig         cross-platform Window facade         (selects the backend by OS)
-  window_wayland.zig Wayland backend (xdg-shell, SHM double-buffer)   (Linux)
+  window_wayland.zig THE Wayland window of the stack (Linux): xdg toplevel + children
+                     and subsurfaces on one connection, SHM double buffer, HiDPI,
+                     xkb text + key repeat, IME, popups, clipboard, dmabuf video,
+                     frame pacing; zrame paints its glass chrome on top of it
+  xkb.zig            hand-declared libxkbcommon FFI (keymap → UTF-8, repeat table)
   window_win32.zig   Win32 backend (layered popup)                    (Windows)
   wl.zig             hand-written Wayland client bindings  (xdg-shell via wayland-scanner)
   paint.zig          Canvas: software rasterizer          (rects, strokes, text blit)

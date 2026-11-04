@@ -141,7 +141,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_bench.step);
 
     // Examples: `zig build run-counter`, `zig build run-world_counter`, `zig build run-shell`.
-    inline for (.{ "counter", "world_counter", "shell", "demo", "gallery", "monitor" }) |name| {
+    inline for (.{ "counter", "world_counter", "shell", "demo", "gallery", "monitor", "multiwindow" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -254,13 +254,9 @@ fn addZrame(
         .link_libc = true,
         .imports = &.{.{ .name = "zicro", .module = zicro }},
     });
-    // The window transport is per-OS: Wayland on Linux (client-side glass chrome, sd-bus
-    // tray/menu, dmabuf video), a native GDI window on Windows. The Wayland protocol
-    // tables come with `zicro` (one source of truth, no duplicate interface symbols).
+    // On Linux the Wayland transport is zicro's window (linked with `zicro`); zrame adds
+    // the desktop integrations. On Windows zrame still owns a native GDI window.
     if (target.result.os.tag == .linux and target.result.abi != .android) {
-        zrame.linkSystemLibrary("wayland-client", .{});
-        // evdev code + compositor keymap → UTF-8 for `on_text` (FFI hand-declared in xkb.zig).
-        zrame.linkSystemLibrary("xkbcommon", .{});
         // Tray (StatusNotifierItem) over sd-bus; FFI hand-declared, so only the library.
         zrame.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
     } else if (target.result.os.tag == .windows) {
@@ -404,6 +400,9 @@ fn addNativeDeps(b: *std.Build, text_c: *TextCCache, mod: *std.Build.Module, tar
 
     if (features.wayland) {
         mod.linkSystemLibrary("wayland-client", .{});
+        // evdev code + compositor keymap → UTF-8 text and the key-repeat table of the
+        // Wayland window (FFI hand-declared in src/xkb.zig).
+        mod.linkSystemLibrary("xkbcommon", .{});
         // Wayland protocol glue, generated from the XMLs vendored in
         // vendor/wayland-protocols/ (MIT; system paths vary per distro — the appmenu
         // XML even required Qt6 dev files to be installed).

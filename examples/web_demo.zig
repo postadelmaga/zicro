@@ -96,6 +96,7 @@ fn onMouse(win: *window.Window, event: window.MouseEvent, user: ?*anyopaque) voi
         .press => s.queue.push(.{ .button = .{ .button = event.button, .pressed = true } }),
         .release => s.queue.push(.{ .button = .{ .button = event.button, .pressed = false } }),
         .scroll => s.queue.push(.{ .scroll = .{ .axis = 0, .px = event.scroll_dy } }),
+        .leave => return,
     }
     win.requestRedraw();
 }
