@@ -3,7 +3,7 @@
 The Z-Scenic backend (`src/window_z.zig`) speaks Z's protocol, which is versioned with
 Z, so CI builds against the exact commits named here, never "the default branch":
 
-- `z.ref` — Z commit (branch `zicro-window-protocol`) that has `surface_pointer`,
+- `z.ref` — Z commit (on `main`) that has `surface_pointer`,
   `rt.callWordsChecked`, the soft-float runtime and the `-Dzicro-only` KTEST lane.
 - `zart.ref` — Zart commit whose `zart_demo` is linked (`zig build zicro-apps`) and
   run (`darwin_zart`) against this Zicro.
