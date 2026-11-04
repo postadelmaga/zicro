@@ -704,9 +704,11 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
             },
             NSScrollWheel => {
                 const p = self.mouseAt(ev);
-                // deltaY > 0 = wheel up = content up, the same sign as the Wayland path.
+                // deltaY > 0 = wheel up: the stack's sign is the opposite (positive =
+                // scrolling down), and a line is about 40 axis units, as on Win32.
                 const dy: f32 = @floatCast(msgF64(ev, "deltaY"));
-                self.emitMouse(.{ .kind = .scroll, .x = p.x, .y = p.y, .scroll_dy = dy * 10.0 });
+                const dx: f32 = @floatCast(msgF64(ev, "deltaX"));
+                self.emitMouse(.{ .kind = .scroll, .x = p.x, .y = p.y, .scroll_dy = -dy * 40.0, .scroll_dx = -dx * 40.0 });
             },
             else => {},
         }

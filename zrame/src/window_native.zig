@@ -865,17 +865,21 @@ pub const Window = struct {
         return .{ .x = o.x, .y = o.y };
     }
 
+    /// A canvas-space event in the app's coordinates (see `MouseEvent`).
+    fn appEvent(self: *Window, ev: zicro.window.MouseEvent) zicro.window.MouseEvent {
+        const o = self.appOriginPx();
+        return chrome.appEvent(ev, o.x, o.y);
+    }
+
     fn innerMouse(win: *Inner, ev: zicro.window.MouseEvent, user: ?*anyopaque) void {
         const self = from(win, user);
         switch (ev.kind) {
             .motion => {
                 self.pointer_x = ev.x;
                 self.pointer_y = ev.y;
-                if (self.routeInput(.{ .motion = .{ .x = ev.x, .y = ev.y } })) return;
+                if (self.routeInput(chrome.panelEvent(ev))) return;
                 if (self.opts.on_mouse) |cb| {
-                    // APP coordinates (see `MouseEvent`): canvas minus the frame origin.
-                    const o = self.appOriginPx();
-                    if (cb(self, .{ .motion = .{ .x = ev.x - o.x, .y = ev.y - o.y } }, self.opts.user)) {
+                    if (cb(self, self.appEvent(ev), self.opts.user)) {
                         // The app owns this motion: no resize arrows over its widget.
                         win.setCursorShape(wl.CursorShapeDevice.SHAPE_DEFAULT);
                         return;
@@ -886,8 +890,10 @@ pub const Window = struct {
             },
             .press, .release => {
                 const pressed = ev.kind == .press;
-                const state: u32 = @intFromBool(pressed);
-                if (self.routeInput(.{ .button = .{ .x = self.pointer_x, .y = self.pointer_y, .button = ev.button, .pressed = pressed } })) return;
+                var at = ev;
+                at.x = self.pointer_x;
+                at.y = self.pointer_y;
+                if (self.routeInput(chrome.panelEvent(at))) return;
                 // The resize band is chrome: it wins over the app even when the content
                 // reaches the panel edge (else a frameless window could not be resized).
                 if (ev.button == wl.BTN_LEFT and pressed and !self.fullscreen and !self.maximized) {
@@ -899,7 +905,7 @@ pub const Window = struct {
                 }
                 if (self.opts.on_mouse) |cb| {
                     // Consumed (e.g. the app grabbed its scrollbar): no window move.
-                    if (cb(self, .{ .button = .{ .button = ev.button, .state = state } }, self.opts.user)) return;
+                    if (cb(self, self.appEvent(at), self.opts.user)) return;
                 }
                 if (ev.button == wl.BTN_LEFT and pressed and !self.opts.titlebar) {
                     // No title bar to grab: the panel drags from near its edge.
@@ -913,15 +919,16 @@ pub const Window = struct {
                 }
             },
             .scroll => {
-                const axis: u32 = if (ev.scroll_dx != 0) 1 else 0;
-                const v = if (axis == 1) ev.scroll_dx else ev.scroll_dy;
-                if (self.routeInput(.{ .axis = .{ .x = self.pointer_x, .y = self.pointer_y, .axis = axis, .value = v, .line = true } })) return;
-                if (self.opts.on_scroll) |cb| cb(self, axis, @intFromFloat(v * 256.0), self.opts.user);
+                var at = ev;
+                at.x = self.pointer_x;
+                at.y = self.pointer_y;
+                if (self.routeInput(chrome.panelEvent(at))) return;
+                if (self.opts.on_mouse) |cb| _ = cb(self, self.appEvent(at), self.opts.user);
             },
             .leave => {
                 // Every panel hears it (hover states fade out), then the app.
                 _ = self.routeInput(.leave);
-                if (self.opts.on_mouse) |cb| _ = cb(self, .leave, self.opts.user);
+                if (self.opts.on_mouse) |cb| _ = cb(self, .{ .kind = .leave }, self.opts.user);
             },
         }
     }

@@ -16,7 +16,7 @@
 //!   scroll offsets, text cursor). Widget identity is a hash of the label (or explicit
 //!   id) scoped by [`Ui.pushIdScope`] — two `button("Ok")` in different scopes are
 //!   distinct.
-//! * [`InputQueue`] adapts the window callbacks (`on_mouse`/`on_key`/`on_scroll`) to a
+//! * [`InputQueue`] adapts the window callbacks (`on_mouse`/`on_key`/`on_text`) to a
 //!   per-frame event slice; button presses use the last motion position (window button
 //!   events carry no position).
 //! * Layout is a cursor: vertical stack by default, [`Ui.beginRow`]/[`Ui.endRow`] for
@@ -90,8 +90,8 @@ pub const Rect = struct {
 pub const InputEvent = union(enum) {
     motion: struct { x: f32, y: f32 },
     button: struct { button: u32, pressed: bool },
-    /// `axis` 0 = vertical, 1 = horizontal; `px` is the scroll amount in pixels
-    /// (zrame's `on_scroll` delivers 1/256 units: divide before pushing).
+    /// `axis` 0 = vertical, 1 = horizontal; `px` is the scroll amount in pixels,
+    /// positive = scrolling down/right (`MouseEvent.scroll_dy`/`scroll_dx` as they come).
     scroll: struct { axis: u32, px: f32 },
     key: struct { code: u32, pressed: bool },
     /// Layout-aware text input (e.g. the window layer's xkbcommon `on_text`):

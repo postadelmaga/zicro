@@ -333,15 +333,6 @@ pub const Window = struct {
 
     fn innerMouse(_: *zicro.window.Window, event: zicro.window.MouseEvent, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        if (event.kind == .scroll) {
-            // zicro: scroll_dy > 0 = content up. The facade axis value matches the
-            // Wayland scale (1/256 px units, positive = content down) — same
-            // conversion as Win32's wheel handling.
-            const value_px = -event.scroll_dy * 4.0;
-            if (self.panels.route(.{ .axis = .{ .x = event.x, .y = event.y, .axis = 0, .value = value_px, .line = true } }, self.host())) return;
-            if (self.opts.on_scroll) |cb| cb(self, 0, @intFromFloat(value_px * 256.0), self.opts.user);
-            return;
-        }
         // App-space mouse (see `MouseEvent`): canvas minus the staged-frame/content
         // origin — panels and the resize band stay in canvas coordinates.
         chrome.forwardMouse(self, event);

@@ -209,11 +209,6 @@ pub const Window = struct {
 
     fn innerMouse(_: *zicro.window.Window, event: zicro.window.MouseEvent, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        if (event.kind == .scroll) {
-            if (self.panels.route(.{ .axis = .{ .x = event.x, .y = event.y, .axis = 0, .value = event.scroll_dy, .line = true } }, self.host())) return;
-            if (self.opts.on_scroll) |cb| cb(self, 0, @intFromFloat(event.scroll_dy * 256.0), self.opts.user);
-            return;
-        }
         chrome.forwardMouse(self, event);
     }
 

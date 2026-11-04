@@ -11,7 +11,7 @@
 
 zicro deliberately stops at the `FrameSink` contract ("the actual GPU/window backend is
 the app's job"). zrame is that backend, and it owns the OS: the app hands it a
-premultiplied-ARGB frame and hooks `on_key` / `on_mouse` / `on_scroll`, and zrame does
+premultiplied-ARGB frame and hooks `on_key` / `on_text` / `on_mouse`, and zrame does
 whatever each platform needs to put a window on screen. On Linux that's a frameless
 Wayland glass toplevel (rounded translucent chrome, drop shadow, real compositor blur)
 painted over zicro's Wayland window; on Windows the same glass over zicro's frameless
@@ -43,7 +43,8 @@ the documented seam). Only the *transport* differs: how each backend acquires a 
 pixel buffer, pumps events, and presents — and on every OS that transport is zicro's
 window, so there is one Wayland and one Win32 implementation in the whole stack. Input is normalized so callbacks are identical
 everywhere — Win32 `VK` codes are translated to the same evdev keycodes Wayland emits,
-wheel deltas to the same 1/256 axis units. Linux-desktop-only surfaces (tray, global
+wheel deltas to the same Wayland axis units, and the app's `on_mouse` gets zicro's own
+`MouseEvent`. Linux-desktop-only surfaces (tray, global
 menu, compositor blur) degrade to no-ops where the OS has no equivalent.
 
 ---
@@ -62,7 +63,7 @@ menu, compositor blur) degrade to no-ops where the OS has no equivalent.
 * **Honest window management** — xdg window geometry and the input region describe the
   *panel*, not the buffer: the shadow gutter doesn't catch clicks and doesn't count when
   the compositor tiles or snaps the window. Drag the title bar to move it, grab an edge to
-  resize it, Esc closes it (raw evdev keycodes — apps hook `Options.on_key` / `on_scroll`).
+  resize it, Esc closes it (raw evdev keycodes — apps hook `Options.on_key` / `on_mouse`).
 * **Window controls & context menu** — an optional client-side title bar with modern,
   procedural controls in two layouts: macOS traffic-lights (glyphs reveal on hover) or
   Material right-aligned min/max/close. Right-click opens a glass context menu

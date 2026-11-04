@@ -11,17 +11,21 @@ pub const Rect = struct {
     h: i32,
 };
 
-/// A pointer event in surface (content) coordinates, y growing downward.
+/// A pointer event — the ONE vocabulary of the stack: zicro's backends emit it and zrame
+/// delivers the same type to its apps (in the app's presentation space, see
+/// `zrame.MouseEvent`). Here: surface coordinates, y growing downward.
 pub const MouseEvent = struct {
     kind: Kind,
     x: f32 = 0,
     y: f32 = 0,
     /// evdev BTN_* code for press/release (272 = left, 273 = right, 274 = middle).
     button: u32 = 0,
-    /// Vertical scroll amount for `.scroll` (positive = content up).
+    /// Vertical scroll for `.scroll`, in Wayland axis units (about a pixel; a wheel
+    /// notch is 10–40). Positive = scrolling DOWN, the content moves up — the
+    /// `wl_pointer.axis` sign, on every backend.
     scroll_dy: f32 = 0,
-    /// Horizontal scroll amount for `.scroll` (positive = content left). Wayland only
-    /// for now; the other backends leave it 0.
+    /// Horizontal scroll for `.scroll`, same units; positive = scrolling right.
+    /// Wayland, Win32 and Cocoa; the web and Android leave it 0.
     scroll_dx: f32 = 0,
 
     /// `.leave`: the pointer left the window — drop hover state. No position.

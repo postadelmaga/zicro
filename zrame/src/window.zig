@@ -153,22 +153,19 @@ fn verifyWindowBackendContract(comptime W: type) void {
     }
 }
 
-/// Mouse events delivered to the app's `on_mouse` callback.
+/// Mouse events delivered to the app's `on_mouse` callback — zicro's own `MouseEvent`,
+/// the one pointer vocabulary of the stack (`kind` = motion / press / release / scroll /
+/// leave; `button` an evdev BTN_* code; `scroll_dy`/`scroll_dx` in Wayland axis units,
+/// positive = scrolling down/right). Every kind but `.leave` carries the pointer position.
 ///
-/// Motion coordinates are in the app's PRESENTATION space, not canvas space: the origin
+/// Coordinates are in the app's PRESENTATION space, not canvas space: the origin
 /// is the top-left of the frame the app last staged with `presentRgba` (zrame centers it
 /// in the content rect), or the content rect itself before any frame is staged. So an
 /// app hit-tests with the same coordinates it drew with, and never sees the shadow
 /// gutter, title bar, or frame-centering offsets — the client-coordinates contract of
 /// mainstream toolkits (Win32 client area, Cocoa view coords, SDL logical presentation).
 /// Chrome-space input (panels, resize bands) stays inside zrame in canvas coordinates.
-pub const MouseEvent = union(enum) {
-    motion: struct { x: f32, y: f32 },
-    button: struct { button: u32, state: u32 },
-    /// The pointer left the window surface: apps drop hover state (highlighted rows,
-    /// custom cursors). Carries no position.
-    leave,
-};
+pub const MouseEvent = zicro.window.MouseEvent;
 
 /// Multi-touch gesture recognized by the substrate (pinch, …). One finger arrives as a
 /// mouse event on `on_mouse`; two fingers land here. `scale` = incremental zoom ratio,
@@ -241,9 +238,7 @@ pub const Options = struct {
     /// indicate the selection/cursor bounds within preedit text. Wayland-only for now; a no-op
     /// on the other backends.
     on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,
-    /// Optional scroll handler (axis: 0 vertical / 1 horizontal, value in 1/256 units).
-    on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
-    /// Optional mouse event handler (motion, button clicks, leave). Motion coordinates
+    /// Optional mouse event handler (motion, press/release, scroll, leave). Coordinates
     /// are in the app's PRESENTATION space, not canvas space — see [`MouseEvent`]'s doc
     /// for the exact origin. Returns **true to consume** the event so the window skips
     /// its default handling.

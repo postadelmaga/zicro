@@ -19,39 +19,51 @@ const plugin = @import("plugin.zig");
 
 const Rect = plugin.Rect;
 
-/// Route a zicro mouse motion/press/release event through the panel stack, then — if no
-/// panel claimed it — into the app's `on_mouse`, converting motion into the app's
-/// presentation space (subtracting `appOrigin`). Shared by the web/android/macOS thin
-/// adapters, which are otherwise identical here; only `.scroll` is left to the caller,
-/// since each backend's `scroll_dy` is in a different unit (Wayland's wl_pointer.axis
-/// fixed-point vs. a browser/NDK raw delta).
+/// Route a zicro mouse event through the panel stack, then — if no panel claimed it —
+/// into the app's `on_mouse`, in the app's presentation space (see `appEvent`). Shared by
+/// the web/android/macOS thin adapters. Scroll units are zicro's on every backend.
 ///
 /// `self` is `*Window` for whichever backend calls this (comptime duck-typed): it needs
 /// `.panels`, `.host()`, `.opts.{on_mouse,user}`, `.contentRect()` and `.mailbox.front`, plus
 /// the optional `.pointer_x`/`.pointer_y` tracking fields some backends keep for other uses.
-pub fn forwardMouse(self: anytype, event: anytype) void {
+pub fn forwardMouse(self: anytype, event: zicro.window.MouseEvent) void {
     const Self = @TypeOf(self.*);
-    switch (event.kind) {
-        .motion => {
-            if (@hasField(Self, "pointer_x")) self.pointer_x = event.x;
-            if (@hasField(Self, "pointer_y")) self.pointer_y = event.y;
-            if (self.panels.route(.{ .motion = .{ .x = event.x, .y = event.y } }, self.host())) return;
-            if (self.opts.on_mouse) |cb| {
-                const o = appOrigin(self.contentRect(), &self.mailbox.front);
-                _ = cb(self, .{ .motion = .{ .x = event.x - o.x, .y = event.y - o.y } }, self.opts.user);
-            }
-        },
-        .press, .release => {
-            const pressed = event.kind == .press;
-            if (self.panels.route(.{ .button = .{ .x = event.x, .y = event.y, .button = event.button, .pressed = pressed } }, self.host())) return;
-            if (self.opts.on_mouse) |cb| _ = cb(self, .{ .button = .{ .button = event.button, .state = @intFromBool(pressed) } }, self.opts.user);
-        },
-        .scroll => {}, // backend-specific scale — the caller handles this case itself
-        .leave => {
-            _ = self.panels.route(.leave, self.host());
-            if (self.opts.on_mouse) |cb| _ = cb(self, .leave, self.opts.user);
-        },
+    if (event.kind == .motion) {
+        if (@hasField(Self, "pointer_x")) self.pointer_x = event.x;
+        if (@hasField(Self, "pointer_y")) self.pointer_y = event.y;
     }
+    if (event.kind == .leave) {
+        // Every panel hears it (hover states fade out), then the app.
+        _ = self.panels.route(.leave, self.host());
+    } else if (self.panels.route(panelEvent(event), self.host())) return;
+    if (self.opts.on_mouse) |cb| {
+        const o = appOrigin(self.contentRect(), &self.mailbox.front);
+        _ = cb(self, appEvent(event, o.x, o.y), self.opts.user);
+    }
+}
+
+/// The panel-seam form of a zicro mouse event (canvas coordinates).
+pub fn panelEvent(ev: zicro.window.MouseEvent) plugin.Event {
+    return switch (ev.kind) {
+        .motion => .{ .motion = .{ .x = ev.x, .y = ev.y } },
+        .press, .release => .{ .button = .{ .x = ev.x, .y = ev.y, .button = ev.button, .pressed = ev.kind == .press } },
+        .scroll => if (ev.scroll_dx != 0)
+            .{ .axis = .{ .x = ev.x, .y = ev.y, .axis = 1, .value = ev.scroll_dx, .line = true } }
+        else
+            .{ .axis = .{ .x = ev.x, .y = ev.y, .axis = 0, .value = ev.scroll_dy, .line = true } },
+        .leave => .leave,
+    };
+}
+
+/// The app's form of a canvas-space event: the same event, its position moved into the
+/// presentation space whose origin is (`ox`,`oy`) in the canvas.
+pub fn appEvent(ev: zicro.window.MouseEvent, ox: f32, oy: f32) zicro.window.MouseEvent {
+    var e = ev;
+    if (e.kind != .leave) {
+        e.x -= ox;
+        e.y -= oy;
+    }
+    return e;
 }
 
 /// Route a multi-touch gesture (pinch, …) from the shared `zicro.gesture` recognizer into

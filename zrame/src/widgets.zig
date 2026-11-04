@@ -63,7 +63,7 @@ pub const Widgets = struct {
         self.store.deinit();
     }
 
-    /// `base` window options (title/size/style/titlebar…) with the five callbacks
+    /// `base` window options (title/size/style/titlebar…) with the four callbacks
     /// and `user` overwritten to route through this host. Any callbacks already set
     /// on `base` are replaced.
     pub fn options(self: *Widgets, base: Options) Options {
@@ -73,7 +73,6 @@ pub const Widgets = struct {
         o.on_mouse = onMouse;
         o.on_key = onKey;
         o.on_text = onText;
-        o.on_scroll = onScroll;
         return o;
     }
 
@@ -124,12 +123,16 @@ fn onMouse(win: *Window, event: MouseEvent, user: ?*anyopaque) bool {
     // `on_mouse` delivers presentation-space coords; a no-frame app's presentation
     // origin is the content rect, and the Ui draws in canvas coords → add content.x/y.
     const c = win.host().info().content;
-    switch (event) {
-        .motion => |m| self.queue.push(.{ .motion = .{
-            .x = m.x + @as(f32, @floatFromInt(c.x)),
-            .y = m.y + @as(f32, @floatFromInt(c.y)),
+    switch (event.kind) {
+        .motion => self.queue.push(.{ .motion = .{
+            .x = event.x + @as(f32, @floatFromInt(c.x)),
+            .y = event.y + @as(f32, @floatFromInt(c.y)),
         } }),
-        .button => |b| self.queue.push(.{ .button = .{ .button = b.button, .pressed = b.state == 1 } }),
+        .press, .release => self.queue.push(.{ .button = .{ .button = event.button, .pressed = event.kind == .press } }),
+        .scroll => if (event.scroll_dx != 0)
+            self.queue.push(.{ .scroll = .{ .axis = 1, .px = event.scroll_dx } })
+        else
+            self.queue.push(.{ .scroll = .{ .axis = 0, .px = event.scroll_dy } }),
         // Pointer left: park it far away so hover clears (matches the widget contract).
         .leave => self.queue.push(.{ .motion = .{ .x = -1e9, .y = -1e9 } }),
     }
@@ -146,12 +149,6 @@ fn onKey(win: *Window, key: u32, state: u32, user: ?*anyopaque) void {
 fn onText(win: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void {
     const self: *Widgets = @ptrCast(@alignCast(user.?));
     self.queue.push(.{ .text = .{ .bytes = bytes, .len = len } });
-    win.host().do(.request_redraw);
-}
-
-fn onScroll(win: *Window, axis: u32, value: i32, user: ?*anyopaque) void {
-    const self: *Widgets = @ptrCast(@alignCast(user.?));
-    self.queue.push(.{ .scroll = .{ .axis = axis, .px = @as(f32, @floatFromInt(value)) / 256.0 } });
     win.host().do(.request_redraw);
 }
 

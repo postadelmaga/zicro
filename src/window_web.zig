@@ -180,8 +180,9 @@ export fn zicroPointerMove(x: f32, y: f32) void {
 export fn zicroPointerButton(button: u32, pressed: i32) void {
     dispatchMouse(.{ .kind = if (pressed != 0) .press else .release, .x = last_x, .y = last_y, .button = button });
 }
+/// `dy` is the page's `-deltaY` (positive = wheel up): flipped to the stack's sign.
 export fn zicroScroll(dy: f32) void {
-    dispatchMouse(.{ .kind = .scroll, .x = last_x, .y = last_y, .scroll_dy = dy });
+    dispatchMouse(.{ .kind = .scroll, .x = last_x, .y = last_y, .scroll_dy = -dy });
 }
 export fn zicroKey(code: u32, pressed: i32) void {
     const win = active orelse return;
