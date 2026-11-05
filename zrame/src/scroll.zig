@@ -20,6 +20,10 @@ const wl = zicro.wl;
 
 const Rect = plugin.Rect;
 
+/// The stack's wheel step and smoothing (see `zicro.scroll`).
+pub const wheel_gain = zicro.scroll.wheel_gain;
+pub const wheelBlend = zicro.scroll.wheelBlend;
+
 pub const Scroll = struct {
     inner: zicro.scroll.Scroll = .{},
     /// When true (auto-mounted by `Window`), the panel derives its `viewport` from the

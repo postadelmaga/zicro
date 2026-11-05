@@ -34,6 +34,7 @@ const std = @import("std");
 const paint = @import("paint.zig");
 const text = @import("text.zig");
 const anim = @import("anim.zig");
+const scroll = @import("scroll.zig");
 const keymap = @import("keymap.zig");
 
 pub const Color = paint.Color;
@@ -90,8 +91,9 @@ pub const Rect = struct {
 pub const InputEvent = union(enum) {
     motion: struct { x: f32, y: f32 },
     button: struct { button: u32, pressed: bool },
-    /// `axis` 0 = vertical, 1 = horizontal; `px` is the scroll amount in pixels,
+    /// `axis` 0 = vertical, 1 = horizontal; `px` is the wheel amount in axis units,
     /// positive = scrolling down/right (`MouseEvent.scroll_dy`/`scroll_dx` as they come).
+    /// The store turns it into pixels with `scroll.wheel_gain`, like every scroll area.
     scroll: struct { axis: u32, px: f32 },
     key: struct { code: u32, pressed: bool },
     /// Layout-aware text input (e.g. the window layer's xkbcommon `on_text`):
@@ -413,6 +415,8 @@ pub const Store = struct {
     left_pressed: bool = false,
     left_released: bool = false,
     right_pressed: bool = false,
+    /// Wheel pixels this frame (axis units × `scroll.wheel_gain`); a hovered scroll area
+    /// or open dropdown consumes it.
     wheel: f32 = 0,
 
     // keyboard state (frame-scoped chars/keys; persistent modifiers)
@@ -624,7 +628,7 @@ pub const Ui = struct {
                 }
             },
             .scroll => |s| {
-                if (s.axis == 0) store.wheel += s.px;
+                if (s.axis == 0) store.wheel += s.px * scroll.wheel_gain;
             },
             .key => |k| {
                 const sym = Key.fromEvdev(k.code);

@@ -45,8 +45,19 @@ const handle_activity: f32 = 0.85;
 // Kinetic friction (px/s²) and the speed below which motion snaps to rest (px/s).
 const friction: f32 = 1000.0;
 const stop_speed: f32 = 20.0;
-// Mouse-wheel gain: wl axis values are ~15/notch; a little gain gives a natural step.
-const wheel_gain: f32 = 2.4;
+/// The stack's one wheel step: pixels per wheel axis unit (`window.MouseEvent.scroll_dy`/
+/// `scroll_dx`, ~15 per notch, so a notch is ~36px). Every app scrolls content by this,
+/// so one notch moves the same distance everywhere. Pair it with [`wheelBlend`].
+pub const wheel_gain: f32 = 2.4;
+/// How long a wheel step takes to land: 90% of it in this many seconds.
+pub const wheel_settle_s: f32 = 0.1;
+
+/// The fraction of a pending wheel delta to apply in a frame of `dt` seconds — the
+/// low-pass every wheel scroll in the stack uses (90% lands in [`wheel_settle_s`],
+/// whatever the frame rate). `offset += wheelBlend(dt) * (target - offset)`.
+pub fn wheelBlend(dt: f32) f32 {
+    return 1.0 - std.math.pow(f32, 0.1, dt / wheel_settle_s);
+}
 
 pub const Scroll = struct {
     /// Scrollable region in canvas coords (app sets each frame). Bars sit at its edges.
@@ -241,12 +252,18 @@ pub const Scroll = struct {
         const d: u8 = @backingInt(axis);
         if (!self.inViewport(x, y) or self.maxOff(d) <= 0) return false;
         if (line) {
-            self.unprocessed[d] += value * wheel_gain; // smoothed in tick
+            self.wheel(axis, value);
         } else {
             self.offset[d] += value; // trackpad pixels: apply immediately
             self.clampOffsets();
         }
         return true;
+    }
+
+    /// A wheel step of `value` axis units on `axis`, with no hit test: for an owner that
+    /// already knows the wheel is for this area. Smoothed in `tick` like `onWheel`.
+    pub fn wheel(self: *Scroll, axis: Axis, value: f32) void {
+        self.unprocessed[@backingInt(axis)] += value * wheel_gain;
     }
 
     /// Primary-button press at `(x,y)`. Grabs a thumb (or jumps it under the cursor) if the
@@ -310,8 +327,7 @@ pub const Scroll = struct {
         var active = false;
         const off_before = self.offset;
 
-        // Wheel low-pass: reach 90% of the pending delta in 0.1s.
-        const t = 1.0 - std.math.pow(f32, 0.1, dt / 0.1);
+        const t = wheelBlend(dt);
         for (0..2) |i| {
             const d: u8 = @intCast(i);
             if (@abs(self.unprocessed[d]) >= 1.0) {
@@ -428,6 +444,19 @@ test "wheel notches smooth in over several ticks" {
     }
     try std.testing.expect(s.offset[1] > 0); // it moved
     try std.testing.expectEqual(@as(f32, 0), s.unprocessed[1]);
+}
+
+test "wheel: one step is wheel_gain px per axis unit, landing like onWheel" {
+    var a = testScroll();
+    var b = testScroll();
+    a.wheel(.vertical, 15); // no hit test
+    _ = b.onWheel(.vertical, 15, true, 100, 50);
+    try std.testing.expectEqual(15 * wheel_gain, a.unprocessed[1]);
+    try std.testing.expectEqual(a.unprocessed[1], b.unprocessed[1]);
+    // 90% of a step lands within wheel_settle_s, whatever the frame split.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), wheelBlend(wheel_settle_s), 1e-5);
+    const two_halves = 1 - (1 - wheelBlend(wheel_settle_s / 2)) * (1 - wheelBlend(wheel_settle_s / 2));
+    try std.testing.expectApproxEqAbs(wheelBlend(wheel_settle_s), two_halves, 1e-5);
 }
 
 test "both bars render when content overflows on both axes (h-bar not dropped)" {
