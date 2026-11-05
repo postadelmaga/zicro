@@ -2355,6 +2355,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.pointer_y = wl.fixedToF32(sy) * s;
         // A new serial: the shape must be re-sent even if unchanged.
         self.sendCursor(t.cursor_shape, true);
+        // The app learns where the pointer is now, not at its first move: hover and
+        // the wheel work on a window that appeared (or that the pointer entered) still.
+        if (t.opts.on_mouse) |cb| cb(t, .{ .kind = .motion, .x = self.pointer_x, .y = self.pointer_y }, t.opts.user);
     }
 
     fn onPointerLeave(data: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {

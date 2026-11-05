@@ -23,6 +23,9 @@ const Rect = plugin.Rect;
 /// The stack's wheel step and smoothing (see `zicro.scroll`).
 pub const wheel_gain = zicro.scroll.wheel_gain;
 pub const wheelBlend = zicro.scroll.wheelBlend;
+/// The bare primitive (no panel): for an app that drives a scroll area itself, on its
+/// own thread or canvas — same step, easing and floating bar as every other area.
+pub const Core = zicro.scroll.Scroll;
 
 pub const Scroll = struct {
     inner: zicro.scroll.Scroll = .{},

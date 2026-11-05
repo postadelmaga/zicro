@@ -66,6 +66,16 @@ pub fn nowMs() i64 {
 /// Widget identity: 0 = none, 1 = the "ground" (a press that hit no widget).
 pub const Id = u64;
 const ground_id: Id = 1;
+/// Seed of the root id scope (what `makeId` hashes labels with outside any scope).
+const root_scope: Id = 0x5a656e_464c4f57;
+
+/// Id of a widget labelled `label` at the root scope — what `Ui.makeId` returns
+/// outside any `pushIdScope`. For code outside a frame (resetting a scroll region
+/// when a panel opens, say).
+pub fn rootId(label: []const u8) Id {
+    const h = std.hash.Wyhash.hash(root_scope, label);
+    return if (h < 2) h + 2 else h; // 0 and 1 are reserved sentinels
+}
 
 /// Id of the scroll region inside widget `id` (its own id, so grabbing the bar is
 /// not a press on the widget).
@@ -503,6 +513,11 @@ pub const Store = struct {
         s.scrolls.deinit(s.gpa);
     }
 
+    /// Forget scroll region `id`: next frame it starts at the top.
+    pub fn resetScroll(s: *Store, id: Id) void {
+        _ = s.scrolls.remove(id);
+    }
+
     /// True while a text field/area owns the keyboard — apps should skip their
     /// own shortcut handling then. (A Tab-focused control does not claim it.)
     pub fn wantsKeyboard(s: *const Store) bool {
@@ -803,7 +818,7 @@ pub const Ui = struct {
             .avail_w = bounds.w - 2 * theme.window_pad,
         };
         ui.depth = 1;
-        ui.id_scopes[0] = 0x5a656e_464c4f57; // root seed
+        ui.id_scopes[0] = root_scope;
         ui.scope_depth = 1;
         return ui;
     }
@@ -1799,7 +1814,7 @@ pub const Ui = struct {
 
         // Wheel (when hovered) and the floating bar, like every scroll area.
         ui.canvas.clip = saved;
-        ui.scrollRegionEnd(sid);
+        ui.scrollRegionEnd(sid, null);
         return result;
     }
 
@@ -2293,11 +2308,13 @@ pub const Ui = struct {
         return sc.scrollY();
     }
 
-    /// Closes a [`scrollRegion`]: if the pointer is over it and it can scroll, it takes
-    /// the wheel no inner region took; then draws its bar.
-    pub fn scrollRegionEnd(ui: *Ui, id: Id) void {
+    /// Closes a [`scrollRegion`]: `content_h` (when given) is the content just laid out;
+    /// if the pointer is over the region and it can scroll, it takes the wheel no inner
+    /// region took; then draws its bar.
+    pub fn scrollRegionEnd(ui: *Ui, id: Id, content_h: ?f32) void {
         const s = ui.store;
         const sc = s.scrolls.getPtr(id) orelse return;
+        if (content_h) |ch| sc.setContent(sc.viewport.w, ch);
         const v = sc.viewport;
         const over = Rect{ .x = v.x, .y = v.y, .w = v.w, .h = v.h };
         if (s.wheel != 0 and sc.maxScroll(.vertical) > 0 and ui.scrollPointer() and over.contains(s.mouse_x, s.mouse_y)) {
@@ -2383,8 +2400,7 @@ pub const Ui = struct {
         // when hovered and draw its bar.
         ui.clip = saved.rect;
         ui.canvas.clip = saved.canvas;
-        if (ui.store.scrolls.getPtr(id)) |sc| sc.setContent(vp.w, content_h);
-        ui.scrollRegionEnd(id);
+        ui.scrollRegionEnd(id, content_h);
 
         // Advance the parent cursor past the viewport.
         c.y += viewport_h + t.gap;
