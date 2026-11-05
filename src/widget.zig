@@ -67,6 +67,12 @@ pub fn nowMs() i64 {
 pub const Id = u64;
 const ground_id: Id = 1;
 
+/// Id of the scroll region inside widget `id` (its own id, so grabbing the bar is
+/// not a press on the widget).
+fn scrollId(id: Id) Id {
+    return id ^ 0x9e37_79b9_7f4a_7c15;
+}
+
 pub const Rect = struct {
     x: f32 = 0,
     y: f32 = 0,
@@ -463,7 +469,8 @@ pub const Store = struct {
     dd_panel: Rect = .{},
     dd_rects: std.ArrayList(Rect) = .empty,
     dd_pending: ?usize = null,
-    dd_scroll: f32 = 0,
+    /// The open list's scroll (the stack's `scroll.Scroll`, like every scroll area).
+    dd_sc: scroll.Scroll = .{},
     /// Keyboard highlight while the overlay is open (arrows move it, Enter picks it).
     dd_hover: ?usize = null,
     dd_ensure_visible: bool = false,
@@ -478,7 +485,8 @@ pub const Store = struct {
 
     /// Animation value + the generation of the last frame it was touched (for the GC).
     anims: std.AutoHashMapUnmanaged(Id, AnimEntry) = .empty,
-    scrolls: std.AutoHashMapUnmanaged(Id, f32) = .empty,
+    /// One `scroll.Scroll` per scroll region ([`Ui.scrollRegion`], scroll areas, text areas).
+    scrolls: std.AutoHashMapUnmanaged(Id, scroll.Scroll) = .empty,
     /// Monotonic frame counter; `anims` entries with a different `gen` are pruned in `end()`.
     frame_gen: u64 = 0,
 
@@ -719,13 +727,16 @@ pub const Ui = struct {
             // Wheel over the open panel scrolls the list, not what's underneath.
             const in_panel = store.dd_panel.contains(store.mouse_x, store.mouse_y);
             if (store.wheel != 0) {
-                store.dd_scroll += store.wheel; // clamped in dropdown(), where content height is known
+                store.dd_sc.wheelPx(.vertical, store.wheel); // eased and clamped in dropdown()
                 store.wheel = 0;
             }
+            _ = store.dd_sc.onMotion(store.mouse_x, store.mouse_y); // bar hover / thumb drag
 
             if (store.left_pressed) {
                 var hit = false;
-                if (in_panel) {
+                if (in_panel and store.dd_sc.onButtonDown(store.mouse_x, store.mouse_y)) {
+                    hit = true; // grabbed the list's scrollbar
+                } else if (in_panel) {
                     for (store.dd_rects.items, 0..) |r, i| {
                         if (r.contains(store.mouse_x, store.mouse_y)) {
                             store.dd_pending = i;
@@ -742,6 +753,7 @@ pub const Ui = struct {
                 if (hit) store.left_pressed = false; // consumed
             }
         }
+        if (store.left_released) _ = store.dd_sc.onButtonUp();
 
         // Tab / Shift+Tab: focus traversal. Consumed here; satisfied by the
         // focusables laid out this frame (navFocusHook), wrap resolved in end().
@@ -1676,7 +1688,9 @@ pub const Ui = struct {
         const line_h: f32 = @floatFromInt(ui.font.lineHeight(t.font_size, .regular));
         const pad_y: f32 = t.s(6);
 
-        var off = s.scrolls.get(id) orelse 0;
+        // The stack's scroll on its own id (its bar's drag must not move the caret).
+        const sid = scrollId(id);
+        const off = ui.scrollRegion(sid, r, null);
 
         if (sig.pressed) {
             if (!focused) {
@@ -1712,27 +1726,23 @@ pub const Ui = struct {
         const had_keys = s.keys_len > 0 or s.text_ops_len > 0;
         if (s.focus == id) result = ui.editText(buf, true);
 
-        // Scroll: wheel when hovered; editing keeps the caret line in view.
+        // Scroll: the content is the text; editing keeps the caret line in view.
         var n_lines: f32 = 1;
         for (buf.items) |c| {
             if (c == '\n') n_lines += 1;
         }
-        const max_off = @max(0, n_lines * line_h + 2 * pad_y - h);
-        if (sig.hovered and s.wheel != 0) {
-            off += s.wheel;
-            s.wheel = 0; // consumed
-        }
-        if (s.focus == id and had_keys) {
-            var caret_line: f32 = 0;
-            for (buf.items[0..s.text_cursor]) |c| {
-                if (c == '\n') caret_line += 1;
+        if (s.scrolls.getPtr(sid)) |sc| {
+            sc.setContent(r.w, n_lines * line_h + 2 * pad_y);
+            if (s.focus == id and had_keys) {
+                var caret_line: f32 = 0;
+                for (buf.items[0..s.text_cursor]) |c| {
+                    if (c == '\n') caret_line += 1;
+                }
+                const cy = caret_line * line_h; // content-space top of the caret line (pad excluded)
+                sc.reveal(.vertical, cy, cy + line_h + 2 * pad_y);
+                ui.animating = true;
             }
-            const cy = pad_y + caret_line * line_h;
-            if (cy - off < pad_y) off = cy - pad_y;
-            if (cy + line_h - off > h - pad_y) off = cy + line_h - (h - pad_y);
         }
-        off = std.math.clamp(off, 0, max_off);
-        s.scrolls.put(s.gpa, id, off) catch {};
 
         // draw
         const ht = ui.hoverT(id, sig.hovered);
@@ -1787,25 +1797,10 @@ pub const Ui = struct {
             li += 1;
         }
 
-        // Thin scrollbar like the scroll area's.
-        if (max_off > 0) {
-            const content_h = n_lines * line_h + 2 * pad_y;
-            ui.drawThinScrollbar(r.x + r.w - t.scrollbar_w, r.y, r.h, content_h, off, if (sig.hovered) 0.35 else 0.18);
-        }
+        // Wheel (when hovered) and the floating bar, like every scroll area.
+        ui.canvas.clip = saved;
+        ui.scrollRegionEnd(sid);
         return result;
-    }
-
-    /// Thin scrollbar thumb, the shape shared by `textArea`, the dropdown overlay and
-    /// `endScroll`: a `4`-wide rounded track at `x`, spanning `span` pixels starting at
-    /// `y`, sized against `content_h` and positioned by `off` (0..`content_h - span`).
-    /// Callers guard the zero-scroll case themselves (skip the call when nothing scrolls).
-    fn drawThinScrollbar(ui: *Ui, x: f32, y: f32, span: f32, content_h: f32, off: f32, alpha: f32) void {
-        const t = ui.theme;
-        const track_h = span - t.s(4);
-        const thumb_h = @max(t.scrollbar_thumb_min, track_h * span / content_h);
-        const max_off = @max(1, content_h - span); // guard: callers only call when > 0
-        const ty = y + t.s(2) + (track_h - thumb_h) * (off / max_off);
-        ui.canvas.fillRoundedRect(x, ty, t.s(4), thumb_h, t.s(2), Color.rgba(255, 255, 255, alpha));
     }
 
     /// Byte offset for a click at content-space `(x, y)` (y includes the scroll).
@@ -2084,7 +2079,7 @@ pub const Ui = struct {
                 s.dd_hover = null;
             } else {
                 s.dd_open = id;
-                s.dd_scroll = 0;
+                s.dd_sc = .{};
                 s.dd_hover = if (options.len > 0) selected.* else null;
                 s.dd_ensure_visible = true; // scroll the current selection into view
             }
@@ -2117,18 +2112,22 @@ pub const Ui = struct {
             if (oy + oh > ui.bounds.y + ui.bounds.h) oy = @max(ui.bounds.y, r.y - oh - pad);
             const orect = Rect{ .x = r.x, .y = oy, .w = r.w, .h = oh };
 
-            // Long lists scroll inside the panel; keep the keyboard highlight in view.
-            const max_scroll = @max(0, content_h - oh);
+            // Long lists scroll inside the panel (the stack's scroll); keep the keyboard
+            // highlight in view — a list that just opened lands on it at once.
+            const sc = &s.dd_sc;
+            sc.setViewport(.{ .x = orect.x, .y = orect.y, .w = orect.w, .h = oh });
+            sc.setContent(orect.w, content_h);
             if (s.dd_ensure_visible) {
                 if (s.dd_hover) |hi| {
-                    const iy = pad + @as(f32, @floatFromInt(hi)) * t.ctl_h; // content-space top
-                    if (iy - s.dd_scroll < pad) s.dd_scroll = iy - pad;
-                    if (iy + t.ctl_h - s.dd_scroll > oh - pad) s.dd_scroll = iy + t.ctl_h - (oh - pad);
+                    const iy = @as(f32, @floatFromInt(hi)) * t.ctl_h; // content-space top (pad excluded)
+                    sc.reveal(.vertical, iy, iy + t.ctl_h + 2 * pad);
+                    if (sig.clicked) sc.settle();
                 }
                 s.dd_ensure_visible = false;
             }
-            s.dd_scroll = std.math.clamp(s.dd_scroll, 0, max_scroll);
-            const gutter: f32 = if (max_scroll > 0) t.scrollbar_w else 0;
+            if (sc.tick(ui.dt)) ui.animating = true;
+            const dd_off = sc.scrollY();
+            const gutter: f32 = if (sc.maxScroll(.vertical) > 0) t.scrollbar_w else 0;
 
             s.dd_owner = r;
             s.dd_panel = orect;
@@ -2136,7 +2135,7 @@ pub const Ui = struct {
             for (options, 0..) |_, i| {
                 s.dd_rects.append(s.gpa, .{
                     .x = orect.x + pad,
-                    .y = orect.y + pad + @as(f32, @floatFromInt(i)) * t.ctl_h - s.dd_scroll,
+                    .y = orect.y + pad + @as(f32, @floatFromInt(i)) * t.ctl_h - dd_off,
                     .w = orect.w - 2 * pad - gutter,
                     .h = t.ctl_h,
                 }) catch break;
@@ -2182,10 +2181,8 @@ pub const Ui = struct {
             ui.drawTextIn(inner, dd.options[i], .left, t.font_size, .regular, t.text);
         }
 
-        // Thin scrollbar, same look as endScroll's.
-        if (dd.content_h > dd.rect.h) {
-            ui.drawThinScrollbar(dd.rect.x + dd.rect.w - t.scrollbar_w, dd.rect.y, dd.rect.h, dd.content_h, ui.store.dd_scroll, 0.25);
-        }
+        // The stack's floating scrollbar, like every scroll area.
+        ui.store.dd_sc.draw(ui.canvas);
     }
 
     // --- tooltip ---------------------------------------------------------------------------------------
@@ -2273,14 +2270,75 @@ pub const Ui = struct {
 
     // --- scroll area ---------------------------------------------------------------------------------------
 
-    /// Clipped, wheel-scrollable vertical region of fixed viewport height. Content is
-    /// laid out normally inside; [`endScroll`] clamps the offset, draws a thin
-    /// scrollbar and consumes the wheel when hovered.
+    /// The stack's scroll ([`scroll.Scroll`]: wheel step and easing, a floating bar with
+    /// hover and thumb drag) for the region `id` at `vp`, fed this frame's pointer and
+    /// advanced by `dt`. `content_h` is the content height (null = keep last frame's,
+    /// for content measured as it is laid out). Returns the vertical offset to draw the
+    /// content at; call [`scrollRegionEnd`] after the content. For a region at an
+    /// absolute rect; [`beginScroll`] wraps it into the cursor layout.
+    pub fn scrollRegion(ui: *Ui, id: Id, vp: Rect, content_h: ?f32) f32 {
+        const s = ui.store;
+        const gop = s.scrolls.getOrPut(s.gpa, id) catch return 0;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const sc = gop.value_ptr;
+        sc.setViewport(.{ .x = vp.x, .y = vp.y, .w = vp.w, .h = vp.h });
+        if (content_h) |ch| sc.setContent(vp.w, ch);
+        if (ui.scrollPointer()) {
+            _ = sc.onMotion(s.mouse_x, s.mouse_y);
+            // A press on the bar grabs it: no widget under it sees the press.
+            if (s.left_pressed and s.active == 0 and sc.onButtonDown(s.mouse_x, s.mouse_y)) s.active = id;
+        } else sc.onLeave();
+        if (s.left_released) _ = sc.onButtonUp();
+        if (sc.tick(ui.dt)) ui.animating = true;
+        return sc.scrollY();
+    }
+
+    /// Closes a [`scrollRegion`]: if the pointer is over it and it can scroll, it takes
+    /// the wheel no inner region took; then draws its bar.
+    pub fn scrollRegionEnd(ui: *Ui, id: Id) void {
+        const s = ui.store;
+        const sc = s.scrolls.getPtr(id) orelse return;
+        const v = sc.viewport;
+        const over = Rect{ .x = v.x, .y = v.y, .w = v.w, .h = v.h };
+        if (s.wheel != 0 and sc.maxScroll(.vertical) > 0 and ui.scrollPointer() and over.contains(s.mouse_x, s.mouse_y)) {
+            sc.wheelPx(.vertical, s.wheel);
+            s.wheel = 0; // consumed
+            ui.animating = true;
+        }
+        sc.draw(ui.canvas);
+    }
+
+    /// Current offset of region `id` (0 if it never ran).
+    pub fn scrollOffset(ui: *Ui, id: Id) f32 {
+        return if (ui.store.scrolls.getPtr(id)) |sc| sc.scrollY() else 0;
+    }
+
+    /// Scroll region `id` so the content range `[lo, hi)` is in view, eased (keyboard
+    /// selection, a caret, a highlighted row).
+    pub fn scrollReveal(ui: *Ui, id: Id, lo: f32, hi: f32) void {
+        if (ui.store.scrolls.getPtr(id)) |sc| {
+            sc.reveal(.vertical, lo, hi);
+            ui.animating = true;
+        }
+    }
+
+    /// Does the pointer reach scroll regions this frame (input enabled, inside the
+    /// clip, not under an open dropdown panel)?
+    fn scrollPointer(ui: *Ui) bool {
+        const s = ui.store;
+        if (!ui.inputEnabled()) return false;
+        if (s.dd_open != 0 and s.dd_panel.contains(s.mouse_x, s.mouse_y)) return false;
+        return ui.clip.contains(s.mouse_x, s.mouse_y);
+    }
+
+    /// Clipped, wheel-scrollable vertical region of fixed viewport height: a
+    /// [`scrollRegion`] in the cursor layout. Content is laid out normally inside;
+    /// [`endScroll`] measures it, takes the wheel when hovered and draws the bar.
     pub fn beginScroll(ui: *Ui, id_str: []const u8, viewport_h: f32) void {
         const id = ui.makeId(id_str);
         const c = ui.cur();
         const vp = Rect{ .x = c.x, .y = c.y, .w = ui.availW(), .h = viewport_h };
-        const off = ui.store.scrolls.get(id) orelse 0;
+        const off = ui.scrollRegion(id, vp, null); // content measured in endScroll
 
         std.debug.assert(ui.clip_depth < ui.saved_clips.len);
         const saved_canvas = ui.canvas.setClip(
@@ -2318,27 +2376,17 @@ pub const Ui = struct {
         const viewport_h = saved.viewport_h;
         const vp_top = saved.top;
 
-        const max_off = @max(0, content_h - viewport_h);
-        var off = ui.store.scrolls.get(id) orelse 0;
-
         const c = ui.cur();
         const vp = Rect{ .x = c.x, .y = vp_top, .w = ui.availW(), .h = viewport_h };
-        const hovered = ui.inputEnabled() and vp.contains(ui.store.mouse_x, ui.store.mouse_y);
-        if (hovered and ui.store.wheel != 0) {
-            off += ui.store.wheel;
-            ui.store.wheel = 0; // consumed
-        }
-        off = std.math.clamp(off, 0, max_off);
-        ui.store.scrolls.put(ui.store.gpa, id, off) catch {};
 
-        // thin scrollbar
-        if (max_off > 0) {
-            ui.drawThinScrollbar(vp.x + vp.w - t.scrollbar_w, vp_top, viewport_h, content_h, off, if (hovered) 0.35 else 0.18);
-        }
-
-        // restore clip and advance the parent cursor past the viewport
+        // Restore the clip, then let the region measure its content, take the wheel
+        // when hovered and draw its bar.
         ui.clip = saved.rect;
         ui.canvas.clip = saved.canvas;
+        if (ui.store.scrolls.getPtr(id)) |sc| sc.setContent(vp.w, content_h);
+        ui.scrollRegionEnd(id);
+
+        // Advance the parent cursor past the viewport.
         c.y += viewport_h + t.gap;
         c.cross = @max(c.cross, vp.w);
         ui.last_rect = vp;
@@ -2667,23 +2715,38 @@ test "scroll area: wheel scrolls and clamps" {
         }
     }.run;
 
-    // Hover the viewport and wheel down a lot → offset clamps to max.
+    // Hover the viewport and wheel down a lot → the offset eases in and clamps to max.
     var ui = h.frame(10, &.{ .{ .motion = .{ .x = 100, .y = 60 } }, .{ .scroll = .{ .axis = 0, .px = 1.0e6 } } });
     build(&ui);
     _ = ui.end();
+    var now: i64 = 10;
+    for (0..30) |_| {
+        now += 16;
+        ui = h.frame(now, &.{});
+        build(&ui);
+        _ = ui.end();
+    }
     const id = blk: {
-        var ui2 = h.frame(20, &.{});
+        var ui2 = h.frame(now + 1, &.{});
         defer _ = ui2.end();
         break :blk ui2.makeId("list");
     };
-    const max_off = h.store.scrolls.get(id).?;
-    try testing.expect(max_off > 0);
+    const sc = h.store.scrolls.getPtr(id).?;
+    try testing.expect(sc.scrollY() > 0);
+    try testing.expectEqual(sc.maxScroll(.vertical), sc.scrollY());
 
     // Wheel back way past the top → clamps to 0.
-    ui = h.frame(30, &.{.{ .scroll = .{ .axis = 0, .px = -1.0e6 } }});
+    ui = h.frame(now + 20, &.{.{ .scroll = .{ .axis = 0, .px = -1.0e6 } }});
     build(&ui);
     _ = ui.end();
-    try testing.expectEqual(@as(f32, 0), h.store.scrolls.get(id).?);
+    now += 20;
+    for (0..30) |_| {
+        now += 16;
+        ui = h.frame(now, &.{});
+        build(&ui);
+        _ = ui.end();
+    }
+    try testing.expectEqual(@as(f32, 0), h.store.scrolls.getPtr(id).?.scrollY());
 }
 
 test "dropdown: opens on click, selects via next-frame click on the overlay" {
@@ -2857,8 +2920,15 @@ test "dropdown: long list is capped and scrolls; clicks outside the panel never 
     ui = h.frame(70, &.{ .{ .motion = .{ .x = p.x + p.w / 2, .y = p.y + p.h / 2 } }, .{ .scroll = .{ .axis = 0, .px = 1.0e6 } } });
     _ = ui.dropdown("dd", &options, &sel);
     _ = ui.end();
-    try testing.expect(h.store.dd_scroll > 0);
-    try testing.expect(h.store.dd_scroll <= content_h - p.h + 1);
+    var now: i64 = 70;
+    for (0..30) |_| {
+        now += 16;
+        ui = h.frame(now, &.{});
+        _ = ui.dropdown("dd", &options, &sel);
+        _ = ui.end();
+    }
+    try testing.expect(h.store.dd_sc.scrollY() > 0);
+    try testing.expect(h.store.dd_sc.scrollY() <= content_h - p.h + 1);
 }
 
 test "radio: click picks exactly one option" {

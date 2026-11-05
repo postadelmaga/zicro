@@ -263,7 +263,27 @@ pub const Scroll = struct {
     /// A wheel step of `value` axis units on `axis`, with no hit test: for an owner that
     /// already knows the wheel is for this area. Smoothed in `tick` like `onWheel`.
     pub fn wheel(self: *Scroll, axis: Axis, value: f32) void {
-        self.unprocessed[@backingInt(axis)] += value * wheel_gain;
+        self.wheelPx(axis, value * wheel_gain);
+    }
+
+    /// Like [`wheel`], for a delta already in pixels (a UI store that converted it).
+    pub fn wheelPx(self: *Scroll, axis: Axis, px: f32) void {
+        self.unprocessed[@backingInt(axis)] += px;
+    }
+
+    /// Land any pending wheel/[`reveal`] delta now, without easing (e.g. a list that
+    /// opens already scrolled to its selection).
+    pub fn settle(self: *Scroll) void {
+        for (0..2) |d| {
+            self.offset[d] += self.unprocessed[d];
+            self.unprocessed[d] = 0;
+        }
+        self.clampOffsets();
+    }
+
+    /// How far `axis` can scroll (0 = the content fits).
+    pub fn maxScroll(self: *const Scroll, axis: Axis) f32 {
+        return self.maxOff(@backingInt(axis));
     }
 
     /// Scroll just enough that the content range `[lo, hi)` on `axis` is in view (e.g. the
