@@ -266,6 +266,19 @@ pub const Scroll = struct {
         self.unprocessed[@backingInt(axis)] += value * wheel_gain;
     }
 
+    /// Scroll just enough that the content range `[lo, hi)` on `axis` is in view (e.g. the
+    /// item a keyboard selection moved to), eased like a wheel step. A range taller than
+    /// the viewport shows its start. No-op when the range is already visible.
+    pub fn reveal(self: *Scroll, axis: Axis, lo: f32, hi: f32) void {
+        const d: u8 = @backingInt(axis);
+        const target = self.offset[d] + self.unprocessed[d];
+        var want = target;
+        if (hi > want + self.viewLen(d)) want = hi - self.viewLen(d);
+        if (lo < want) want = lo;
+        want = std.math.clamp(want, 0.0, self.maxOff(d));
+        self.unprocessed[d] += want - target;
+    }
+
     /// Primary-button press at `(x,y)`. Grabs a thumb (or jumps it under the cursor) if the
     /// press lands on a bar. Returns true if it started a drag.
     pub fn onButtonDown(self: *Scroll, x: f32, y: f32) bool {
@@ -444,6 +457,22 @@ test "wheel notches smooth in over several ticks" {
     }
     try std.testing.expect(s.offset[1] > 0); // it moved
     try std.testing.expectEqual(@as(f32, 0), s.unprocessed[1]);
+}
+
+test "reveal: eases just far enough to show the range, and only when hidden" {
+    var s = testScroll(); // viewport h 100, content h 1000
+    s.reveal(.vertical, 20, 80); // already visible
+    try std.testing.expectEqual(@as(f32, 0), s.unprocessed[1]);
+    s.reveal(.vertical, 300, 350); // below: its bottom lands on the viewport's
+    try std.testing.expect(s.scrollY() == 0); // eased, not a jump
+    for (0..60) |_| _ = s.tick(1.0 / 60.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 250), s.scrollY(), 0.01);
+    s.reveal(.vertical, 100, 150); // above: its top lands on the viewport's
+    for (0..60) |_| _ = s.tick(1.0 / 60.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), s.scrollY(), 0.01);
+    s.reveal(.vertical, 990, 2000); // clamped to the end
+    for (0..60) |_| _ = s.tick(1.0 / 60.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 900), s.scrollY(), 0.01);
 }
 
 test "wheel: one step is wheel_gain px per axis unit, landing like onWheel" {
