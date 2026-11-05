@@ -71,6 +71,18 @@ struct zicro_pw {
 static pthread_once_t g_pw_once = PTHREAD_ONCE_INIT;
 static void pw_init_once(void) { pw_init(NULL, NULL); }
 
+// ...and it runs at load time, while the process has one thread. Its first call takes
+// PipeWire's init lock and then dlopens the SPA support plugins (the loader lock).
+// A library whose constructor calls pw_init — PipeWire's libjack, pulled in by
+// dlopen("libmpv.so.2") — takes the two locks the other way round: loader lock first
+// (it is inside dlopen), then the init lock. Two threads doing those two things at once
+// deadlock; Zuer hung opening a YouTube stream exactly so (the stream's audio opening
+// here, its mpv decoder loading on another thread). Once pw_init has run, later calls
+// only bump a count under the init lock and load nothing, so the order no longer exists.
+__attribute__((constructor)) static void zicro_pw_preinit(void) {
+    pthread_once(&g_pw_once, pw_init_once);
+}
+
 // App-side wait when the ring is full (write) or empty (read). ~200µs is well under an audio
 // quantum (256/48k ≈ 5.3ms), so this costs a negligible slice of latency and little CPU.
 static void backoff(void) {
