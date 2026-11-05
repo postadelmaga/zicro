@@ -297,14 +297,26 @@ test "reader never sees a torn frame under concurrent writes" {
     defer r.deinit();
 
     var stop: std.atomic.Value(bool) = .init(false);
+    // The writer never stops, but it leaves a gap of varying length after each frame:
+    // a seqlock lets a writer that rewrites back to back starve its readers (a reader's
+    // copy outlasts the writer's even window, every time), and a real writer writes at
+    // a frame rate. Short gaps keep reads landing on writes in flight — the torn case
+    // this test is about; long ones let reads complete.
     const Writer = struct {
         fn run(writer: *StateWriter, stop_flag: *std.atomic.Value(bool)) void {
             var frame: [4096]u8 = undefined;
             var k: u8 = 1;
+            var n: u32 = 0;
             while (!stop_flag.load(.monotonic)) {
                 @memset(&frame, k);
                 writer.write(&frame) catch unreachable;
                 k = @max(k +% 1, 1);
+                n +%= 1;
+                // Bursts of back-to-back writes (torn reads, if the seqlock let them
+                // through), then a gap of 0..20k spins, scrambled (whole reads).
+                var gap = if (n % 4 != 0) 0 else (n *% 2654435761) % 20_000;
+                while (gap > 0) : (gap -= 1) std.atomic.spinLoopHint();
+                if (n % 64 == 0) std.Thread.yield() catch {}; // share a single core
             }
         }
     };
@@ -313,10 +325,9 @@ test "reader never sees a torn frame under concurrent writes" {
     var seen: u64 = 0;
     var reads: usize = 0;
     var i: usize = 0;
-    // 50k reads, and past them for as long as none has landed yet (bounded): on a
-    // 2-core CI runner the 50k can run out before the writer thread is even scheduled,
-    // and `reads > 0` below is a liveness check, not what this test is about.
-    while (i < 50_000 or (reads == 0 and i < 20_000_000)) : (i += 1) {
+    // Until 5000 frames have been read whole, bounded so that a starved reader fails
+    // on `reads > 0` below instead of running into the test timeout.
+    while (reads < 5000 and i < 5_000_000) : (i += 1) {
         const got = try r.readLatest(gpa, &seen);
         if (got == null) std.Thread.yield() catch {}; // let the writer run
         if (got) |frame| {
