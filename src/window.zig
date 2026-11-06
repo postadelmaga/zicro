@@ -233,3 +233,8 @@ pub const Window = switch (builtin.os.tag) {
         }
     },
 };
+
+test {
+    // The platform backend's own tests (its file is otherwise analyzed only by apps).
+    if (builtin.os.tag == .linux and builtin.abi != .android and builtin.abi != .androideabi) _ = @import("window_wayland.zig");
+}

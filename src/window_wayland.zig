@@ -48,10 +48,15 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     shm: ?*wl.Shm = null,
     dmabuf: ?*wl.LinuxDmabuf = null,
     /// The (format, modifier) pairs the compositor announced it imports. A buffer
-    /// outside the list would be a fatal protocol error on `create_immed`: the
-    /// video plane refuses it instead (the caller falls back to CPU pixels).
+    /// outside the list is refused here (the caller falls back to CPU pixels).
     dmabuf_pairs: [dmabuf_pairs_cap]DmabufPair = undefined,
     dmabuf_pair_count: u32 = 0,
+    /// Announced is not importable: a driver can list a pair and still refuse a
+    /// buffer (NVIDIA, hybrid GPUs), and a refused `create_immed` is fatal for the
+    /// connection. The first buffer of each pair goes through `create`; its answer
+    /// is recorded here and decides `dmabufSupported` from then on.
+    dmabuf_imports: [dmabuf_imports_cap]DmabufImport = undefined,
+    dmabuf_import_count: u32 = 0,
     wm_base: ?*wl.XdgWmBase = null,
     seat: ?*wl.Seat = null,
     decoration_manager: ?*wl.ZxdgDecorationManager = null,
@@ -641,6 +646,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (self.decoration_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
         if (self.cursor_shapes) |m| wl.wl_proxy_destroy(@ptrCast(m));
         if (self.appmenu_manager) |m| wl.wl_proxy_destroy(@ptrCast(m));
+        for (self.dmabuf_imports[0..self.dmabuf_import_count]) |e| {
+            if (e.params) |p| p.destroy();
+        }
         wl.wl_display_disconnect(self.display);
         _ = linux.close(self.wake_fd);
         if (self.repeat_fd >= 0) _ = linux.close(self.repeat_fd);
@@ -1111,6 +1119,42 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
 
     const DmabufPair = struct { fourcc: u32, modifier: u64 };
     const dmabuf_pairs_cap = 1024;
+
+    const ImportState = enum(u8) { probing, ok, failed };
+    const DmabufImport = struct {
+        fourcc: u32,
+        modifier: u64,
+        /// Written on the window thread, read by producers on any thread.
+        state: std.atomic.Value(ImportState),
+        /// The `create` in flight (probing only).
+        params: ?*wl.BufferParams,
+    };
+    const dmabuf_imports_cap = 8;
+
+    fn findImport(self: *Window, fourcc: u32, modifier: u64) ?*DmabufImport {
+        for (self.dmabuf_imports[0..self.dmabuf_import_count]) |*e| {
+            if (e.fourcc == fourcc and e.modifier == modifier) return e;
+        }
+        return null;
+    }
+
+    const import_listener = wl.BufferParams.Listener{ .created = onImportCreated, .failed = onImportFailed };
+
+    fn onImportCreated(data: ?*anyopaque, params: *wl.BufferParams, buffer: *wl.Buffer) callconv(.c) void {
+        const e: *DmabufImport = @ptrCast(@alignCast(data.?));
+        // Only the verdict was wanted: the frames that follow get their own buffers.
+        buffer.destroy();
+        params.destroy();
+        e.params = null;
+        e.state.store(.ok, .release);
+    }
+
+    fn onImportFailed(data: ?*anyopaque, params: *wl.BufferParams) callconv(.c) void {
+        const e: *DmabufImport = @ptrCast(@alignCast(data.?));
+        params.destroy();
+        e.params = null;
+        e.state.store(.failed, .release);
+    }
     const drm_mod_linear: u64 = 0;
     const drm_mod_invalid: u64 = 0x00ff_ffff_ffff_ffff;
 
@@ -1134,9 +1178,16 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// Can the compositor import a `fourcc` buffer with `modifier`? An explicit LINEAR
     /// also passes where only the implicit modifier is announced (implicit LINEAR is
     /// what every driver does for it). No announcement at all: unknown, allowed.
+    /// A pair whose import the compositor refused is unsupported from then on.
     pub fn dmabufSupported(self: *Window, fourcc: u32, modifier: u64) bool {
         const r = self.rt();
         if (r.dmabuf == null) return false;
+        // The import table is appended on the window thread only; an entry is
+        // complete before the count covers it.
+        const n = @atomicLoad(u32, &r.dmabuf_import_count, .acquire);
+        for (r.dmabuf_imports[0..n]) |*e| {
+            if (e.fourcc == fourcc and e.modifier == modifier and e.state.load(.acquire) == .failed) return false;
+        }
         if (r.dmabuf_pair_count == 0) return true;
         for (r.dmabuf_pairs[0..r.dmabuf_pair_count]) |p| {
             if (p.fourcc != fourcc) continue;
@@ -1213,6 +1264,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const req = req_opt orelse return false;
         defer req.closeFds(); // a created wl_buffer holds its own reference
         const r = self.rt();
+        if (!r.importVerified(&req)) return false; // frame dropped: the verdict decides the next
 
         if (self.video_surface == null) {
             const vs = r.compositor.?.createSurface();
@@ -1288,6 +1340,29 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         cb.setListener(&video_frame_listener, self);
         vs.commit();
         return true;
+    }
+
+    /// Root: has the compositor imported this kind of buffer? The first frame of a
+    /// new (format, modifier) starts an asynchronous `create` and is dropped, like
+    /// the frames until the answer (one roundtrip). Refused: false for good, and
+    /// `dmabufSupported` turns the producer to CPU pixels. Window thread.
+    fn importVerified(self: *Window, req: *const StagedDma) bool {
+        const modifier = req.planes[0].modifier;
+        if (self.findImport(req.fourcc, modifier)) |e| return e.state.load(.acquire) == .ok;
+        // Table full (never with one video format): trust the announcement.
+        if (self.dmabuf_import_count == dmabuf_imports_cap) return true;
+        const params = self.dmabuf.?.createParams();
+        var pi: u32 = 0;
+        while (pi < req.plane_count) : (pi += 1) {
+            const pl = req.planes[pi];
+            params.add(pl.fd, pi, pl.offset, pl.stride, pl.modifier);
+        }
+        const e = &self.dmabuf_imports[self.dmabuf_import_count];
+        e.* = .{ .fourcc = req.fourcc, .modifier = modifier, .state = .init(.probing), .params = params };
+        params.setListener(&import_listener, e);
+        params.create(@intCast(req.width), @intCast(req.height), req.fourcc, 0);
+        @atomicStore(u32, &self.dmabuf_import_count, self.dmabuf_import_count + 1, .release);
+        return false;
     }
 
     /// Identity of a dmabuf: its inode (fd numbers get reused, inodes don't).
@@ -2675,3 +2750,45 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         try std.testing.expect(d.full and d.rect == null);
     }
 };
+
+test "dmabuf plane: announced is not enough, a refused import turns the pair off for good" {
+    // A compositor double: the tables are filled by hand, nothing touches the wire
+    // (`dmabuf` is only compared with null; entries with a verdict never `create`).
+    var w: Window = undefined;
+    w.parent = null;
+    w.dmabuf = @ptrFromInt(0x1000);
+    w.dmabuf_pair_count = 0;
+    w.dmabuf_import_count = 0;
+    const xb24: u32 = 0x34324258;
+    const ar24: u32 = 0x34325241;
+    const tiled: u64 = 0x0100000000000001;
+    try std.testing.expect(w.dmabufSupported(xb24, Window.drm_mod_linear)); // nothing announced: allowed
+
+    w.dmabuf_pairs[0] = .{ .fourcc = xb24, .modifier = Window.drm_mod_invalid };
+    w.dmabuf_pairs[1] = .{ .fourcc = ar24, .modifier = tiled };
+    w.dmabuf_pair_count = 2;
+    try std.testing.expect(w.dmabufSupported(xb24, Window.drm_mod_linear)); // implicit covers LINEAR
+    try std.testing.expect(!w.dmabufSupported(ar24, Window.drm_mod_linear)); // not announced
+    try std.testing.expect(w.dmabufSupported(ar24, tiled));
+
+    var req: Window.StagedDma = .{ .slot = 0, .width = 64, .height = 64, .fourcc = xb24 };
+    req.planes[0] = .{ .fd = -1, .offset = 0, .stride = 256, .modifier = Window.drm_mod_linear };
+    w.dmabuf_imports[0] = .{ .fourcc = xb24, .modifier = Window.drm_mod_linear, .state = .init(.probing), .params = null };
+    w.dmabuf_import_count = 1;
+    // Waiting for the answer: still offered (the producer keeps going), not attached.
+    try std.testing.expect(w.dmabufSupported(xb24, Window.drm_mod_linear));
+    try std.testing.expect(!w.importVerified(&req));
+
+    w.dmabuf_imports[0].state.store(.ok, .release);
+    try std.testing.expect(w.dmabufSupported(xb24, Window.drm_mod_linear));
+    try std.testing.expect(w.importVerified(&req));
+
+    w.dmabuf_imports[0].state.store(.failed, .release);
+    try std.testing.expect(!w.dmabufSupported(xb24, Window.drm_mod_linear)); // announced, refused
+    try std.testing.expect(!w.importVerified(&req)); // and never retried
+    try std.testing.expectEqual(@as(u32, 1), w.dmabuf_import_count);
+    try std.testing.expect(w.dmabufSupported(ar24, tiled)); // other pairs keep their own verdict
+
+    w.dmabuf = null;
+    try std.testing.expect(!w.dmabufSupported(ar24, tiled)); // no linux-dmabuf at all
+}

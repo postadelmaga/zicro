@@ -352,6 +352,17 @@ pub const LinuxDmabuf = opaque {
 };
 
 pub const BufferParams = opaque {
+    /// Outcome of `create`: `created` hands over a new wl_buffer, `failed` means
+    /// the compositor could not import the dmabufs (not a protocol error).
+    pub const Listener = extern struct {
+        created: *const fn (data: ?*anyopaque, params: *BufferParams, buffer: *Buffer) callconv(.c) void,
+        failed: *const fn (data: ?*anyopaque, params: *BufferParams) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *BufferParams, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
     pub fn destroy(self: *BufferParams) void {
         _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
     }
@@ -360,9 +371,14 @@ pub const BufferParams = opaque {
         _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, fd, plane, offset, stride, @as(u32, @intCast(modifier >> 32)), @as(u32, @truncate(modifier)));
     }
 
-    /// `create_immed` (v2+): synchronous buffer creation — an invalid dmabuf is
-    /// a protocol error instead of an event, which is fine: our fds come from
-    /// a Vulkan export we already validated.
+    /// `create`: asynchronous import, answered by `created` or `failed`.
+    pub fn create(self: *BufferParams, w: i32, h: i32, format: u32, flags: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 2, null, version(self), 0, w, h, format, flags);
+    }
+
+    /// `create_immed` (v2+): synchronous buffer creation. An import the compositor
+    /// rejects is fatal for the connection (or poisons the buffer): use it only for
+    /// a (format, modifier) a `create` has already seen imported.
     pub fn createImmed(self: *BufferParams, w: i32, h: i32, format: u32, flags: u32) *Buffer {
         const p = wl_proxy_marshal_flags(proxy(self), 3, &wl_buffer_interface, version(self), 0, @as(?*Proxy, null), w, h, format, flags);
         return @ptrCast(p.?);
