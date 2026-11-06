@@ -1300,6 +1300,50 @@ pub const Canvas = struct {
         }
     }
 
+    /// Erase a rounded rect to transparent (destination-out, antialiased edges): a hole
+    /// through which a surface stacked BELOW this one shows — the dmabuf video plane.
+    /// Premultiplied pixels scale whole; straight ones lose only alpha.
+    pub fn eraseRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32) void {
+        std.debug.assert(self.gl == null); // CPU canvases only, like `blitRgba`
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        if (x0 >= x1 or y0 >= y1) return;
+        self.addDamage(x0, y0, x1, y1);
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            const s0, const s1 = self.fullSpan(fy, x, y, w, h, radius, x0, x1);
+            if (s1 > s0) @memset(row[s0..s1], 0);
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                if (px >= s0 and px < s1) continue;
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const cov = coverage(roundedRectSdf(fx, fy, x, y, w, h, radius));
+                if (cov <= 0.0) continue;
+                row[px] = eraseBy(row[px], 1.0 - cov, self.format);
+            }
+        }
+    }
+
+    fn eraseBy(px: u32, keep: f32, format: Format) u32 {
+        const k: u32 = @intFromFloat(@round(std.math.clamp(keep, 0.0, 1.0) * 256.0));
+        switch (format) {
+            .argb_premul => {
+                const rb = ((px & 0x00ff00ff) * k >> 8) & 0x00ff00ff;
+                const ag = (((px >> 8) & 0x00ff00ff) * k) & 0xff00ff00;
+                return rb | ag;
+            },
+            .rgba_straight => {
+                const a = (px >> 24) * k >> 8;
+                return (px & 0x00ffffff) | (a << 24);
+            },
+        }
+    }
+
     /// L'intervallo di colonne `[s0, s1)` in cui, su questa riga, la copertura del rettangolo
     /// arrotondato è **esattamente 1** — l'unico modo per non pagare una `@sqrt` per pixel su
     /// una forma che di curvo ha solo quattro angoli.
@@ -2038,4 +2082,15 @@ test "overColorU8 (integer fast path used by blitImage) tracks the overColor flo
         }
     }
     try std.testing.expect(max_diff <= 2); // ≤2/255 rounding error vs. the float reference
+}
+
+test "eraseRoundedRect apre un buco trasparente, bordi sfumati" {
+    var px: [16 * 16]u32 = @splat(0xff336699);
+    var cv = Canvas.init(&px, 16, 16);
+    cv.eraseRoundedRect(4, 4, 8, 8, 0);
+    try std.testing.expectEqual(@as(u32, 0), px[8 * 16 + 8]); // dentro
+    try std.testing.expectEqual(@as(u32, 0xff336699), px[1 * 16 + 1]); // fuori
+    cv.eraseRoundedRect(0.5, 0, 1, 1, 0); // mezzo pixel: si dimezza, non sparisce
+    const a = px[0] >> 24;
+    try std.testing.expect(a > 0x60 and a < 0xa0);
 }

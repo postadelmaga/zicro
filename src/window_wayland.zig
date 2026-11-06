@@ -143,12 +143,18 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// Raised at teardown: `waitFrame` returns false instead of waiting forever.
     frame_teardown: std.atomic.Value(bool) = .init(false),
 
-    // --- the dmabuf video plane: a desynced subsurface over `video_area` ------------------
+    // --- the dmabuf video plane: a desynced subsurface UNDER the window, in `video_area` --
+    // The window shows it through a transparent hole over `video_rect` (zrame erases it
+    // in its compose), so whatever the window draws there — controls, labels, panels —
+    // stays on top of the video.
     video_surface: ?*wl.Surface = null,
     video_subsurface: ?*wl.Subsurface = null,
     video_viewport: ?*wl.Viewport = null,
     video_buffers: [8]?*wl.Buffer = @splat(null),
     video_buf_sizes: [8][2]u32 = @splat(.{ 0, 0 }),
+    /// The dmabuf (inode) behind each slot's wl_buffer: a slot re-presented with a new
+    /// image of the same size (the producer reallocated) needs a new wl_buffer too.
+    video_buf_ino: [8]u64 = @splat(0),
     video_pending: std.atomic.Value(bool) = .init(false),
     /// Where the video plane sits (buffer px); null = the window geometry.
     video_area: ?PxRect = null,
@@ -1124,6 +1130,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             empty.destroy();
             const ss = r.subcompositor.?.getSubsurface(vs, self.surface.?);
             ss.setDesync();
+            // Under the parent: the app's overlay (drawn on the parent, around a
+            // transparent hole over `video_rect`) stays visible on top of the video.
+            ss.placeBelow(self.surface.?);
             self.video_surface = vs;
             self.video_subsurface = ss;
             if (r.viewporter) |vpr| self.video_viewport = vpr.getViewport(vs);
@@ -1144,22 +1153,27 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             dx = area.x + (area.w - vw) / 2;
             dy = area.y + (area.h - vh) / 2;
         }
-        self.video_rect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
+        const new_rect: PxRect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
+        // The parent's hole follows the plane: a moved/resized plane repaints it.
+        if (self.video_rect == null or !std.meta.eql(self.video_rect.?, new_rect)) self.damageAll();
+        self.video_rect = new_rect;
         self.video_subsurface.?.setPosition(@intCast(self.logiPx(dx)), @intCast(self.logiPx(dy)));
         if (self.video_viewport) |vp| {
             vp.setDestination(@intCast(@max(self.logiPx(vw), 1)), @intCast(@max(self.logiPx(vh), 1)));
         }
 
         // A slot presented at a new size gets a fresh wl_buffer.
+        const ino = dmabufIno(req.planes[0].fd);
         if (self.video_buffers[req.slot]) |b| {
             const sz = self.video_buf_sizes[req.slot];
-            if (sz[0] != req.width or sz[1] != req.height) {
+            if (sz[0] != req.width or sz[1] != req.height or self.video_buf_ino[req.slot] != ino) {
                 b.destroy();
                 self.video_buffers[req.slot] = null;
             }
         }
         if (self.video_buffers[req.slot] == null) {
             self.video_buf_sizes[req.slot] = .{ req.width, req.height };
+            self.video_buf_ino[req.slot] = ino;
             const params = r.dmabuf.?.createParams();
             var pi: u32 = 0;
             while (pi < req.plane_count) : (pi += 1) {
@@ -1177,6 +1191,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         cb.setListener(&video_frame_listener, self);
         vs.commit();
         return true;
+    }
+
+    /// Identity of a dmabuf: its inode (fd numbers get reused, inodes don't).
+    fn dmabufIno(fd: posix.fd_t) u64 {
+        const at_empty_path: u32 = 0x1000;
+        var stx: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", at_empty_path, .{ .INO = true }, &stx)) != .SUCCESS) return 0;
+        return stx.ino;
     }
 
     const video_frame_listener = wl.Callback.Listener{ .done = onVideoFrameDone };

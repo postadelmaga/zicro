@@ -726,6 +726,7 @@ pub const Window = struct {
                 while (y < y1) : (y += 1) @memset(pixels[@as(usize, y) * bw + r0.x ..][0 .. x1 - r0.x], 0xFF141414);
                 _ = canvas.setClip(r0.x, r0.y, x1 - r0.x, y1 - r0.y);
             } else @memset(pixels, 0xFF141414);
+            self.eraseVideoHole(&canvas);
             chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
             return;
         }
@@ -746,7 +747,31 @@ pub const Window = struct {
             if (stale) self.repaintDecor(bw, bh) catch return;
             @memcpy(pixels, self.decor);
         }
+        self.eraseVideoHole(&canvas);
         chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+    }
+
+    /// The dmabuf video plane sits UNDER the window: make the window transparent over
+    /// it (inside the rounded content shape), so it shows through while whatever the
+    /// app and the panels draw next lands on top of it.
+    fn eraseVideoHole(self: *Window, canvas: *paint.Canvas) void {
+        const vr = self.inner.video_rect orelse return;
+        const saved = canvas.clip;
+        defer canvas.clip = saved;
+        var x0 = vr.x;
+        var y0 = vr.y;
+        var x1 = vr.x +| vr.w;
+        var y1 = vr.y +| vr.h;
+        if (saved) |c| {
+            x0 = @max(x0, c.x0);
+            y0 = @max(y0, c.y0);
+            x1 = @min(x1, c.x1);
+            y1 = @min(y1, c.y1);
+        }
+        if (x0 >= x1 or y0 >= y1) return;
+        canvas.clip = .{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 };
+        const cr = self.contentRect();
+        canvas.eraseRoundedRect(@floatFromInt(cr.x), @floatFromInt(cr.y), @floatFromInt(cr.w), @floatFromInt(cr.h), self.paintStyle().content_radius);
     }
 
     /// (Re)raster the chrome cache at `bw`×`bh`, reusing the allocation at equal size.
