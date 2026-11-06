@@ -7,6 +7,7 @@
 //! a decorated frame is just math over pixels.
 
 const std = @import("std");
+const builtin = @import("builtin");
 pub const text = @import("text.zig");
 
 /// Text drawing options: pixel size, style (face) and color.
@@ -953,6 +954,12 @@ pub const Canvas = struct {
             sy_end = @min(src_h, c.y1 -| dst_y);
             if (sx_start >= sx_end or sy_start >= sy_end) return;
         }
+        // Columns (destination x) where every mask is saturated, the same on every row
+        // inside the flat band: there a pixel is plain "source over", done in bulk by
+        // `blitSpanOver` — the per-pixel SDF/flat tests stay for the rounded edges only.
+        // Video and image frames spend almost all their pixels here.
+        const flat_x0: u32 = @intFromFloat(@max(0.0, @ceil(@max(flat_px0, flat_cx0) - 0.5)));
+        const flat_x1: u32 = @intFromFloat(@max(0.0, @floor(@min(flat_px1, flat_cx1) - 0.5) + 1.0));
         var sy: u32 = sy_start;
         while (sy < sy_end) : (sy += 1) {
             const y = dst_y + sy;
@@ -960,10 +967,26 @@ pub const Canvas = struct {
             const fy = @as(f32, @floatFromInt(y)) + 0.5;
             const row = self.pixels[@as(usize, y) * self.width ..][0..self.width];
             const src_row = src[@as(usize, sy) * src_w * 4 ..][0 .. @as(usize, src_w) * 4];
+            const row_end = @min(dst_x + sx_end, self.width);
+            var span0: u32 = 0;
+            var span1: u32 = 0;
+            if (trivial) {
+                span0 = dst_x + sx_start;
+                span1 = row_end;
+            } else if (style.border_anim_width == 0.0 and fy >= flat_py0 and fy <= flat_py1 and fy >= flat_cy0 and fy <= flat_cy1) {
+                span0 = flat_x0;
+                span1 = @min(flat_x1, row_end);
+            }
             var sx: u32 = sx_start;
             while (sx < sx_end) : (sx += 1) {
                 const x = dst_x + sx;
                 if (x >= self.width) break;
+                if (x >= span0 and x < span1) {
+                    const n = span1 - x;
+                    blitSpanOver(row[x..][0..n], src_row[@as(usize, sx) * 4 ..][0 .. @as(usize, n) * 4]);
+                    sx += n - 1;
+                    continue;
+                }
                 const sp = src_row[@as(usize, sx) * 4 ..][0..4];
                 // A transparent source pixel changes nothing on any path (its `sa` is 0):
                 // skip it before the masks — along the rounded edges two SDFs per pixel,
@@ -1040,6 +1063,49 @@ pub const Canvas = struct {
                 );
             }
         }
+    }
+
+    /// Straight-alpha RGBA "over" a premultiplied ARGB8888 row with every mask at 1
+    /// (the inner part of `blitRgba`): opaque pixels are a byte swizzle, transparent
+    /// ones a no-op, the rest the same float blend as the masked path. Eight pixels at
+    /// a time when they are all opaque or all transparent — a video frame's case.
+    fn blitSpanOver(dst: []u32, src: []const u8) void {
+        var i: usize = 0;
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            const V = @Vector(8, u32);
+            while (i + 8 <= dst.len) : (i += 8) {
+                const v: V = @bitCast(src[i * 4 ..][0..32].*);
+                const a = v >> @splat(24);
+                if (@reduce(.And, a == @as(V, @splat(255)))) {
+                    // Little-endian RGBA as u32 is 0xAABBGGRR: swap R and B for 0xAARRGGBB.
+                    const sw = (v & @as(V, @splat(0xFF00FF00))) |
+                        ((v & @as(V, @splat(0xFF))) << @splat(16)) |
+                        ((v >> @splat(16)) & @as(V, @splat(0xFF)));
+                    dst[i..][0..8].* = @as([8]u32, sw);
+                    continue;
+                }
+                if (@reduce(.And, a == @as(V, @splat(0)))) continue;
+                for (0..8) |k| pixelOver(&dst[i + k], src[(i + k) * 4 ..][0..4]);
+            }
+        }
+        while (i < dst.len) : (i += 1) pixelOver(&dst[i], src[i * 4 ..][0..4]);
+    }
+
+    fn pixelOver(d: *u32, sp: *const [4]u8) void {
+        if (sp[3] == 0) return;
+        if (sp[3] == 255) {
+            d.* = 0xFF000000 | (@as(u32, sp[0]) << 16) | (@as(u32, sp[1]) << 8) | @as(u32, sp[2]);
+            return;
+        }
+        const sa = @as(f32, @floatFromInt(sp[3])) / 255.0;
+        const dr, const dg, const db, const da = unpackPremul(d.*);
+        const inv = 1.0 - sa;
+        d.* = packPremul(
+            @as(f32, @floatFromInt(sp[0])) / 255.0 * sa + dr * inv,
+            @as(f32, @floatFromInt(sp[1])) / 255.0 * sa + dg * inv,
+            @as(f32, @floatFromInt(sp[2])) / 255.0 * sa + db * inv,
+            sa + da * inv,
+        );
     }
 
     /// Precomputed per-column nearest-neighbour source-x lookup for a scaled blit's row
@@ -2095,4 +2161,39 @@ test "eraseRoundedRect apre un buco trasparente, bordi sfumati" {
     cv.eraseRoundedRect(0.5, 0, 1, 1, 0); // mezzo pixel: si dimezza, non sparisce
     const a = px[0] >> 24;
     try std.testing.expect(a > 0x60 and a < 0xa0);
+}
+
+test "blitRgba: the bulk span path matches the per-pixel blend, opaque runs and alpha alike" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    const W = 97;
+    const H = 13;
+    var src: [W * H * 4]u8 = undefined;
+    for (0..W * H) |i| {
+        r.bytes(src[i * 4 ..][0..3]);
+        // Long opaque and transparent runs (the 8-wide fast cases) plus mixed alpha.
+        src[i * 4 + 3] = switch ((i / 11) % 4) {
+            0 => 255,
+            1 => 0,
+            2 => r.int(u8),
+            else => if (r.boolean()) 255 else r.int(u8),
+        };
+    }
+    var got: [W * H]u32 = undefined;
+    var want: [W * H]u32 = undefined;
+    for (&got, &want) |*g, *w| {
+        const v = r.int(u32) | 0xFF000000;
+        g.* = v;
+        w.* = v;
+    }
+    var canvas = Canvas.init(&got, W, H);
+    const flat: Style = .{ .margin = 0, .corner_radius = 0, .content_radius = 0, .content_fade_width = 0, .corner_fade_width = 0, .border_anim_width = 0 };
+    canvas.blitRgba(0, 0, &src, W, H, flat);
+    for (0..W * H) |i| Canvas.pixelOver(&want[i], src[i * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u32, &want, &got);
+    // Opaque red lands as ARGB 0xFFFF0000.
+    var one = [_]u32{0};
+    var c1 = Canvas.init(&one, 1, 1);
+    c1.blitRgba(0, 0, &.{ 255, 0, 0, 255 }, 1, 1, flat);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), one[0]);
 }
