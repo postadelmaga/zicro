@@ -105,6 +105,9 @@ pub const Staged = struct {
     height: u32 = 0,
     /// Set by `stageFrame`, cleared when `swapFront` moves to front slot.
     fresh: bool = false,
+    /// What changed since the frame before it, in frame pixels (`stageFrameRegion`);
+    /// null = all of it. Frames that replace an unconsumed one merge their areas.
+    dirty: ?Rect = null,
 
     pub fn deinit(self: *Staged, gpa: std.mem.Allocator) void {
         self.pixels.deinit(gpa);
@@ -130,10 +133,23 @@ pub const SpinLock = struct {
 /// On OOM the staged frame is invalidated (so a stale width can't send a later blit out of
 /// bounds) and false is returned.
 pub fn stageFrame(gpa: std.mem.Allocator, lock: *SpinLock, staged: *Staged, width: u32, height: u32, rgba: []const u8) bool {
+    return stageFrameRegion(gpa, lock, staged, width, height, rgba, null);
+}
+
+/// `stageFrame` for a frame that differs from the previous one only inside `dirty` (frame
+/// pixels; null = everywhere): the window recomposes just that part of it. A frame that
+/// replaces one not yet composed inherits its area too (union; null wins).
+pub fn stageFrameRegion(gpa: std.mem.Allocator, lock: *SpinLock, staged: *Staged, width: u32, height: u32, rgba: []const u8, dirty: ?Rect) bool {
     const need = @as(usize, width) * @as(usize, height) * 4;
     if (rgba.len < need) return false;
     lock.lock();
     defer lock.unlock();
+    const same_size = staged.width == width and staged.height == height;
+    staged.dirty = if (staged.fresh) blk: {
+        const prev = staged.dirty orelse break :blk null;
+        const cur = dirty orelse break :blk null;
+        break :blk if (same_size) plugin.unionOf(prev, cur) else null;
+    } else dirty;
     staged.pixels.clearRetainingCapacity();
     staged.pixels.appendSlice(gpa, rgba[0..need]) catch {
         staged.width = 0;
@@ -173,6 +189,10 @@ pub const FrameMailbox = struct {
 
     pub fn stage(self: *FrameMailbox, gpa: std.mem.Allocator, width: u32, height: u32, rgba: []const u8) bool {
         return stageFrame(gpa, &self.lock, &self.staged, width, height, rgba);
+    }
+
+    pub fn stageRegion(self: *FrameMailbox, gpa: std.mem.Allocator, width: u32, height: u32, rgba: []const u8, dirty: ?Rect) bool {
+        return stageFrameRegion(gpa, &self.lock, &self.staged, width, height, rgba, dirty);
     }
 
     pub fn swap(self: *FrameMailbox) void {

@@ -221,6 +221,11 @@ pub const Window = struct {
         }
     }
 
+    /// The whole frame is recomposed here anyway: the changed area is only a hint.
+    pub fn presentRgbaRegion(self: *Window, width: u32, height: u32, rgba: []const u8, _: ?facade.Rect) void {
+        self.presentRgba(width, height, rgba);
+    }
+
     // --- 2D-GL engine: seam for wasm exports (called by the app in web.zig) ----------------
     pub fn setGl(self: *Window, on: bool) void {
         self.gl_mode = on;

@@ -965,11 +965,14 @@ pub const Canvas = struct {
                 const x = dst_x + sx;
                 if (x >= self.width) break;
                 const sp = src_row[@as(usize, sx) * 4 ..][0..4];
+                // A transparent source pixel changes nothing on any path (its `sa` is 0):
+                // skip it before the masks — along the rounded edges two SDFs per pixel,
+                // and a video HUD is transparent almost everywhere.
+                if (sp[3] == 0) continue;
 
                 // Trivial-mask fast path: no SDF, and a fully-opaque source pixel is a direct
                 // packed write (ARGB8888, premultiplied == the color for a==255).
                 if (trivial) {
-                    if (sp[3] == 0) continue;
                     if (sp[3] == 255) {
                         row[x] = 0xFF000000 | (@as(u32, sp[0]) << 16) | (@as(u32, sp[1]) << 8) | @as(u32, sp[2]);
                         continue;
@@ -994,7 +997,6 @@ pub const Canvas = struct {
                             row[x] = 0xFF000000 | (@as(u32, sp[0]) << 16) | (@as(u32, sp[1]) << 8) | @as(u32, sp[2]);
                             continue;
                         }
-                        if (sp[3] == 0) continue;
                         // Otherwise mask and content_cov stay saturated at 1 — no SDF.
                     } else {
                         const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);

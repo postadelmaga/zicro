@@ -308,6 +308,13 @@ pub const Window = struct {
         if (self.mailbox.stage(self.gpa, width, height, rgba)) self.inner.wake();
     }
 
+    /// `presentRgba` for a frame that changed only inside `dirty` (frame pixels; null =
+    /// everywhere): only that part of the window is recomposed and damaged — a video
+    /// HUD whose timeline ticks needn't repaint the transparent rest. Any thread.
+    pub fn presentRgbaRegion(self: *Window, width: u32, height: u32, rgba: []const u8, dirty: ?Rect) void {
+        if (self.mailbox.stageRegion(self.gpa, width, height, rgba, dirty)) self.inner.wake();
+    }
+
     /// Keep `px` on the right of the content for the app's overlay. Any thread.
     pub fn reserveGutter(self: *Window, px: u32) void {
         self.gutter_right.store(px, .release);
@@ -690,6 +697,13 @@ pub const Window = struct {
         return .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
     }
 
+    /// `d` (frame pixels) placed in the frame's canvas rect `r`, clamped to it.
+    fn subRect(r: Rect, d: Rect) Rect {
+        const x = @min(d.x, r.w);
+        const y = @min(d.y, r.h);
+        return .{ .x = r.x + x, .y = r.y + y, .w = @min(d.w, r.w - x), .h = @min(d.h, r.h - y) };
+    }
+
     fn innerBeforeCompose(win: *Inner, user: ?*anyopaque) void {
         const self = from(win, user);
         self.syncGeometry();
@@ -702,7 +716,13 @@ pub const Window = struct {
         if (self.mailbox.front.width > 0) {
             const r = chrome.frameRect(area, self.mailbox.front.width, self.mailbox.front.height);
             if (self.dirty_staged) {
-                if (self.last_front_rect) |prev| partial = plugin.unionOf(prev, r) else full = true;
+                if (self.last_front_rect) |prev| {
+                    // Same place, and the app said what changed: only that.
+                    partial = if (std.meta.eql(prev, r) and self.mailbox.front.dirty != null)
+                        subRect(r, self.mailbox.front.dirty.?)
+                    else
+                        plugin.unionOf(prev, r);
+                } else full = true;
             }
             self.last_front_rect = r;
         } else if (self.dirty_staged) {

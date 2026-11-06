@@ -139,6 +139,7 @@ fn verifyWindowBackendContract(comptime W: type) void {
         "contentPx",
         "contentRect",
         "presentRgba",
+        "presentRgbaRegion",
         "waitFrame",
         "toggleFullscreen",
         "setStyle",

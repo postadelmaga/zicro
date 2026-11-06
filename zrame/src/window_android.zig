@@ -149,6 +149,11 @@ pub const Window = struct {
             self.inner.requestRedraw();
         }
     }
+
+    /// The whole frame is recomposed here anyway: the changed area is only a hint.
+    pub fn presentRgbaRegion(self: *Window, width: u32, height: u32, rgba: []const u8, _: ?facade.Rect) void {
+        self.presentRgba(width, height, rgba);
+    }
     pub fn textFont(self: *Window) !*text.Font {
         if (self.font == null) self.font = try text.Font.initDefault(self.gpa);
         return &self.font.?;

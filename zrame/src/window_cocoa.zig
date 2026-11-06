@@ -149,6 +149,11 @@ pub const Window = struct {
         _ = self.mailbox.stage(self.gpa, width, height, rgba);
     }
 
+    /// The whole frame is recomposed here anyway: the changed area is only a hint.
+    pub fn presentRgbaRegion(self: *Window, width: u32, height: u32, rgba: []const u8, _: ?facade.Rect) void {
+        self.presentRgba(width, height, rgba);
+    }
+
     /// dmabuf zero-copy present is a Linux/Wayland path; callers fall back to `presentRgba`.
     /// No video plane on this backend (`presentDmabuf` is a no-op): nothing to hide.
     pub fn hideVideo(_: *Window) void {}
