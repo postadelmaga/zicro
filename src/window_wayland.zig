@@ -47,6 +47,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     subcompositor: ?*wl.Subcompositor = null,
     shm: ?*wl.Shm = null,
     dmabuf: ?*wl.LinuxDmabuf = null,
+    /// The (format, modifier) pairs the compositor announced it imports. A buffer
+    /// outside the list would be a fatal protocol error on `create_immed`: the
+    /// video plane refuses it instead (the caller falls back to CPU pixels).
+    dmabuf_pairs: [dmabuf_pairs_cap]DmabufPair = undefined,
+    dmabuf_pair_count: u32 = 0,
     wm_base: ?*wl.XdgWmBase = null,
     seat: ?*wl.Seat = null,
     decoration_manager: ?*wl.ZxdgDecorationManager = null,
@@ -147,6 +152,10 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     frame_cb_pending: bool = false,
     /// Raised at teardown: `waitFrame` returns false instead of waiting forever.
     frame_teardown: std.atomic.Value(bool) = .init(false),
+
+    /// Held by the compositor: attached to the video surface and not yet released.
+    /// The producer renders only into a slot that is neither held nor staged.
+    video_held: [8]std.atomic.Value(bool) = @splat(.init(false)),
 
     // --- the dmabuf video plane: a desynced subsurface UNDER the window, in `video_area` --
     // The window shows it through a transparent hole over `video_rect` (zrame erases it
@@ -284,7 +293,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         height: u32,
         fourcc: u32,
         plane_count: u8 = 1,
+        /// The fds are OURS (dup'ed at staging): the producer may close or reuse its
+        /// own the moment `presentDmabuf` returns — e.g. retiring buffers on a resize
+        /// while this frame still waits for the window thread.
         planes: [4]window.DmabufPlane = undefined,
+
+        fn closeFds(s: *const StagedDma) void {
+            for (s.planes[0..s.plane_count]) |pl| _ = linux.close(pl.fd);
+        }
     };
 
     /// The staging handoffs are short bounded copies at frame cadence: a spin on an
@@ -534,6 +550,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.cancelFrameCallback();
         if (self.unmap_sync) |cb| cb.destroy();
         self.unmap_sync = null;
+        if (self.staged_dma) |s| s.closeFds();
+        self.staged_dma = null;
         for (self.active_popups.items) |p| p.destroy();
         self.active_popups.deinit(self.gpa);
         for (self.video_buffers) |vb| {
@@ -710,6 +728,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
 
     /// Unmap the video plane (the window's own pixels show again). Any thread.
     pub fn hideVideo(self: *Window) void {
+        // A frame staged before the hide belongs to what is being hidden.
+        self.mutex.lock();
+        if (self.staged_dma) |old| old.closeFds();
+        self.staged_dma = null;
+        self.mutex.unlock();
         self.pending_hide_video.store(true, .release);
         self.wake();
     }
@@ -1086,6 +1109,53 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     // The dmabuf video plane
     // =====================================================================================
 
+    const DmabufPair = struct { fourcc: u32, modifier: u64 };
+    const dmabuf_pairs_cap = 1024;
+    const drm_mod_linear: u64 = 0;
+    const drm_mod_invalid: u64 = 0x00ff_ffff_ffff_ffff;
+
+    const dmabuf_listener = wl.LinuxDmabuf.Listener{ .format = onDmabufFormat, .modifier = onDmabufModifier };
+
+    fn onDmabufFormat(data: ?*anyopaque, _: *wl.LinuxDmabuf, format: u32) callconv(.c) void {
+        addDmabufPair(@ptrCast(@alignCast(data.?)), format, drm_mod_invalid);
+    }
+
+    fn onDmabufModifier(data: ?*anyopaque, _: *wl.LinuxDmabuf, format: u32, hi: u32, lo: u32) callconv(.c) void {
+        addDmabufPair(@ptrCast(@alignCast(data.?)), format, @as(u64, hi) << 32 | lo);
+    }
+
+    fn addDmabufPair(self: *Window, fourcc: u32, modifier: u64) void {
+        for (self.dmabuf_pairs[0..self.dmabuf_pair_count]) |p| if (p.fourcc == fourcc and p.modifier == modifier) return;
+        if (self.dmabuf_pair_count == dmabuf_pairs_cap) return;
+        self.dmabuf_pairs[self.dmabuf_pair_count] = .{ .fourcc = fourcc, .modifier = modifier };
+        self.dmabuf_pair_count += 1;
+    }
+
+    /// Can the compositor import a `fourcc` buffer with `modifier`? An explicit LINEAR
+    /// also passes where only the implicit modifier is announced (implicit LINEAR is
+    /// what every driver does for it). No announcement at all: unknown, allowed.
+    pub fn dmabufSupported(self: *Window, fourcc: u32, modifier: u64) bool {
+        const r = self.rt();
+        if (r.dmabuf == null) return false;
+        if (r.dmabuf_pair_count == 0) return true;
+        for (r.dmabuf_pairs[0..r.dmabuf_pair_count]) |p| {
+            if (p.fourcc != fourcc) continue;
+            if (p.modifier == modifier) return true;
+            if (modifier == drm_mod_linear and p.modifier == drm_mod_invalid) return true;
+        }
+        return false;
+    }
+
+    /// Is `slot` free for the producer to render into: not attached and unreleased
+    /// by the compositor, not staged for the next commit. Any thread.
+    pub fn videoSlotFree(self: *Window, slot: u8) bool {
+        if (slot >= self.video_held.len) return false;
+        if (self.video_held[slot].load(.acquire)) return false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return if (self.staged_dma) |s| s.slot != slot else true;
+    }
+
     /// Single-plane `presentDmabufPlanes`.
     pub fn presentDmabuf(self: *Window, slot: u8, fd: posix.fd_t, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64) bool {
         return self.presentDmabufPlanes(slot, &.{.{ .fd = fd, .offset = 0, .stride = stride, .modifier = modifier }}, width, height, fourcc);
@@ -1098,18 +1168,30 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     pub fn presentDmabufPlanes(self: *Window, slot: u8, planes: []const window.DmabufPlane, width: u32, height: u32, fourcc: u32) bool {
         const r = self.rt();
         if (r.dmabuf == null or r.subcompositor == null or planes.len == 0 or planes.len > 4) return false;
+        if (!self.dmabufSupported(fourcc, planes[0].modifier)) return false;
         std.debug.assert(slot < self.video_buffers.len);
+        var req: StagedDma = .{
+            .slot = slot,
+            .width = width,
+            .height = height,
+            .fourcc = fourcc,
+            .plane_count = @intCast(planes.len),
+        };
+        for (planes, 0..) |pl, i| {
+            const rc = linux.fcntl(pl.fd, linux.F.DUPFD_CLOEXEC, 0);
+            if (linux.errno(rc) != .SUCCESS) {
+                for (req.planes[0..i]) |done| _ = linux.close(done.fd);
+                return false;
+            }
+            req.planes[i] = pl;
+            req.planes[i].fd = @intCast(rc);
+        }
         {
             self.mutex.lock();
             defer self.mutex.unlock();
-            self.staged_dma = .{
-                .slot = slot,
-                .width = width,
-                .height = height,
-                .fourcc = fourcc,
-                .plane_count = @intCast(planes.len),
-            };
-            @memcpy(self.staged_dma.?.planes[0..planes.len], planes);
+            // A frame not yet committed is superseded: its fds go with it.
+            if (self.staged_dma) |old| old.closeFds();
+            self.staged_dma = req;
         }
         self.wake();
         return true;
@@ -1129,6 +1211,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.staged_dma = null;
         self.mutex.unlock();
         const req = req_opt orelse return false;
+        defer req.closeFds(); // a created wl_buffer holds its own reference
         const r = self.rt();
 
         if (self.video_surface == null) {
@@ -1178,6 +1261,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             if (sz[0] != req.width or sz[1] != req.height or self.video_buf_ino[req.slot] != ino) {
                 b.destroy();
                 self.video_buffers[req.slot] = null;
+                // A destroyed buffer gets no release; the old image is the producer's.
+                self.video_held[req.slot].store(false, .release);
             }
         }
         if (self.video_buffers[req.slot] == null) {
@@ -1189,10 +1274,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
                 const pl = req.planes[pi];
                 params.add(pl.fd, pi, pl.offset, pl.stride, pl.modifier);
             }
-            self.video_buffers[req.slot] = params.createImmed(@intCast(req.width), @intCast(req.height), req.fourcc, 0);
+            const nb = params.createImmed(@intCast(req.width), @intCast(req.height), req.fourcc, 0);
             params.destroy();
+            nb.setListener(&video_buffer_listener, &self.video_held[req.slot]);
+            self.video_buffers[req.slot] = nb;
         }
         const vs = self.video_surface.?;
+        self.video_held[req.slot].store(true, .release);
         vs.attach(self.video_buffers[req.slot], 0, 0);
         vs.damageBuffer(0, 0, @intCast(req.width), @intCast(req.height));
         self.video_pending.store(true, .release);
@@ -1208,6 +1296,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         var stx: linux.Statx = undefined;
         if (linux.errno(linux.statx(fd, "", at_empty_path, .{ .INO = true }, &stx)) != .SUCCESS) return 0;
         return stx.ino;
+    }
+
+    const video_buffer_listener = wl.Buffer.Listener{ .release = onVideoBufferRelease };
+
+    fn onVideoBufferRelease(data: ?*anyopaque, _: *wl.Buffer) callconv(.c) void {
+        const held: *std.atomic.Value(bool) = @ptrCast(@alignCast(data.?));
+        held.store(false, .release);
     }
 
     const video_frame_listener = wl.Callback.Listener{ .done = onVideoFrameDone };
@@ -1730,6 +1825,17 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
 
     /// Apply what other threads staged for this window, on the loop thread.
     fn serviceWake(self: *Window) void {
+        // Hide first: a hide always predates the frames staged with it (it closes the
+        // previous session; the next one presents after). Applied after them, it
+        // would unmap the next session's first frame.
+        if (self.pending_hide_video.swap(false, .acquire)) {
+            if (self.video_surface) |vs| {
+                vs.attach(null, 0, 0);
+                vs.commit();
+                self.video_rect = null;
+                self.damageAll();
+            }
+        }
         const video = self.processVideo();
         if (self.opts.on_compose == null) {
             self.mutex.lock();
@@ -1750,14 +1856,6 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             self.gpa.free(clip);
         }
         if (self.pending_toggle_visible.swap(false, .acquire)) self.setVisible(self.hidden.load(.acquire));
-        if (self.pending_hide_video.swap(false, .acquire)) {
-            if (self.video_surface) |vs| {
-                vs.attach(null, 0, 0);
-                vs.commit();
-                self.video_rect = null;
-                self.damageAll();
-            }
-        }
         if (self.opts.on_wake) |cb| cb(self, video, self.opts.user);
     }
 
@@ -1948,8 +2046,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         } else if (std.mem.eql(u8, iface, "wl_shm")) {
             self.shm = @ptrCast(registry.bind(name, &wl.wl_shm_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) {
-            // v2 has create_immed; nothing past v4 is used.
-            if (ver >= 2) self.dmabuf = @ptrCast(registry.bind(name, &wl.zwp_linux_dmabuf_v1_interface, @min(ver, 4)).?);
+            // v2 has create_immed; v3 announces format+modifier pairs (v4 moves them to
+            // feedback objects, which nothing here needs).
+            if (ver >= 2) {
+                const d: *wl.LinuxDmabuf = @ptrCast(registry.bind(name, &wl.zwp_linux_dmabuf_v1_interface, @min(ver, 3)).?);
+                d.setListener(&dmabuf_listener, self);
+                self.dmabuf = d;
+            }
         } else if (std.mem.eql(u8, iface, "xdg_wm_base")) {
             self.wm_base = @ptrCast(registry.bind(name, &wl.xdg_wm_base_interface, @min(ver, 6)).?);
         } else if (std.mem.eql(u8, iface, "zxdg_decoration_manager_v1")) {

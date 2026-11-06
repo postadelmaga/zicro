@@ -177,6 +177,10 @@ pub const Window = struct {
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }
+    /// No video plane here: no slot is ever free (`presentDmabuf` returns false).
+    pub fn videoSlotFree(_: *Window, _: u8) bool {
+        return false;
+    }
     pub fn waitFrame(_: *Window, _: u32) bool {
         return true;
     }

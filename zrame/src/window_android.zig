@@ -127,6 +127,10 @@ pub const Window = struct {
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }
+    /// No video plane here: no slot is ever free (`presentDmabuf` returns false).
+    pub fn videoSlotFree(_: *Window, _: u8) bool {
+        return false;
+    }
     /// No video plane on this backend (`presentDmabuf` is a no-op): nothing to hide.
     pub fn hideVideo(_: *Window) void {}
 

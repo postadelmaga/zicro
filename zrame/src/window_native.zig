@@ -345,6 +345,12 @@ pub const Window = struct {
         return self.inner.videoBusy();
     }
 
+    /// The producer may render into `slot`: the compositor released it and it is not
+    /// staged for the next commit (see zicro `videoSlotFree`).
+    pub fn videoSlotFree(self: *Window, slot: u8) bool {
+        return self.inner.videoSlotFree(slot);
+    }
+
     /// Block any thread until the compositor's next frame, or `timeout_ms` (false).
     pub fn waitFrame(self: *Window, timeout_ms: u32) bool {
         return self.inner.waitFrame(timeout_ms);

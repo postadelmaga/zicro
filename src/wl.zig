@@ -334,6 +334,17 @@ pub const Subsurface = opaque {
 // --- zwp_linux_dmabuf_v1 ------------------------------------------------------------------
 
 pub const LinuxDmabuf = opaque {
+    /// v3 events: the format/modifier pairs the compositor can import (`format` is
+    /// the v1/v2 form, sent alongside: the format with an implicit modifier).
+    pub const Listener = extern struct {
+        format: *const fn (data: ?*anyopaque, dmabuf: *LinuxDmabuf, format: u32) callconv(.c) void,
+        modifier: *const fn (data: ?*anyopaque, dmabuf: *LinuxDmabuf, format: u32, hi: u32, lo: u32) callconv(.c) void,
+    };
+
+    pub fn setListener(self: *LinuxDmabuf, listener: *const Listener, data: ?*anyopaque) void {
+        addListener(self, listener, data);
+    }
+
     pub fn createParams(self: *LinuxDmabuf) *BufferParams {
         const p = wl_proxy_marshal_flags(proxy(self), 1, &zwp_linux_buffer_params_v1_interface, version(self), 0, @as(?*Proxy, null));
         return @ptrCast(p.?);

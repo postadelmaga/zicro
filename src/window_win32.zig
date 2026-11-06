@@ -671,6 +671,10 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }
+    /// No video plane here: no slot is ever free (`presentDmabuf` returns false).
+    pub fn videoSlotFree(_: *Window, _: u8) bool {
+        return false;
+    }
 
     pub fn hideVideo(_: *Window) void {}
 

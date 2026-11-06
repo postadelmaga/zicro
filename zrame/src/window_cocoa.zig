@@ -164,6 +164,10 @@ pub const Window = struct {
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }
+    /// No video plane here: no slot is ever free (`presentDmabuf` returns false).
+    pub fn videoSlotFree(_: *Window, _: u8) bool {
+        return false;
+    }
 
     /// API parity with the Wayland backend: no vsync hook is wired, so return `false` at
     /// once — the caller degrades to its own software pacer (same contract as Win32).
