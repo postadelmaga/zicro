@@ -137,6 +137,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// Counter of the main surface's frame callbacks; `waitFrame` futex-waits on it.
     frame_seq: std.atomic.Value(u32) = .init(0),
     frame_cb: ?*wl.Callback = null,
+    /// Set by an unmap (remap for a resize, hide to tray) until the compositor has
+    /// seen it: configures that arrive meanwhile were sent BEFORE the unmap, which
+    /// reset the xdg state — acking one is the fatal "wrong configure serial", and
+    /// drawing on one attaches before the real (re)configure.
+    unmap_sync: ?*wl.Callback = null,
     /// A frame callback is in flight: the next redraw waits for it (one commit per
     /// refresh, never more).
     frame_cb_pending: bool = false,
@@ -527,6 +532,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// The per-surface half of the teardown, shared by root and children.
     fn destroySurfaceState(self: *Window) void {
         self.cancelFrameCallback();
+        if (self.unmap_sync) |cb| cb.destroy();
+        self.unmap_sync = null;
         for (self.active_popups.items) |p| p.destroy();
         self.active_popups.deinit(self.gpa);
         for (self.video_buffers) |vb| {
@@ -954,6 +961,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const surface = self.surface.?;
         surface.attach(null, 0, 0);
         surface.commit();
+        self.markUnmapped();
         self.configured = false;
         surface.commit();
         self.cancelFrameCallback();
@@ -979,6 +987,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             if (self.surface) |surface| {
                 surface.attach(null, 0, 0);
                 surface.commit();
+                self.markUnmapped();
             }
             self.configured = false;
             self.cancelFrameCallback();
@@ -2069,6 +2078,22 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         wm_base.pong(serial);
     }
 
+    /// After an unmap commit: drop the configures already in flight (see `unmap_sync`).
+    fn markUnmapped(self: *Window) void {
+        if (self.unmap_sync) |cb| cb.destroy();
+        const cb = self.rt().display.sync();
+        cb.setListener(&unmap_sync_listener, self);
+        self.unmap_sync = cb;
+    }
+
+    const unmap_sync_listener = wl.Callback.Listener{ .done = onUnmapSynced };
+
+    fn onUnmapSynced(data: ?*anyopaque, callback: *wl.Callback, _: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        callback.destroy();
+        if (self.unmap_sync == callback) self.unmap_sync = null;
+    }
+
     const decoration_listener = wl.ZxdgToplevelDecoration.Listener{ .configure = onDecorationConfigure };
 
     /// The compositor may override the requested mode: whatever it picks is fine.
@@ -2078,6 +2103,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
 
     fn onXdgConfigure(data: ?*anyopaque, xdg_surface: *wl.XdgSurface, serial: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
+        // Sent before our unmap reached the compositor: that state is gone.
+        if (self.unmap_sync != null) return;
         xdg_surface.ackConfigure(serial);
         self.configured = true;
         self.damageAll();

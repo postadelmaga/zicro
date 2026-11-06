@@ -19,7 +19,14 @@ const std = @import("std");
 // --- libwayland-client core -----------------------------------------------------------
 
 pub const Proxy = opaque {};
-pub const Display = opaque {};
+pub const Display = opaque {
+    /// `wl_display.sync`: its `done` arrives after every event the compositor sent
+    /// before it handled the requests flushed so far — a marker in the event stream.
+    pub fn sync(self: *Display) *Callback {
+        const p = wl_proxy_marshal_flags(proxy(self), 0, &wl_callback_interface, version(self), 0, @as(?*Proxy, null));
+        return @ptrCast(p.?);
+    }
+};
 
 pub const Interface = extern struct {
     name: [*:0]const u8,
