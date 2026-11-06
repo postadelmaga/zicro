@@ -29,6 +29,14 @@ const is_linux = builtin.os.tag == .linux;
 
 pub const Error = error{ OpenFailed, Unsupported };
 
+/// Name the app's audio streams (PipeWire `application.id`/`application.name`) before
+/// opening a device. The session manager remembers a volume per stream identity: an app
+/// that also plays through another engine naming itself the same way (mpv's
+/// `audio-client-name`) keeps one volume for both. No-op elsewhere. `id` is copied.
+pub fn setAppId(id: [:0]const u8) void {
+    if (comptime is_linux) zicro_pw_set_app_id(id.ptr);
+}
+
 /// Hardware audio output. Wrap with `audio.AudioOut.of(DeviceOut, &dev)` to feed an
 /// `AudioSink`, or call `play()` directly. Not thread-safe: one producer thread.
 pub const DeviceOut = struct {
@@ -506,6 +514,7 @@ extern fn zicro_pw_write(pw: *anyopaque, src: [*]const f32, frames: usize) c_int
 extern fn zicro_pw_read(pw: *anyopaque, dst: [*]f32, frames: usize) usize;
 extern fn zicro_pw_delay_frames(pw: *anyopaque) u32;
 extern fn zicro_pw_close(pw: *anyopaque) void;
+extern fn zicro_pw_set_app_id(id: [*:0]const u8) void;
 
 const PipeWireOut = struct {
     handle: *anyopaque,

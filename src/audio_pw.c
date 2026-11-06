@@ -50,6 +50,15 @@
 // 3-4 on systems that crackle under load.
 #define ZICRO_PW_TARGET_QUANTA 2
 
+// Identity of the app's streams (application.id/name): the session manager keys the
+// remembered volume on it, so an app whose audio also comes from another engine (mpv,
+// which names itself) sets the same id and the user's volume follows both.
+static char app_id[128];
+
+void zicro_pw_set_app_id(const char *id) {
+    snprintf(app_id, sizeof(app_id), "%s", id ? id : "");
+}
+
 struct zicro_pw {
     struct pw_thread_loop *loop;
     struct pw_stream *stream;
@@ -203,6 +212,10 @@ static struct zicro_pw *pw_open(uint32_t rate, uint16_t channels, int capture) {
         PW_KEY_MEDIA_ROLE, "Production",
         PW_KEY_NODE_LATENCY, latency,
         NULL);
+    if (props && app_id[0]) {
+        pw_properties_set(props, PW_KEY_APP_ID, app_id);
+        pw_properties_set(props, PW_KEY_APP_NAME, app_id);
+    }
 
     pw->stream = pw_stream_new_simple(
         pw_thread_loop_get_loop(pw->loop),
