@@ -436,7 +436,12 @@ fn addNativeDeps(b: *std.Build, text_c: *TextCCache, mod: *std.Build.Module, tar
     }
 
     // winmm: backend audio waveOut (audio_device.zig) on Windows.
-    if (features.winmm) mod.linkSystemLibrary("winmm", .{});
+    if (features.winmm) {
+        mod.linkSystemLibrary("winmm", .{});
+        // WASAPI output (audio_wasapi.c): COM from ole32, the rest via vtables.
+        mod.addCSourceFile(.{ .file = b.path("src/audio_wasapi.c"), .flags = &.{ "-O2", "-fno-sanitize=undefined" } });
+        mod.linkSystemLibrary("ole32", .{});
+    }
 
     // macOS Cocoa windowing backend (AppKit via the ObjC runtime + CoreGraphics present).
     // Only libobjc and the CG functions are needed at LINK time — AppKit classes resolve

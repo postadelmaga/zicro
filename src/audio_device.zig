@@ -4,8 +4,9 @@
 //! devices that drive the sound card, so an [`AudioSink`](audio.AudioSink) actually makes
 //! noise and an [`AudioSource`](audio.AudioSource) actually hears. Platform backend behind a
 //! comptime switch, like the window backends:
-//!   - **Windows** → `winmm` **waveOut** / **waveIn** (a plain C API — no COM to hand-declare;
-//!     Wine implements it too), double-buffered with a small pool of `WAVEHDR`s.
+//!   - **Windows** → **WASAPI** shared-mode output (src/audio_wasapi.c: follows the default
+//!     endpoint, reopens after a device loss, reports real latency), `winmm` **waveOut** as
+//!     the fallback when WASAPI can't open; capture stays on **waveIn**.
 //!   - **Linux**   → **ALSA** `snd_pcm` (`default` device), blocking interleaved reads/writes.
 //!   - **macOS**   → **AudioQueue** output (AudioToolbox, opened at runtime: nothing to
 //!     link, so cross-compiles need no SDK). Capture stays the no-op device.
@@ -125,7 +126,7 @@ pub const DeviceIn = struct {
 // ── Backend selection ───────────────────────────────────────────────────────
 // On Linux both audio backends are tried at runtime: PipeWire first (low latency), ALSA as
 // the fallback when no PipeWire graph is reachable (see LinuxOut/LinuxIn).
-const Backend = if (is_win) WaveOut else if (is_linux) LinuxOut else if (is_mac) MacOut else NullDev;
+const Backend = if (is_win) WinOut else if (is_linux) LinuxOut else if (is_mac) MacOut else NullDev;
 const InBackend = if (is_win) WaveIn else if (is_linux) LinuxIn else NullIn;
 
 /// Fallback for platforms without a backend: silent, always "succeeds".
@@ -195,7 +196,22 @@ const MacOut = struct {
         AudioQueueStart: *const fn (AudioQueueRef, ?*const anyopaque) callconv(.c) OSStatus,
         AudioQueueStop: *const fn (AudioQueueRef, bool) callconv(.c) OSStatus,
         AudioQueueDispose: *const fn (AudioQueueRef, bool) callconv(.c) OSStatus,
+        AudioQueueGetCurrentTime: *const fn (AudioQueueRef, ?*anyopaque, *AudioTimeStamp, ?*u8) callconv(.c) OSStatus,
     };
+    /// CoreAudio's AudioTimeStamp (64 bytes): only `mSampleTime` is read — the queue's
+    /// playback position, in frames of the queue's own format, since `AudioQueueStart`.
+    const AudioTimeStamp = extern struct {
+        mSampleTime: f64,
+        mHostTime: u64,
+        mRateScalar: f64,
+        mWordClockTime: u64,
+        mSMPTETime: [24]u8,
+        mFlags: u32,
+        mReserved: u32,
+    };
+    comptime {
+        std.debug.assert(@sizeOf(AudioTimeStamp) == 64);
+    }
     const toolbox_path = "/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox";
     var api_lock: std.atomic.Value(bool) = .init(false);
     var api: ?Api = null;
@@ -226,6 +242,9 @@ const MacOut = struct {
     bufs: [NBUF]?*AudioQueueBuffer,
     next: usize,
     started: bool,
+    channels: u16,
+    /// Frames handed to the queue since start (the producer thread only).
+    submitted: u64,
 
     fn onDone(user: ?*anyopaque, _: AudioQueueRef, buf: *AudioQueueBuffer) callconv(.c) void {
         const sh: *Shared = @ptrCast(@alignCast(user.?));
@@ -253,7 +272,7 @@ const MacOut = struct {
             std.heap.c_allocator.destroy(shared);
             return Error.OpenFailed;
         }
-        return .{ .a = a, .q = q, .shared = shared, .bufs = @splat(null), .next = 0, .started = false };
+        return .{ .a = a, .q = q, .shared = shared, .bufs = @splat(null), .next = 0, .started = false, .channels = channels, .submitted = 0 };
     }
 
     /// Blocking write = backpressure, capped at ~2 s like WaveOut: a queue that never
@@ -287,11 +306,20 @@ const MacOut = struct {
             return;
         }
         if (!self.started) self.started = self.a.AudioQueueStart(self.q, null) == 0;
+        self.submitted += samples.len / @max(self.channels, 1);
         self.next = (i + 1) % NBUF;
     }
 
-    fn latencyFrames(_: *const MacOut) ?u32 {
-        return null;
+    /// Frames queued and not yet played: submitted minus the queue's playback position
+    /// (`AudioQueueGetCurrentTime`). The output device's own hardware latency (a few ms)
+    /// is not included. `null` before the queue starts or if the position is unavailable.
+    fn latencyFrames(self: *const MacOut) ?u32 {
+        if (!self.started) return null;
+        var ts: AudioTimeStamp = undefined;
+        if (self.a.AudioQueueGetCurrentTime(self.q, null, &ts, null) != 0) return null;
+        if (!(ts.mSampleTime >= 0)) return null;
+        const played: u64 = @intFromFloat(ts.mSampleTime);
+        return @intCast(@min(self.submitted -| played, std.math.maxInt(u32)));
     }
 
     fn close(self: *MacOut) void {
@@ -554,6 +582,113 @@ const WaveIn = struct {
         _ = waveInClose(self.hwi);
     }
 };
+
+// ── Windows: WASAPI first, waveOut as the fallback ─────────────────────────
+// Same shape as LinuxOut (PipeWire → ALSA). `ZICRO_AUDIO=waveout` forces the fallback,
+// for comparisons and for the tests of the fallback path itself.
+const WinOut = union(enum) {
+    wasapi: WasapiOut,
+    waveout: WaveOut,
+
+    fn open(rate: u32, channels: u16) Error!WinOut {
+        const force_waveout = if (std.c.getenv("ZICRO_AUDIO")) |v| std.mem.eql(u8, std.mem.span(v), "waveout") else false;
+        if (!force_waveout) {
+            if (WasapiOut.open(rate, channels)) |w| return .{ .wasapi = w } else |_| {}
+        }
+        return .{ .waveout = try WaveOut.open(rate, channels) };
+    }
+    fn write(self: *WinOut, samples: []const f32) void {
+        switch (self.*) {
+            inline else => |*b| b.write(samples),
+        }
+    }
+    fn latencyFrames(self: *const WinOut) ?u32 {
+        return switch (self.*) {
+            inline else => |*b| b.latencyFrames(),
+        };
+    }
+    fn close(self: *WinOut) void {
+        switch (self.*) {
+            inline else => |*b| b.close(),
+        }
+    }
+};
+
+const WasapiOut = struct {
+    extern fn zicro_wasapi_open(rate: c_uint, channels: c_uint) ?*anyopaque;
+    extern fn zicro_wasapi_write(h: *anyopaque, samples: [*]const f32, frames: c_uint) c_int;
+    extern fn zicro_wasapi_latency(h: *anyopaque) c_int;
+    extern fn zicro_wasapi_close(h: *anyopaque) void;
+
+    h: *anyopaque,
+    channels: u16,
+
+    fn open(rate: u32, channels: u16) Error!WasapiOut {
+        const h = zicro_wasapi_open(rate, channels) orelse return Error.OpenFailed;
+        return .{ .h = h, .channels = channels };
+    }
+    fn write(self: *WasapiOut, samples: []const f32) void {
+        const frames = samples.len / @max(self.channels, 1);
+        if (frames > 0) _ = zicro_wasapi_write(self.h, samples.ptr, @intCast(frames));
+    }
+    fn latencyFrames(self: *const WasapiOut) ?u32 {
+        const l = zicro_wasapi_latency(self.h);
+        return if (l < 0) null else @intCast(l);
+    }
+    fn close(self: *WasapiOut) void {
+        zicro_wasapi_close(self.h);
+    }
+};
+
+/// Loopback capture of the default output's MIX (Windows/WASAPI only), for tests that
+/// must prove samples actually reached the device — see `audio_wasapi.c`. Mono f32.
+pub const Loopback = if (is_win) struct {
+    extern fn zicro_wasapi_loop_open(rate: *c_uint, channels: *c_uint) ?*anyopaque;
+    extern fn zicro_wasapi_loop_read(h: *anyopaque, out: [*]f32, cap: c_int) c_int;
+    extern fn zicro_wasapi_loop_close(h: *anyopaque) void;
+
+    h: *anyopaque,
+    rate: u32,
+
+    pub fn open() Error!@This() {
+        var rate: c_uint = 0;
+        var ch: c_uint = 0;
+        const h = zicro_wasapi_loop_open(&rate, &ch) orelse return Error.OpenFailed;
+        return .{ .h = h, .rate = rate };
+    }
+    /// Drains what was captured since the last call into `out`; returns samples read.
+    pub fn read(self: *@This(), out: []f32) ?usize {
+        const n = zicro_wasapi_loop_read(self.h, out.ptr, @intCast(@min(out.len, std.math.maxInt(c_int))));
+        return if (n < 0) null else @intCast(n);
+    }
+    pub fn close(self: *@This()) void {
+        zicro_wasapi_loop_close(self.h);
+    }
+} else struct {
+    rate: u32 = 0,
+    pub fn open() Error!@This() {
+        return Error.Unsupported;
+    }
+    pub fn read(_: *@This(), _: []f32) ?usize {
+        return null;
+    }
+    pub fn close(_: *@This()) void {}
+};
+
+/// Active output endpoints as "name\n" lines (the default one prefixed "* "), for
+/// diagnostics; returns how many. Only Windows enumerates for now (elsewhere: 0 and
+/// an empty string — the backends there always play on the system default).
+pub fn listOutputs(buf: []u8) usize {
+    if (comptime is_win) {
+        const f = struct {
+            extern fn zicro_wasapi_list(out: [*]u8, cap: c_int) c_int;
+        };
+        const n = f.zicro_wasapi_list(buf.ptr, @intCast(@min(buf.len, std.math.maxInt(c_int))));
+        return if (n < 0) 0 else @intCast(n);
+    }
+    if (buf.len > 0) buf[0] = 0;
+    return 0;
+}
 
 // ── Linux: ALSA snd_pcm ─────────────────────────────────────────────────────
 const Alsa = struct {
