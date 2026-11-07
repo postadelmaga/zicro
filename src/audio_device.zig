@@ -7,6 +7,8 @@
 //!   - **Windows** → `winmm` **waveOut** / **waveIn** (a plain C API — no COM to hand-declare;
 //!     Wine implements it too), double-buffered with a small pool of `WAVEHDR`s.
 //!   - **Linux**   → **ALSA** `snd_pcm` (`default` device), blocking interleaved reads/writes.
+//!   - **macOS**   → **AudioQueue** output (AudioToolbox, opened at runtime: nothing to
+//!     link, so cross-compiles need no SDK). Capture stays the no-op device.
 //!   - other       → a no-op device (compiles everywhere; silent output / silent capture).
 //!
 //! The device opens at a FIXED format — 32-bit float, interleaved, `channels`×`rate` — and
@@ -26,6 +28,7 @@ pub const AudioBlock = media.AudioBlock;
 
 const is_win = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
+const is_mac = builtin.os.tag == .macos;
 
 pub const Error = error{ OpenFailed, Unsupported };
 
@@ -122,7 +125,7 @@ pub const DeviceIn = struct {
 // ── Backend selection ───────────────────────────────────────────────────────
 // On Linux both audio backends are tried at runtime: PipeWire first (low latency), ALSA as
 // the fallback when no PipeWire graph is reachable (see LinuxOut/LinuxIn).
-const Backend = if (is_win) WaveOut else if (is_linux) LinuxOut else NullDev;
+const Backend = if (is_win) WaveOut else if (is_linux) LinuxOut else if (is_mac) MacOut else NullDev;
 const InBackend = if (is_win) WaveIn else if (is_linux) LinuxIn else NullIn;
 
 /// Fallback for platforms without a backend: silent, always "succeeds".
@@ -148,6 +151,154 @@ const NullIn = struct {
         return buf.len / @max(channels, 1);
     }
     fn close(_: *NullIn) void {}
+};
+
+// ── macOS: AudioToolbox AudioQueue ─────────────────────────────────────────
+// Same shape as WaveOut: a small pool of queue buffers, `write` copies a block into the
+// next free one (waiting, with a cap, for the hardware to hand it back) and enqueues it.
+// The queue runs its callbacks on its own internal thread (run loop NULL): the callback
+// only flips the buffer's "busy" flag. That shared state lives on the heap, because the
+// backend value is moved after `open` and the callback keeps the pointer.
+const MacOut = struct {
+    const OSStatus = i32;
+    const AudioQueueRef = *anyopaque;
+    const AudioStreamBasicDescription = extern struct {
+        mSampleRate: f64,
+        mFormatID: u32,
+        mFormatFlags: u32,
+        mBytesPerPacket: u32,
+        mFramesPerPacket: u32,
+        mBytesPerFrame: u32,
+        mChannelsPerFrame: u32,
+        mBitsPerChannel: u32,
+        mReserved: u32 = 0,
+    };
+    const AudioQueueBuffer = extern struct {
+        mAudioDataBytesCapacity: u32,
+        mAudioData: [*]u8,
+        mAudioDataByteSize: u32,
+        mUserData: ?*anyopaque,
+        mPacketDescriptionCapacity: u32,
+        mPacketDescriptions: ?*anyopaque,
+        mPacketDescriptionCount: u32,
+    };
+    const Callback = *const fn (?*anyopaque, AudioQueueRef, *AudioQueueBuffer) callconv(.c) void;
+    const kAudioFormatLinearPCM: u32 = 0x6C70636D; // 'lpcm'
+    const kAudioFormatFlagIsFloat: u32 = 1 << 0;
+    const kAudioFormatFlagIsPacked: u32 = 1 << 3;
+
+    const Api = struct {
+        AudioQueueNewOutput: *const fn (*const AudioStreamBasicDescription, Callback, ?*anyopaque, ?*anyopaque, ?*anyopaque, u32, *AudioQueueRef) callconv(.c) OSStatus,
+        AudioQueueAllocateBuffer: *const fn (AudioQueueRef, u32, **AudioQueueBuffer) callconv(.c) OSStatus,
+        AudioQueueFreeBuffer: *const fn (AudioQueueRef, *AudioQueueBuffer) callconv(.c) OSStatus,
+        AudioQueueEnqueueBuffer: *const fn (AudioQueueRef, *AudioQueueBuffer, u32, ?*const anyopaque) callconv(.c) OSStatus,
+        AudioQueueStart: *const fn (AudioQueueRef, ?*const anyopaque) callconv(.c) OSStatus,
+        AudioQueueStop: *const fn (AudioQueueRef, bool) callconv(.c) OSStatus,
+        AudioQueueDispose: *const fn (AudioQueueRef, bool) callconv(.c) OSStatus,
+    };
+    const toolbox_path = "/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox";
+    var api_lock: std.atomic.Value(bool) = .init(false);
+    var api: ?Api = null;
+
+    /// The framework stays loaded for the process lifetime (it lives in the dyld shared
+    /// cache anyway): a queue's callbacks must never outlive the code that serves them.
+    fn getApi() ?*const Api {
+        while (api_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer api_lock.store(false, .release);
+        if (api) |*a| return a;
+        var lib = std.DynLib.open(toolbox_path) catch return null;
+        var a: Api = undefined;
+        inline for (@typeInfo(Api).@"struct".field_names, @typeInfo(Api).@"struct".field_types) |name, T| {
+            @field(a, name) = lib.lookup(T, name) orelse return null;
+        }
+        api = a;
+        return &api.?;
+    }
+
+    extern "c" fn usleep(usec: c_uint) c_int;
+
+    const NBUF = 8;
+    const Shared = struct { busy: [NBUF]std.atomic.Value(bool) };
+
+    a: *const Api,
+    q: AudioQueueRef,
+    shared: *Shared,
+    bufs: [NBUF]?*AudioQueueBuffer,
+    next: usize,
+    started: bool,
+
+    fn onDone(user: ?*anyopaque, _: AudioQueueRef, buf: *AudioQueueBuffer) callconv(.c) void {
+        const sh: *Shared = @ptrCast(@alignCast(user.?));
+        const idx = @intFromPtr(buf.mUserData) - 1;
+        sh.busy[idx].store(false, .release);
+    }
+
+    fn open(rate: u32, channels: u16) Error!MacOut {
+        const a = getApi() orelse return Error.OpenFailed;
+        const shared = std.heap.c_allocator.create(Shared) catch return Error.OpenFailed;
+        for (&shared.busy) |*b| b.* = .init(false);
+        const frame_bytes: u32 = @as(u32, channels) * 4;
+        const fmt = AudioStreamBasicDescription{
+            .mSampleRate = @floatFromInt(rate),
+            .mFormatID = kAudioFormatLinearPCM,
+            .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            .mBytesPerPacket = frame_bytes,
+            .mFramesPerPacket = 1,
+            .mBytesPerFrame = frame_bytes,
+            .mChannelsPerFrame = channels,
+            .mBitsPerChannel = 32,
+        };
+        var q: AudioQueueRef = undefined;
+        if (a.AudioQueueNewOutput(&fmt, onDone, shared, null, null, 0, &q) != 0) {
+            std.heap.c_allocator.destroy(shared);
+            return Error.OpenFailed;
+        }
+        return .{ .a = a, .q = q, .shared = shared, .bufs = @splat(null), .next = 0, .started = false };
+    }
+
+    /// Blocking write = backpressure, capped at ~2 s like WaveOut: a queue that never
+    /// drains (no output device) drops the block instead of hanging the producer.
+    fn write(self: *MacOut, samples: []const f32) void {
+        const bytes = std.mem.sliceAsBytes(samples);
+        const i = self.next;
+        var spins: u32 = 0;
+        while (self.shared.busy[i].load(.acquire)) : (spins += 1) {
+            if (spins > 2000) return;
+            _ = usleep(1000);
+        }
+        if (self.bufs[i]) |b| {
+            if (b.mAudioDataBytesCapacity < bytes.len) {
+                _ = self.a.AudioQueueFreeBuffer(self.q, b);
+                self.bufs[i] = null;
+            }
+        }
+        if (self.bufs[i] == null) {
+            var nb: *AudioQueueBuffer = undefined;
+            if (self.a.AudioQueueAllocateBuffer(self.q, @intCast(bytes.len), &nb) != 0) return;
+            nb.mUserData = @ptrFromInt(i + 1);
+            self.bufs[i] = nb;
+        }
+        const b = self.bufs[i].?;
+        @memcpy(b.mAudioData[0..bytes.len], bytes);
+        b.mAudioDataByteSize = @intCast(bytes.len);
+        self.shared.busy[i].store(true, .release);
+        if (self.a.AudioQueueEnqueueBuffer(self.q, b, 0, null) != 0) {
+            self.shared.busy[i].store(false, .release);
+            return;
+        }
+        if (!self.started) self.started = self.a.AudioQueueStart(self.q, null) == 0;
+        self.next = (i + 1) % NBUF;
+    }
+
+    fn latencyFrames(_: *const MacOut) ?u32 {
+        return null;
+    }
+
+    fn close(self: *MacOut) void {
+        _ = self.a.AudioQueueStop(self.q, true); // immediate: no callback after this returns
+        _ = self.a.AudioQueueDispose(self.q, true); // frees the buffers too
+        std.heap.c_allocator.destroy(self.shared);
+    }
 };
 
 // ── Windows: winmm shared constants/types/decls (WaveOut and WaveIn are otherwise
