@@ -130,6 +130,15 @@ fn msgId(obj: id, sel: [*:0]const u8) id {
     return f(obj, sel_registerName(sel));
 }
 /// `[obj sel]` → void.
+/// La `NSWindow` di Cocotron/Zart (piattaforma senza schermo) ha un `platformWindow`;
+/// quella di macOS no, e un selettore sconosciuto è un'eccezione che chiude l'app.
+/// Null dove la finestra non lo offre: si va sui percorsi di macOS.
+fn platformWindow(win: id) id {
+    const responds: *const fn (id, SEL, SEL) callconv(.c) bool = @ptrCast(&objc_msgSend);
+    if (!responds(win, sel_registerName("respondsToSelector:"), sel_registerName("platformWindow"))) return null;
+    return msgId(win, "platformWindow");
+}
+
 fn msgVoid(obj: id, sel: [*:0]const u8) void {
     const f: *const fn (id, SEL) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(obj, sel_registerName(sel));
@@ -522,7 +531,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     /// path is macOS-only; the Z backend (window_z.zig) presents into its Scenic VMO.
     fn present(self: *Window) void {
         const win = self.win orelse return;
-        if (msgId(win, "platformWindow")) |pw| {
+        if (platformWindow(win)) |pw| {
             const poisoned = msgId(pw, "cgContext");
             const surface = if (poisoned) |c| msgId(c, "surface") else null;
             if (surface) |s| {
@@ -576,12 +585,12 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     }
 
     pub fn beginMove(self: *Window) void {
-        const pw = msgId(self.win orelse return, "platformWindow");
+        const pw = platformWindow(self.win orelse return);
         if (pw) |p| msgVoid(p, "zartBeginMove");
     }
 
     pub fn beginResize(self: *Window, edge: u32) void {
-        const pw = msgId(self.win orelse return, "platformWindow");
+        const pw = platformWindow(self.win orelse return);
         if (pw) |p| msgVoidInt(p, "zartBeginResize:", edge);
     }
 
