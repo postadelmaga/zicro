@@ -84,6 +84,15 @@ pub const DeviceOut = struct {
         return self.backend.latencyFrames();
     }
 
+    /// How many times the backend reopened its stream after losing the device (or after
+    /// the default device changed), or `null` when the backend doesn't reopen by itself
+    /// (everything but WASAPI). Diagnostics and tests: a removal that never shows up here
+    /// was never noticed.
+    pub fn reopens(self: *const DeviceOut) ?u32 {
+        if (comptime Backend != WinOut) return null;
+        return self.backend.reopens();
+    }
+
     pub fn close(self: *DeviceOut) void {
         self.backend.close();
     }
@@ -607,6 +616,12 @@ const WinOut = union(enum) {
             inline else => |*b| b.latencyFrames(),
         };
     }
+    fn reopens(self: *const WinOut) ?u32 {
+        return switch (self.*) {
+            .wasapi => |*b| b.reopens(),
+            else => null,
+        };
+    }
     fn close(self: *WinOut) void {
         switch (self.*) {
             inline else => |*b| b.close(),
@@ -619,6 +634,7 @@ const WasapiOut = struct {
     extern fn zicro_wasapi_write(h: *anyopaque, samples: [*]const f32, frames: c_uint) c_int;
     extern fn zicro_wasapi_latency(h: *anyopaque) c_int;
     extern fn zicro_wasapi_close(h: *anyopaque) void;
+    extern fn zicro_wasapi_reopens(h: *anyopaque) c_uint;
 
     h: *anyopaque,
     channels: u16,
@@ -634,6 +650,9 @@ const WasapiOut = struct {
     fn latencyFrames(self: *const WasapiOut) ?u32 {
         const l = zicro_wasapi_latency(self.h);
         return if (l < 0) null else @intCast(l);
+    }
+    fn reopens(self: *const WasapiOut) u32 {
+        return zicro_wasapi_reopens(self.h);
     }
     fn close(self: *WasapiOut) void {
         zicro_wasapi_close(self.h);
