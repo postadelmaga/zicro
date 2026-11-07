@@ -60,6 +60,10 @@ pub const Window = struct {
     scrollbars: scroll.Scroll = .{ .follow_content = true },
 
     mailbox: chrome.FrameMailbox = .{},
+    /// `requestResize` da un thread qualsiasi: (w << 32) | h, 0 = nessuna richiesta.
+    /// AppKit va toccato solo dal main thread (altrimenti `setFrame` da un thread di
+    /// lavoro termina il processo: "transaction must be valid"); lo applica `innerTick`.
+    pending_resize: std.atomic.Value(u64) = .init(0),
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const self = try gpa.create(Window);
@@ -87,6 +91,8 @@ pub const Window = struct {
             .on_key = innerKey,
             .on_mouse = innerMouse,
             .on_close_request = if (opts.on_close_request != null) innerCloseRequest else null,
+            .on_tick = innerTick,
+            .tick_ms = 1,
             .user = self,
         });
         return self;
@@ -207,8 +213,19 @@ pub const Window = struct {
         self.inner.setContentSize(@max(target_w, 160), @max(target_h, 120));
     }
 
+    /// Come `animateResize`, ma da qualsiasi thread: il main thread la applica al
+    /// prossimo giro del loop (vince l'ultima richiesta).
     pub fn requestResize(self: *Window, width: u32, height: u32) void {
-        self.animateResize(width, height);
+        const w: u64 = @max(width, 1);
+        const h: u64 = @max(height, 1);
+        self.pending_resize.store((w << 32) | h, .release);
+    }
+
+    /// Main thread, a ogni giro del loop di zicro, fuori dal lock dei pixel.
+    fn innerTick(_: *zicro.window.Window, user: ?*anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(user.?));
+        const v = self.pending_resize.swap(0, .acq_rel);
+        if (v != 0) self.animateResize(@intCast(v >> 32), @truncate(v));
     }
 
     pub fn textFont(self: *Window) !*text.Font {
