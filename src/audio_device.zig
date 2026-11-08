@@ -328,20 +328,24 @@ const MacOut = struct {
 
     /// Frames queued and not yet played: submitted minus the queue's playback position
     /// (`AudioQueueGetCurrentTime`). The output device's own hardware latency (a few ms)
-    /// is not included. `null` before the queue starts or if the position is unavailable.
-    /// The position is capped at the real time elapsed since the start: on the GitHub
-    /// macOS VMs, with large blocks (4096-frame ALAC or PCM packets) `mSampleTime` ran
-    /// ~0.5 s ahead of the wall clock right after the start, i.e. the clock claimed
-    /// audio played faster than real time. No device can, so the cap only ever
-    /// corrects a position that is impossible.
+    /// is not included. `null` only before the queue starts.
     fn latencyFrames(self: *const MacOut) ?u32 {
         if (!self.started) return null;
+        // Right after AudioQueueStart the queue may have no position yet (the call
+        // fails or mSampleTime < 0): nothing has played, so everything submitted is
+        // queued. Returning null there made the player fall back to its fixed 30 ms
+        // estimate with ~0.6 s already queued (seen on the GitHub macOS VMs with
+        // fast-decoding WAV): the audio clock ran ~0.5 s ahead of real time.
         var ts: AudioTimeStamp = undefined;
-        if (self.a.AudioQueueGetCurrentTime(self.q, null, &ts, null) != 0) return null;
-        if (!(ts.mSampleTime >= 0)) return null;
+        const pos: u64 = if (self.a.AudioQueueGetCurrentTime(self.q, null, &ts, null) == 0 and ts.mSampleTime >= 0)
+            @intFromFloat(ts.mSampleTime)
+        else
+            0;
+        // A device never plays faster than real time: the position is bounded by the
+        // time elapsed since the start, whatever the queue reports.
         const elapsed_ms: u64 = @intCast(@max(0, time.monotonicMs() - self.start_ms));
         const wall: u64 = elapsed_ms * self.rate / 1000;
-        const played: u64 = @min(@as(u64, @intFromFloat(ts.mSampleTime)), wall);
+        const played: u64 = @min(pos, wall);
         return @intCast(@min(self.submitted -| played, std.math.maxInt(u32)));
     }
 
