@@ -24,6 +24,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const media = @import("media.zig");
+const time = @import("time.zig");
 
 pub const AudioBlock = media.AudioBlock;
 
@@ -252,8 +253,11 @@ const MacOut = struct {
     next: usize,
     started: bool,
     channels: u16,
+    rate: u32,
     /// Frames handed to the queue since start (the producer thread only).
     submitted: u64,
+    /// `time.monotonicMs` at `AudioQueueStart`: bounds the reported position (below).
+    start_ms: i64,
 
     fn onDone(user: ?*anyopaque, _: AudioQueueRef, buf: *AudioQueueBuffer) callconv(.c) void {
         const sh: *Shared = @ptrCast(@alignCast(user.?));
@@ -281,7 +285,7 @@ const MacOut = struct {
             std.heap.c_allocator.destroy(shared);
             return Error.OpenFailed;
         }
-        return .{ .a = a, .q = q, .shared = shared, .bufs = @splat(null), .next = 0, .started = false, .channels = channels, .submitted = 0 };
+        return .{ .a = a, .q = q, .shared = shared, .bufs = @splat(null), .next = 0, .started = false, .channels = channels, .rate = rate, .submitted = 0, .start_ms = 0 };
     }
 
     /// Blocking write = backpressure, capped at ~2 s like WaveOut: a queue that never
@@ -314,7 +318,10 @@ const MacOut = struct {
             self.shared.busy[i].store(false, .release);
             return;
         }
-        if (!self.started) self.started = self.a.AudioQueueStart(self.q, null) == 0;
+        if (!self.started) {
+            self.started = self.a.AudioQueueStart(self.q, null) == 0;
+            if (self.started) self.start_ms = time.monotonicMs();
+        }
         self.submitted += samples.len / @max(self.channels, 1);
         self.next = (i + 1) % NBUF;
     }
@@ -322,12 +329,19 @@ const MacOut = struct {
     /// Frames queued and not yet played: submitted minus the queue's playback position
     /// (`AudioQueueGetCurrentTime`). The output device's own hardware latency (a few ms)
     /// is not included. `null` before the queue starts or if the position is unavailable.
+    /// The position is capped at the real time elapsed since the start: on the GitHub
+    /// macOS VMs, with large blocks (4096-frame ALAC or PCM packets) `mSampleTime` ran
+    /// ~0.5 s ahead of the wall clock right after the start, i.e. the clock claimed
+    /// audio played faster than real time. No device can, so the cap only ever
+    /// corrects a position that is impossible.
     fn latencyFrames(self: *const MacOut) ?u32 {
         if (!self.started) return null;
         var ts: AudioTimeStamp = undefined;
         if (self.a.AudioQueueGetCurrentTime(self.q, null, &ts, null) != 0) return null;
         if (!(ts.mSampleTime >= 0)) return null;
-        const played: u64 = @intFromFloat(ts.mSampleTime);
+        const elapsed_ms: u64 = @intCast(@max(0, time.monotonicMs() - self.start_ms));
+        const wall: u64 = elapsed_ms * self.rate / 1000;
+        const played: u64 = @min(@as(u64, @intFromFloat(ts.mSampleTime)), wall);
         return @intCast(@min(self.submitted -| played, std.math.maxInt(u32)));
     }
 
