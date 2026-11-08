@@ -126,7 +126,7 @@ pub const Options = struct {
     /// Cocoa, Wayland e Win32 (sul web/Android la chiusura è del sistema).
     on_close_request: ?*const fn (window: *Window, user: ?*anyopaque) bool = null,
     /// Layout-correct text of a key press (xkbcommon) or an IME commit: one UTF-8
-    /// codepoint, `bytes[0..len]`. Additive to `on_key`. Wayland only for now.
+    /// codepoint, `bytes[0..len]`. Additive to `on_key`. Wayland, Win32 and Cocoa.
     on_text: ?*const fn (window: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void = null,
     /// IME pre-edit (composition in progress): `text` is empty when it ends. Wayland only.
     on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,

@@ -130,12 +130,17 @@ fn msgId(obj: id, sel: [*:0]const u8) id {
     return f(obj, sel_registerName(sel));
 }
 /// `[obj sel]` → void.
+/// `[obj respondsToSelector:sel]`: an unknown selector is an exception that ends the app.
+fn responds(obj: id, sel: [*:0]const u8) bool {
+    const f: *const fn (id, SEL, SEL) callconv(.c) bool = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName("respondsToSelector:"), sel_registerName(sel));
+}
+
 /// La `NSWindow` di Cocotron/Zart (piattaforma senza schermo) ha un `platformWindow`;
 /// quella di macOS no, e un selettore sconosciuto è un'eccezione che chiude l'app.
 /// Null dove la finestra non lo offre: si va sui percorsi di macOS.
 fn platformWindow(win: id) id {
-    const responds: *const fn (id, SEL, SEL) callconv(.c) bool = @ptrCast(&objc_msgSend);
-    if (!responds(win, sel_registerName("respondsToSelector:"), sel_registerName("platformWindow"))) return null;
+    if (!responds(win, "platformWindow")) return null;
     return msgId(win, "platformWindow");
 }
 
@@ -249,6 +254,7 @@ const MAX_WINDOWS = 8;
 var g_views: [MAX_WINDOWS]id = @splat(null);
 var g_wins: [MAX_WINDOWS]?*anyopaque = @splat(null);
 var g_view_class: Class = null;
+var g_window_class: Class = null;
 
 fn registerView(view: id, win: *anyopaque) void {
     for (&g_views, &g_wins) |*v, *w| {
@@ -290,6 +296,23 @@ fn ensureViewClass() Class {
     _ = class_addMethod(cls, sel_registerName("isOpaque"), @ptrCast(&imp_no), "c@:");
     objc_registerClassPair(cls);
     g_view_class = cls;
+    return cls;
+}
+
+/// Build the `ZicroWindow` class once: an NSWindow that can become key and main even
+/// when borderless. A plain NSWindow with no title bar (`decorations = false`, where
+/// zrame draws its own chrome) answers NO to `canBecomeKeyWindow`, so it would never
+/// receive key events — on macOS and under Darling alike.
+fn ensureWindowClass() Class {
+    if (g_window_class != null) return g_window_class;
+    const cls = objc_allocateClassPair(class("NSWindow"), "ZicroWindow", 0) orelse {
+        g_window_class = class("ZicroWindow");
+        return g_window_class;
+    };
+    _ = class_addMethod(cls, sel_registerName("canBecomeKeyWindow"), @ptrCast(&imp_yes), "c@:");
+    _ = class_addMethod(cls, sel_registerName("canBecomeMainWindow"), @ptrCast(&imp_yes), "c@:");
+    objc_registerClassPair(cls);
+    g_window_class = cls;
     return cls;
 }
 
@@ -338,6 +361,9 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     mods_shift: bool = false,
     mods_ctrl: bool = false,
     mods_alt: bool = false,
+    /// True while `on_text` delivers text typed on the keyboard (always, here: it comes
+    /// from the key event's `characters`, as WM_CHAR on Win32).
+    text_from_key: bool = false,
     last_tick_ns: u64 = 0,
 
     const backing_buffered: u64 = 2; // NSBackingStoreBuffered
@@ -367,7 +393,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
             .origin = .{ .x = 100, .y = 100 },
             .size = .{ .width = @floatFromInt(opts.width), .height = @floatFromInt(opts.height) },
         };
-        const win_alloc = msgId(class("NSWindow"), "alloc");
+        const win_alloc = msgId(ensureWindowClass(), "alloc");
         const initFrame: *const fn (id, SEL, CGRect, u64, u64, bool) callconv(.c) id = @ptrCast(&objc_msgSend);
         const style_mask: u64 = if (opts.decorations) 1 | 2 | 4 | 8 else 0;
         const win = initFrame(
@@ -584,14 +610,21 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         return 1;
     }
 
+    /// Move the window with the pointer (drag of the client-drawn title bar). The
+    /// Zart backend has its own entry point; elsewhere the standard
+    /// `performWindowDragWithEvent:` (macOS 10.11+, and Darling's AppKit) with the
+    /// event being handled — the button press that started the drag.
     pub fn beginMove(self: *Window) void {
-        const pw = platformWindow(self.win orelse return);
-        if (pw) |p| msgVoid(p, "zartBeginMove");
+        const w = self.win orelse return;
+        if (platformWindow(w)) |p| if (responds(p, "zartBeginMove")) return msgVoid(p, "zartBeginMove");
+        if (!responds(w, "performWindowDragWithEvent:")) return;
+        const ev = msgId(self.app orelse return, "currentEvent") orelse return;
+        msgVoidId(w, "performWindowDragWithEvent:", ev);
     }
 
     pub fn beginResize(self: *Window, edge: u32) void {
         const pw = platformWindow(self.win orelse return);
-        if (pw) |p| msgVoidInt(p, "zartBeginResize:", edge);
+        if (pw) |p| if (responds(p, "zartBeginResize:")) msgVoidInt(p, "zartBeginResize:", edge);
     }
 
     pub fn run(self: *Window) !void {
@@ -694,10 +727,9 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
 
         switch (ns_type) {
             NSKeyDown, NSKeyUp => {
-                const cb = self.opts.on_key orelse return;
                 const code = keyCodeOf(ev);
-                if (code == 0) return;
-                cb(self, code, if (ns_type == NSKeyDown) 1 else 0, self.opts.user);
+                if (code != 0) if (self.opts.on_key) |cb| cb(self, code, if (ns_type == NSKeyDown) 1 else 0, self.opts.user);
+                if (ns_type == NSKeyDown) self.emitText(ev);
             },
             NSLeftMouseDown, NSRightMouseDown, NSOtherMouseDown => {
                 const p = self.mouseAt(ev);
@@ -720,6 +752,35 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
                 self.emitMouse(.{ .kind = .scroll, .x = p.x, .y = p.y, .scroll_dy = -dy * 40.0, .scroll_dx = -dx * 40.0 });
             },
             else => {},
+        }
+    }
+
+    /// Key press → `on_text`, from `characters`: AppKit (and Cocotron, through the X input
+    /// method) has already applied the keyboard layout, dead keys and Option. Shortcuts
+    /// (Command/Control held) type nothing; control characters, DEL and the function-key
+    /// private-use range (arrows, F1…) are keys, not text — the Wayland/Win32 rule.
+    fn emitText(self: *Window, ev: id) void {
+        const cb = self.opts.on_text orelse return;
+        if (msgU64(ev, "modifierFlags") & (ModControl | ModCommand) != 0) return;
+        const chars = msgId(ev, "characters") orelse return;
+        const n = msgU64(chars, "length");
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            const cu = msgCharAt(chars, i);
+            var cp: u21 = cu;
+            if (cu >= 0xD800 and cu <= 0xDBFF) {
+                if (i + 1 >= n) return;
+                const lo = msgCharAt(chars, i + 1);
+                if (lo < 0xDC00 or lo > 0xDFFF) continue;
+                i += 1;
+                cp = 0x10000 + ((@as(u21, cu - 0xD800) << 10) | (lo - 0xDC00));
+            } else if (cu >= 0xDC00 and cu <= 0xDFFF) continue;
+            if (cp < 0x20 or cp == 0x7f or (cp >= 0xF700 and cp <= 0xF8FF)) continue;
+            var bytes: [4]u8 = .{ 0, 0, 0, 0 };
+            const len: u8 = std.unicode.utf8Encode(cp, &bytes) catch continue;
+            self.text_from_key = true;
+            defer self.text_from_key = false;
+            cb(self, bytes, len, self.opts.user);
         }
     }
 

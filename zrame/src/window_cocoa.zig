@@ -55,6 +55,8 @@ pub const Window = struct {
     font: ?text.Font = null,
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
+    /// The last key press went to a panel: its text must not reach the app either.
+    key_consumed: bool = false,
 
     panels: plugin.Registry,
     scrollbars: scroll.Scroll = .{ .follow_content = true },
@@ -89,6 +91,7 @@ pub const Window = struct {
             .height = self.panel_h,
             .on_draw = innerDraw,
             .on_key = innerKey,
+            .on_text = innerText,
             .on_mouse = innerMouse,
             .on_close_request = if (opts.on_close_request != null) innerCloseRequest else null,
             .on_tick = innerTick,
@@ -332,8 +335,8 @@ pub const Window = struct {
 
     // --- composition / input (zicro callbacks) -----------------------------------------
 
-    /// Content fills the whole panel: native decorations, no shadow gutter, no client
-    /// title bar (same geometry as the Win32 opaque escape-hatch).
+    /// Content fills the whole panel: borderless window, no shadow gutter (macOS draws
+    /// the window shadow), no client title bar.
     pub fn contentRect(self: *Window) Rect {
         return .{ .x = 0, .y = 0, .w = self.panel_w, .h = self.panel_h };
     }
@@ -344,11 +347,14 @@ pub const Window = struct {
         return .{ .w = r.w, .h = r.h };
     }
 
-    /// The style used for content compositing: every mask/fade field zeroed so
-    /// `blitRgba` takes its trivial fast path — a square opaque window doesn't want
-    /// rounded/faded content clipping.
+    /// The frame style, as on Wayland: the glass and the rounded corners zrame paints
+    /// itself on a borderless window. The margin (shadow gutter) stays 0: macOS draws
+    /// the shadow of the window. Full screen: square, every mask zeroed.
     fn presentStyle(self: *const Window) Style {
-        return self.opts.style.contentFill();
+        if (self.fullscreen) return self.opts.style.contentFill();
+        var s = self.opts.style;
+        s.margin = 0;
+        return s;
     }
 
     fn innerDraw(canvas: *paint.Canvas, content: zicro.window.Rect, user: ?*anyopaque) void {
@@ -358,19 +364,39 @@ pub const Window = struct {
         // Panels animate on the frame clock (the zicro loop is a steady ~60 Hz).
         _ = self.panels.tick(0.016, self.host());
         self.mailbox.swap();
-        chrome.composeContent(canvas, self.contentRect(), self.contentRect(), &self.mailbox.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        const style = self.presentStyle();
+        canvas.drawChrome(style);
+        chrome.composeContent(canvas, self.contentRect(), self.contentRect(), &self.mailbox.front, style, &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     fn innerKey(_: *zicro.window.Window, key: u32, state: u32, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        if (self.panels.route(.{ .key = .{ .key = key, .pressed = state == 1 } }, self.host())) return;
+        self.key_consumed = false;
+        if (self.panels.route(.{ .key = .{ .key = key, .pressed = state == 1 } }, self.host())) {
+            self.key_consumed = true;
+            return;
+        }
         if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
+    }
+
+    /// Layout-aware text of the key just sent to `innerKey` — not if a panel ate the key.
+    fn innerText(win: *zicro.window.Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(user.?));
+        if (win.text_from_key and self.key_consumed) return;
+        if (self.opts.on_text) |cb| cb(self, bytes, len, self.opts.user);
     }
 
     fn innerMouse(_: *zicro.window.Window, event: zicro.window.MouseEvent, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
         // App-space mouse (see `MouseEvent`): canvas minus the staged-frame/content
         // origin — panels and the resize band stay in canvas coordinates.
-        chrome.forwardMouse(self, event);
+        if (chrome.forwardMouse(self, event)) return;
+        // No title bar to grab: the window drags from near its edge, as on Wayland.
+        if (event.kind == .press and event.button == 272 and !self.fullscreen) {
+            const w: f32 = @floatFromInt(self.panel_w);
+            const h: f32 = @floatFromInt(self.panel_h);
+            const grab: f32 = 30.0;
+            if (event.x < grab or event.y < grab or event.x > w - grab or event.y > h - grab) self.inner.beginMove();
+        }
     }
 };

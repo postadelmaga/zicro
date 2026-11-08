@@ -26,7 +26,8 @@ const Rect = plugin.Rect;
 /// `self` is `*Window` for whichever backend calls this (comptime duck-typed): it needs
 /// `.panels`, `.host()`, `.opts.{on_mouse,user}`, `.contentRect()` and `.mailbox.front`, plus
 /// the optional `.pointer_x`/`.pointer_y` tracking fields some backends keep for other uses.
-pub fn forwardMouse(self: anytype, event: zicro.window.MouseEvent) void {
+/// True when a panel or the app consumed the event.
+pub fn forwardMouse(self: anytype, event: zicro.window.MouseEvent) bool {
     const Self = @TypeOf(self.*);
     if (event.kind == .motion) {
         if (@hasField(Self, "pointer_x")) self.pointer_x = event.x;
@@ -35,11 +36,12 @@ pub fn forwardMouse(self: anytype, event: zicro.window.MouseEvent) void {
     if (event.kind == .leave) {
         // Every panel hears it (hover states fade out), then the app.
         _ = self.panels.route(.leave, self.host());
-    } else if (self.panels.route(panelEvent(event), self.host())) return;
+    } else if (self.panels.route(panelEvent(event), self.host())) return true;
     if (self.opts.on_mouse) |cb| {
         const o = appOrigin(self.contentRect(), &self.mailbox.front);
-        _ = cb(self, appEvent(event, o.x, o.y), self.opts.user);
+        return cb(self, appEvent(event, o.x, o.y), self.opts.user);
     }
+    return false;
 }
 
 /// The panel-seam form of a zicro mouse event (canvas coordinates).

@@ -228,7 +228,7 @@ pub const Window = struct {
 
     fn innerMouse(_: *zicro.window.Window, event: zicro.window.MouseEvent, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        chrome.forwardMouse(self, event);
+        _ = chrome.forwardMouse(self, event);
     }
 
     // Multi-touch gesture from the substrate: reports the center in app coordinates (like innerMouse).
