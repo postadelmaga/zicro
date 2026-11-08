@@ -174,6 +174,7 @@ pub const Window = struct {
             .hidpi = true,
             .resize_band = false,
             .video_native = opts.video_fit == .native,
+            .video_contain = opts.video_fit == .contain,
             .on_key = innerKey,
             .on_text = innerText,
             .on_preedit = innerPreedit,
@@ -342,6 +343,19 @@ pub const Window = struct {
 
     pub fn presentDmabuf(self: *Window, slot: u8, fd: i32, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64) bool {
         return self.inner.presentDmabuf(slot, fd, width, height, stride, fourcc, modifier);
+    }
+
+    /// Would the compositor take a dmabuf of this format and modifier. Any thread.
+    pub fn dmabufSupported(self: *Window, fourcc: u32, modifier: u64) bool {
+        return self.inner.dmabufSupported(fourcc, modifier);
+    }
+
+    /// Radius, in buffer pixels, of the rounded corners that clip the content rect (0 in
+    /// fullscreen and on opaque windows). A dmabuf video plane that fills the content
+    /// rect lies under the window and is NOT clipped by them: its producer rounds its
+    /// own corners with this radius to match.
+    pub fn contentCornerPx(self: *Window) f32 {
+        return self.paintStyle().content_radius;
     }
 
     pub fn presentDmabufPlanes(self: *Window, slot: u8, planes: []const DmabufPlane, width: u32, height: u32, fourcc: u32) bool {

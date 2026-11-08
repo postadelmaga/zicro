@@ -201,6 +201,16 @@ pub const Window = struct {
         self.gutter_right = px;
     }
 
+    /// No dmabuf video plane on this backend.
+    pub fn dmabufSupported(_: *Window, _: u32, _: u64) bool {
+        return false;
+    }
+
+    /// No dmabuf video plane on this backend: nothing to round.
+    pub fn contentCornerPx(_: *Window) f32 {
+        return 0;
+    }
+
     pub fn presentDmabuf(_: *Window, _: u8, _: i32, _: u32, _: u32, _: u32, _: u32, _: u64) bool {
         return false; // GPU zero-copy is a Linux/Wayland path
     }

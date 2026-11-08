@@ -155,6 +155,10 @@ pub const Options = struct {
     /// A dmabuf frame is shown at its own size, centered in the video area, instead of
     /// filling it (see `presentDmabufPlanes`).
     video_native: bool = false,
+    /// A dmabuf frame is scaled to the largest rect of its own aspect ratio that fits
+    /// the video area, centered (letterbox), instead of filling it. Its pixel size
+    /// stays a quality knob, as with fill. Ignored when `video_native` is set.
+    video_contain: bool = false,
     /// Called on the window thread before a redraw picks its buffer: the client declares
     /// what changed with `damage`/`damageAll` (no call = the whole buffer).
     on_before_compose: ?*const fn (window: *Window, user: ?*anyopaque) void = null,

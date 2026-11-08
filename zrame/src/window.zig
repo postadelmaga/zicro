@@ -197,6 +197,10 @@ pub const VideoFit = enum {
     /// render is a PANEL inside a larger card — the rest of the content rect
     /// belongs to `on_draw` (text, chrome) and must not be painted over.
     native,
+    /// The frame is scaled (wp_viewport, free) to the largest rect of its own aspect
+    /// ratio inside the content rect, centered: a video in a window or a screen of
+    /// another shape, letterboxed. Its pixel size is a quality knob, as with `fill`.
+    contain,
 };
 
 pub const Options = struct {

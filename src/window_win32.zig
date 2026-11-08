@@ -664,6 +664,10 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         return false;
     }
 
+    pub fn dmabufSupported(_: *Window, _: u32, _: u64) bool {
+        return false;
+    }
+
     pub fn presentDmabufPlanes(_: *Window, _: u8, _: []const window.DmabufPlane, _: u32, _: u32, _: u32) bool {
         return false;
     }

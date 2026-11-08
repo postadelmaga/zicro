@@ -1296,6 +1296,15 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             vh = @min(req.height, area.h);
             dx = area.x + (area.w - vw) / 2;
             dy = area.y + (area.h - vh) / 2;
+        } else if (self.opts.video_contain and req.width > 0 and req.height > 0) {
+            // Aspect fit: the larger axis ratio decides, the other side is letterboxed.
+            if (@as(u64, area.w) * req.height > @as(u64, area.h) * req.width) {
+                vw = @max(1, @as(u32, @intCast(@as(u64, area.h) * req.width / req.height)));
+            } else {
+                vh = @max(1, @as(u32, @intCast(@as(u64, area.w) * req.height / req.width)));
+            }
+            dx = area.x + (area.w - vw) / 2;
+            dy = area.y + (area.h - vh) / 2;
         }
         const new_rect: PxRect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
         // The parent's hole follows the plane: a moved/resized plane repaints it.
