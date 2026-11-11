@@ -288,9 +288,27 @@ const MacOut = struct {
         return .{ .a = a, .q = q, .shared = shared, .bufs = @splat(null), .next = 0, .started = false, .channels = channels, .rate = rate, .submitted = 0, .start_ms = 0 };
     }
 
-    /// Blocking write = backpressure, capped at ~2 s like WaveOut: a queue that never
-    /// drains (no output device) drops the block instead of hanging the producer.
+    /// Largest buffer handed to the queue, in frames (~85 ms at 48 kHz). A decoder
+    /// frame can be far longer (TTA: ~1 s, Monkey's Audio: ~1.5 s): one buffer per
+    /// write would queue NBUF of them, seconds of audio, while the other codecs queue
+    /// well under a second. Seen on the GitHub macOS VMs: with TTA the queue reported
+    /// ~7 s queued and its position did not move for 6 s.
+    const max_buf_frames = 4096;
+
+    /// Blocking write = backpressure, capped at ~2 s per buffer like WaveOut: a queue
+    /// that never drains (no output device) drops the block instead of hanging the
+    /// producer. Blocks longer than `max_buf_frames` go out as several buffers.
     fn write(self: *MacOut, samples: []const f32) void {
+        const step = max_buf_frames * @as(usize, @max(self.channels, 1));
+        var rest = samples;
+        while (rest.len > 0) {
+            const n = @min(rest.len, step);
+            self.writeBuffer(rest[0..n]);
+            rest = rest[n..];
+        }
+    }
+
+    fn writeBuffer(self: *MacOut, samples: []const f32) void {
         const bytes = std.mem.sliceAsBytes(samples);
         const i = self.next;
         var spins: u32 = 0;
