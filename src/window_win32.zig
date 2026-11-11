@@ -143,6 +143,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     extern "user32" fn GetWindowPlacement(HWND, *WINDOWPLACEMENT) callconv(.winapi) i32;
     extern "user32" fn SendMessageW(HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
     extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
+    extern "user32" fn SetCapture(HWND) callconv(.winapi) HWND;
     extern "user32" fn GetCursorPos(*POINT) callconv(.winapi) i32;
     extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) i32;
     extern "user32" fn UpdateLayeredWindow(HWND, HDC, ?*const POINT, ?*const SIZE, HDC, ?*const POINT, u32, *const BLENDFUNCTION, u32) callconv(.winapi) i32;
@@ -182,6 +183,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_FRAMECHANGED: u32 = 0x0020;
     const SWP_SHOWWINDOW: u32 = 0x0040;
     const ULW_ALPHA: u32 = 0x02;
@@ -198,6 +200,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     const WM_ERASEBKGND: u32 = 0x0014;
     const WM_SETCURSOR: u32 = 0x0020;
     const WM_NCCALCSIZE: u32 = 0x0083;
+    const WM_CAPTURECHANGED: u32 = 0x0215;
     const WM_NCLBUTTONDOWN: u32 = 0x00A1;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
@@ -254,6 +257,13 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     tracking_leave: bool = false,
+    /// Button of the press being delivered to `on_mouse` (0 outside one): `beginMove`
+    /// picks the OS move loop for the left button, its own drag for the others.
+    press_button: u32 = 0,
+    /// A window drag with a non-left button in progress: cursor and window origin
+    /// (screen px) at its start. The OS loop (`WM_NCLBUTTONDOWN`) only follows the
+    /// left button, so the others move the window by hand under capture.
+    move_drag: ?struct { cx: i32, cy: i32, wx: i32, wy: i32 } = null,
     cursor_shape: u32 = wl.CursorShapeDevice.SHAPE_DEFAULT,
     /// True while `on_key` delivers an auto-repeat (WM_KEYDOWN with the previous-state bit).
     key_repeating: bool = false,
@@ -554,6 +564,14 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
 
     /// Hand the drag to the OS move loop (Aero snap included), as from a title bar.
     pub fn beginMove(self: *Window) void {
+        if (self.press_button != 0 and self.press_button != wl.BTN_LEFT) {
+            var c: POINT = .{ .x = 0, .y = 0 };
+            var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+            if (GetCursorPos(&c) == 0 or GetWindowRect(self.hwnd, &r) == 0) return;
+            self.move_drag = .{ .cx = c.x, .cy = c.y, .wx = r.left, .wy = r.top };
+            _ = SetCapture(self.hwnd);
+            return;
+        }
         _ = ReleaseCapture();
         _ = SendMessageW(self.hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
     }
@@ -1048,6 +1066,12 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
                 return 0;
             },
             WM_MOUSEMOVE => {
+                if (self.move_drag) |d| {
+                    var c: POINT = .{ .x = 0, .y = 0 };
+                    if (GetCursorPos(&c) != 0)
+                        _ = SetWindowPos(hwnd, null, d.wx + c.x - d.cx, d.wy + c.y - d.cy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    return 0;
+                }
                 const p = lparamPoint(lparam);
                 self.pointer_x = p[0];
                 self.pointer_y = p[1];
@@ -1066,8 +1090,17 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
                 if (self.needs_redraw) self.redraw();
                 return 0;
             },
+            WM_CAPTURECHANGED => {
+                self.move_drag = null;
+                return 0;
+            },
             WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP => {
                 const pressed = msg == WM_LBUTTONDOWN or msg == WM_RBUTTONDOWN or msg == WM_MBUTTONDOWN;
+                // Any release ends a hand-made drag (see `move_drag`).
+                if (!pressed and self.move_drag != null) {
+                    self.move_drag = null;
+                    _ = ReleaseCapture();
+                }
                 const button: u32 = switch (msg) {
                     WM_LBUTTONDOWN, WM_LBUTTONUP => wl.BTN_LEFT,
                     WM_RBUTTONDOWN, WM_RBUTTONUP => BTN_RIGHT,
@@ -1085,7 +1118,9 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
                     if (msg == WM_LBUTTONDOWN and self.frameless and !self.fullscreen) self.beginMove();
                     return 0;
                 }
+                self.press_button = if (pressed) button else 0;
                 self.mouse(.{ .kind = if (pressed) .press else .release, .x = self.pointer_x, .y = self.pointer_y, .button = button });
+                self.press_button = 0;
                 self.inputRedraw();
                 if (self.needs_redraw) self.redraw();
                 return 0;

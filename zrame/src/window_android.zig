@@ -151,6 +151,7 @@ pub const Window = struct {
         return false;
     }
     pub fn toggleFullscreen(_: *Window) void {}
+    pub fn beginMove(_: *Window) void {} // the activity is full-screen
     pub fn setStyle(self: *Window, style: Style) !void {
         self.opts.style = style;
     }

@@ -421,6 +421,14 @@ pub const Window = struct {
         self.inner.toggleFullscreen();
     }
 
+    /// Start an interactive window move from the press `on_mouse` is handling, with any
+    /// button: the app's own "drag from anywhere" gesture (e.g. the right button on a
+    /// frameless panel). Call it only from inside `on_mouse`, on a `.press`.
+    pub fn beginMove(self: *Window) void {
+        if (self.fullscreen or self.maximized) return;
+        self.inner.beginMove();
+    }
+
     /// Resize the panel to `w`×`h` (kept on screen, re-centered). Window thread.
     pub fn animateResize(self: *Window, target_w: u32, target_h: u32) void {
         self.inner.setContentSize(target_w, target_h);

@@ -219,6 +219,14 @@ pub const Window = struct {
         self.inner.toggleFullscreen();
     }
 
+    /// Start an interactive window move from the press `on_mouse` is handling, with any
+    /// button: the app's own "drag from anywhere" gesture (e.g. the right button on a
+    /// frameless panel). Call it only from inside `on_mouse`, on a `.press`.
+    pub fn beginMove(self: *Window) void {
+        if (self.fullscreen) return;
+        self.inner.beginMove();
+    }
+
     /// Resize the content area to `target_w`×`target_h` (the native frame grows around
     /// it). No animation: AppKit animates frame changes on its own terms.
     pub fn animateResize(self: *Window, target_w: u32, target_h: u32) void {

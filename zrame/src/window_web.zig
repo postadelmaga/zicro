@@ -220,6 +220,7 @@ pub const Window = struct {
     pub fn toggleFullscreen(self: *Window) void {
         self.fullscreen = !self.fullscreen;
     }
+    pub fn beginMove(_: *Window) void {} // the page owns the browser window
     pub fn setStyle(self: *Window, style: Style) !void {
         self.opts.style = style;
     }

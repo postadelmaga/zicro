@@ -190,6 +190,11 @@ fn msgVoidInt(obj: id, sel: [*:0]const u8, arg: i64) void {
     const f: *const fn (id, SEL, i64) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(obj, sel_registerName(sel), arg);
 }
+/// `[obj sel:point]` with a CGPoint argument → void.
+fn msgVoidPoint(obj: id, sel: [*:0]const u8, arg: CGPoint) void {
+    const f: *const fn (id, SEL, CGPoint) callconv(.c) void = @ptrCast(&objc_msgSend);
+    f(obj, sel_registerName(sel), arg);
+}
 /// `[obj sel:size]` with a CGSize argument → void.
 fn msgVoidSize(obj: id, sel: [*:0]const u8, arg: CGSize) void {
     const f: *const fn (id, SEL, CGSize) callconv(.c) void = @ptrCast(&objc_msgSend);
@@ -365,6 +370,13 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     /// from the key event's `characters`, as WM_CHAR on Win32).
     text_from_key: bool = false,
     last_tick_ns: u64 = 0,
+    /// NSEvent type of the press being delivered to `on_mouse` (0 outside one):
+    /// `beginMove` hands a left press to AppKit, the other buttons to `move_drag`.
+    press_type: u64 = 0,
+    /// A window drag with a non-left button in progress: pointer and window origin
+    /// (screen points, y up) at its start. `performWindowDragWithEvent:` follows the
+    /// left button only, so the others move the window by hand on their drag events.
+    move_drag: ?struct { start: CGPoint, origin: CGPoint } = null,
 
     const backing_buffered: u64 = 2; // NSBackingStoreBuffered
     const event_mask_any: u64 = std.math.maxInt(u64); // NSEventMaskAny
@@ -616,6 +628,11 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
     /// event being handled — the button press that started the drag.
     pub fn beginMove(self: *Window) void {
         const w = self.win orelse return;
+        trace("beginMove: press type {d}", .{self.press_type});
+        if (self.press_type == NSRightMouseDown or self.press_type == NSOtherMouseDown) {
+            self.move_drag = .{ .start = msgPoint(class("NSEvent"), "mouseLocation"), .origin = msgRect(w, "frame").origin };
+            return;
+        }
         if (platformWindow(w)) |p| if (responds(p, "zartBeginMove")) return msgVoid(p, "zartBeginMove");
         if (!responds(w, "performWindowDragWithEvent:")) return;
         const ev = msgId(self.app orelse return, "currentEvent") orelse return;
@@ -733,13 +750,23 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
             },
             NSLeftMouseDown, NSRightMouseDown, NSOtherMouseDown => {
                 const p = self.mouseAt(ev);
+                self.press_type = ns_type;
+                trace("mouse down: type {d}", .{ns_type});
+                defer self.press_type = 0;
                 self.emitMouse(.{ .kind = .press, .x = p.x, .y = p.y, .button = buttonOf(ns_type) });
             },
             NSLeftMouseUp, NSRightMouseUp, NSOtherMouseUp => {
+                self.move_drag = null;
                 const p = self.mouseAt(ev);
                 self.emitMouse(.{ .kind = .release, .x = p.x, .y = p.y, .button = buttonOf(ns_type) });
             },
             NSMouseMoved, NSLeftMouseDragged, NSRightMouseDragged, NSOtherMouseDragged => {
+                if (self.move_drag) |d| {
+                    // Screen deltas, not the event's window location: the window moves under it.
+                    const now = msgPoint(class("NSEvent"), "mouseLocation");
+                    if (self.win) |w| msgVoidPoint(w, "setFrameOrigin:", .{ .x = d.origin.x + now.x - d.start.x, .y = d.origin.y + now.y - d.start.y });
+                    return;
+                }
                 const p = self.mouseAt(ev);
                 self.emitMouse(.{ .kind = .motion, .x = p.x, .y = p.y });
             },
