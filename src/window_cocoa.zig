@@ -383,13 +383,24 @@ fn msgCStr(obj: id, sel: [*:0]const u8) ?[*:0]const u8 {
     return f(obj, sel_registerName(sel));
 }
 
-/// NSArray<NSURL *>: only file URLs carry a path (`fileSystemRepresentation`).
+/// The path of an NSString as UTF-8 AS WRITTEN, not `fileSystemRepresentation`: that one
+/// decomposes accents (NFD, "è" → "e" + U+0300). macOS finds the file in either form
+/// (APFS and HFS+ are normalization-insensitive), but an app comparing names with what
+/// the directory lists, or Darling on a Linux filesystem (normalization-sensitive: the
+/// NFD name does not exist there), needs the form the file was saved with.
+/// `fileSystemRepresentation` stays as the fallback.
+fn pathOf(s: id) ?[*:0]const u8 {
+    if (s == null) return null;
+    return msgCStr(s, "UTF8String") orelse msgCStr(s, "fileSystemRepresentation");
+}
+
+/// NSArray<NSURL *>: only file URLs carry a path.
 fn imp_openURLs(_: id, _: SEL, _: id, urls: id) callconv(.c) void {
     var i: u64 = 0;
     while (i < arrayCount(urls)) : (i += 1) {
         const url = arrayAt(urls, i) orelse continue;
         if (!msgBool(url, "isFileURL")) continue;
-        _ = deliverPath(msgCStr(url, "fileSystemRepresentation"));
+        _ = deliverPath(pathOf(msgId(url, "path")) orelse msgCStr(url, "fileSystemRepresentation"));
     }
 }
 
@@ -399,15 +410,14 @@ fn imp_openFiles(_: id, _: SEL, sender: id, files: id) callconv(.c) void {
     var i: u64 = 0;
     while (i < arrayCount(files)) : (i += 1) {
         const s = arrayAt(files, i) orelse continue;
-        if (!deliverPath(msgCStr(s, "fileSystemRepresentation"))) ok = false;
+        if (!deliverPath(pathOf(s))) ok = false;
     }
     // NSApplicationDelegateReplySuccess = 0, …Failure = 2.
     if (sender != null and responds(sender, "replyToOpenOrPrint:")) msgVoidInt(sender, "replyToOpenOrPrint:", if (ok) 0 else 2);
 }
 
 fn imp_openFile(_: id, _: SEL, _: id, file: id) callconv(.c) bool {
-    if (file == null) return false;
-    return deliverPath(msgCStr(file, "fileSystemRepresentation"));
+    return deliverPath(pathOf(file));
 }
 
 fn imp_yes(_: id, _: SEL) callconv(.c) bool {
