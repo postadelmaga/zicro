@@ -258,6 +258,10 @@ pub const Options = struct {
     /// itself. Wayland, Win32 and Cocoa (macOS re-shows the window it just ordered out). Web
     /// and Android have no veto: the page/activity lifecycle is the browser's/OS's.
     on_close_request: ?*const fn (window: *Window, user: ?*anyopaque) bool = null,
+    /// A file the system asks the app to open (macOS Finder double-click / "Open With" /
+    /// drop on the Dock icon: no argv, an Apple Event instead). Main thread, once per
+    /// path. Cocoa only — on the other platforms files arrive through argv.
+    on_open_file: ?*const fn (window: *Window, path: []const u8, user: ?*anyopaque) void = null,
     /// Optional system-tray icon (StatusNotifierItem over DBus). Linux-only; a no-op
     /// elsewhere.
     tray: ?TrayConfig = null,

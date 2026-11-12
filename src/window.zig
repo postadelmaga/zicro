@@ -130,6 +130,12 @@ pub const Options = struct {
     on_text: ?*const fn (window: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void = null,
     /// IME pre-edit (composition in progress): `text` is empty when it ends. Wayland only.
     on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,
+    /// A file the system asks the app to open: on macOS Finder's double-click / "Open
+    /// With" / a drop on the Dock icon launch the app WITHOUT argv and deliver the paths
+    /// as an Apple Event, which arrives here (once per path, main thread, during `run`).
+    /// Without it AppKit answers the user "Zuer cannot open files in the … format".
+    /// Cocoa only; elsewhere files come in through argv.
+    on_open_file: ?*const fn (window: *Window, path: []const u8, user: ?*anyopaque) void = null,
     user: ?*anyopaque = null,
 
     // --- Wayland transport, for a client that paints its own chrome (zrame) -------------

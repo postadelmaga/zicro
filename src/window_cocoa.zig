@@ -321,6 +321,95 @@ fn ensureWindowClass() Class {
     return cls;
 }
 
+// --- files from the system (Finder "Open With", double-click, Dock drop) -------------
+
+/// The window whose `on_open_file` receives the paths: the first one that asked for
+/// them. One per process, like NSApp's delegate.
+var g_open_target: ?*anyopaque = null;
+var g_delegate_class: Class = null;
+/// NSApp keeps its delegate as a weak (assign) reference: the object lives here forever.
+var g_delegate: id = null;
+
+/// Build the `ZicroAppDelegate` class once: an NSObject answering the open-document
+/// Apple Event. A Finder launch passes NO path in argv — the files come through these
+/// methods, and an app without them gets AppKit's "cannot open files in the … format".
+/// `application:openURLs:` is what macOS 10.13+ calls when present; Cocotron (Darling)
+/// knows only the older `openFile:`/`openFiles:`, so all three are registered.
+fn ensureDelegateClass() Class {
+    if (g_delegate_class != null) return g_delegate_class;
+    const cls = objc_allocateClassPair(class("NSObject"), "ZicroAppDelegate", 0) orelse {
+        g_delegate_class = class("ZicroAppDelegate");
+        return g_delegate_class;
+    };
+    _ = class_addMethod(cls, sel_registerName("application:openURLs:"), @ptrCast(&imp_openURLs), "v@:@@");
+    _ = class_addMethod(cls, sel_registerName("application:openFiles:"), @ptrCast(&imp_openFiles), "v@:@@");
+    _ = class_addMethod(cls, sel_registerName("application:openFile:"), @ptrCast(&imp_openFile), "c@:@@");
+    objc_registerClassPair(cls);
+    g_delegate_class = cls;
+    return cls;
+}
+
+/// Install the delegate on NSApp — before `finishLaunching`, which is when AppKit
+/// starts delivering the launch's open-document event.
+fn installOpenDelegate(app: id, target: *anyopaque) void {
+    if (g_open_target != null) return;
+    g_open_target = target;
+    if (g_delegate == null) g_delegate = msgId(msgId(ensureDelegateClass(), "alloc"), "init");
+    if (g_delegate != null) msgVoidId(app, "setDelegate:", g_delegate);
+}
+
+fn deliverPath(c_path: ?[*:0]const u8) bool {
+    const p = c_path orelse return false;
+    const w: *Window = @ptrCast(@alignCast(g_open_target orelse return false));
+    const cb = w.opts.on_open_file orelse return false;
+    const path = std.mem.span(p);
+    if (path.len == 0) return false;
+    trace("open file: {s}", .{path});
+    cb(w, path, w.opts.user);
+    return true;
+}
+
+fn arrayCount(arr: id) u64 {
+    return if (arr == null) 0 else msgU64(arr, "count");
+}
+
+fn arrayAt(arr: id, i: u64) id {
+    const f: *const fn (id, SEL, u64) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(arr, sel_registerName("objectAtIndex:"), i);
+}
+
+fn msgCStr(obj: id, sel: [*:0]const u8) ?[*:0]const u8 {
+    const f: *const fn (id, SEL) callconv(.c) ?[*:0]const u8 = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName(sel));
+}
+
+/// NSArray<NSURL *>: only file URLs carry a path (`fileSystemRepresentation`).
+fn imp_openURLs(_: id, _: SEL, _: id, urls: id) callconv(.c) void {
+    var i: u64 = 0;
+    while (i < arrayCount(urls)) : (i += 1) {
+        const url = arrayAt(urls, i) orelse continue;
+        if (!msgBool(url, "isFileURL")) continue;
+        _ = deliverPath(msgCStr(url, "fileSystemRepresentation"));
+    }
+}
+
+/// NSArray<NSString *>; AppKit waits for `replyToOpenOrPrint:` after this one.
+fn imp_openFiles(_: id, _: SEL, sender: id, files: id) callconv(.c) void {
+    var ok = true;
+    var i: u64 = 0;
+    while (i < arrayCount(files)) : (i += 1) {
+        const s = arrayAt(files, i) orelse continue;
+        if (!deliverPath(msgCStr(s, "fileSystemRepresentation"))) ok = false;
+    }
+    // NSApplicationDelegateReplySuccess = 0, …Failure = 2.
+    if (sender != null and responds(sender, "replyToOpenOrPrint:")) msgVoidInt(sender, "replyToOpenOrPrint:", if (ok) 0 else 2);
+}
+
+fn imp_openFile(_: id, _: SEL, _: id, file: id) callconv(.c) bool {
+    if (file == null) return false;
+    return deliverPath(msgCStr(file, "fileSystemRepresentation"));
+}
+
 fn imp_yes(_: id, _: SEL) callconv(.c) bool {
     return true;
 }
@@ -400,6 +489,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         const app = msgId(class("NSApplication"), "sharedApplication");
         self.app = app;
         msgVoidInt(app, "setActivationPolicy:", 0); // NSApplicationActivationPolicyRegular
+        if (opts.on_open_file != null) installOpenDelegate(app, self);
 
         const frame = CGRect{
             .origin = .{ .x = 100, .y = 100 },
@@ -479,6 +569,7 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
 
     pub fn deinit(self: *Window) void {
         if (self.view) |v| unregisterView(v);
+        if (g_open_target == @as(?*anyopaque, self)) g_open_target = null;
         if (self.win) |w| msgVoidId(w, "close", null);
         self.gpa.free(self.pixels);
         self.gpa.destroy(self);

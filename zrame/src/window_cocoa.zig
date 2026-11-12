@@ -94,6 +94,7 @@ pub const Window = struct {
             .on_text = innerText,
             .on_mouse = innerMouse,
             .on_close_request = if (opts.on_close_request != null) innerCloseRequest else null,
+            .on_open_file = if (opts.on_open_file != null) innerOpenFile else null,
             .on_tick = innerTick,
             .tick_ms = 1,
             .user = self,
@@ -109,6 +110,11 @@ pub const Window = struct {
         self.threaded.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    fn innerOpenFile(_: *zicro.window.Window, path: []const u8, user: ?*anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(user.?));
+        if (self.opts.on_open_file) |cb| cb(self, path, self.opts.user);
     }
 
     fn innerCloseRequest(_: *zicro.window.Window, user: ?*anyopaque) bool {
