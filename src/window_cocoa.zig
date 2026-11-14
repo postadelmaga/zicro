@@ -344,6 +344,7 @@ fn ensureDelegateClass() Class {
     _ = class_addMethod(cls, sel_registerName("application:openURLs:"), @ptrCast(&imp_openURLs), "v@:@@");
     _ = class_addMethod(cls, sel_registerName("application:openFiles:"), @ptrCast(&imp_openFiles), "v@:@@");
     _ = class_addMethod(cls, sel_registerName("application:openFile:"), @ptrCast(&imp_openFile), "c@:@@");
+    _ = class_addMethod(cls, sel_registerName("applicationDidFinishLaunching:"), @ptrCast(&imp_didFinishLaunching), "v@:@");
     objc_registerClassPair(cls);
     g_delegate_class = cls;
     return cls;
@@ -354,12 +355,43 @@ fn ensureDelegateClass() Class {
 fn installOpenDelegate(app: id, target: *anyopaque) void {
     if (g_open_target != null) return;
     g_open_target = target;
+    ensureDelegate(app);
+}
+
+fn ensureDelegate(app: id) void {
     if (g_delegate == null) g_delegate = msgId(msgId(ensureDelegateClass(), "alloc"), "init");
     if (g_delegate != null) msgVoidId(app, "setDelegate:", g_delegate);
 }
 
+/// `finishLaunching` already sent (by `launchFiles`): `run` must not send it again.
+var g_launched = false;
+/// AppKit is done with the launch's Apple Event (`applicationDidFinishLaunching:`).
+var g_did_finish = std.atomic.Value(bool).init(false);
+/// While `launchFiles` runs: where the delivered paths go (no window exists yet).
+var g_launch_sink: ?*LaunchSink = null;
+
+const LaunchSink = struct {
+    gpa: std.mem.Allocator,
+    paths: std.ArrayList([]u8) = .empty,
+};
+
+fn imp_didFinishLaunching(_: id, _: SEL, _: id) callconv(.c) void {
+    g_did_finish.store(true, .release);
+}
+
 fn deliverPath(c_path: ?[*:0]const u8) bool {
     const p = c_path orelse return false;
+    if (g_open_target == null) if (g_launch_sink) |sink| {
+        const path = std.mem.span(p);
+        if (path.len == 0) return false;
+        trace("launch file: {s}", .{path});
+        const dup = sink.gpa.dupe(u8, path) catch return false;
+        sink.paths.append(sink.gpa, dup) catch {
+            sink.gpa.free(dup);
+            return false;
+        };
+        return true;
+    };
     const w: *Window = @ptrCast(@alignCast(g_open_target orelse return false));
     const cb = w.opts.on_open_file orelse return false;
     const path = std.mem.span(p);
@@ -745,10 +777,63 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         if (pw) |p| if (responds(p, "zartBeginResize:")) msgVoidInt(p, "zartBeginResize:", edge);
     }
 
+    /// The documents macOS launched the app with, BEFORE any window exists. A Finder
+    /// launch passes no path in argv: the files arrive as an Apple Event that AppKit
+    /// handles only once the app has finished launching. This finishes the launch
+    /// here and pumps events until AppKit reports it done (the open-document event is
+    /// handled before `applicationDidFinishLaunching:`) or `timeout_ms` passes, so an
+    /// app can size its first window on the document instead of opening a generic
+    /// one and resizing it. Later documents (Dock drop, "Open With" while running) go
+    /// to `on_open_file` as before. Main thread, before `init`; the caller owns the
+    /// returned paths (free each, then the slice, with `gpa`).
+    pub fn launchFiles(gpa: Allocator, timeout_ms: u32) [][]u8 {
+        std.mem.doNotOptimizeAway(&NSApp);
+        const app = msgId(class("NSApplication"), "sharedApplication") orelse return &.{};
+        if (g_launched) return &.{};
+        msgVoidInt(app, "setActivationPolicy:", 0); // NSApplicationActivationPolicyRegular
+        ensureDelegate(app);
+        var sink: LaunchSink = .{ .gpa = gpa };
+        g_launch_sink = &sink;
+        defer g_launch_sink = null;
+        trace("launchFiles: finishLaunching", .{});
+        msgVoid(app, "finishLaunching");
+        g_launched = true;
+
+        const nextEvent: *const fn (id, SEL, u64, id, id, bool) callconv(.c) id = @ptrCast(&objc_msgSend);
+        const send: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        const next_sel = sel_registerName("nextEventMatchingMask:untilDate:inMode:dequeue:");
+        const dateIn: *const fn (Class, SEL, f64) callconv(.c) id = @ptrCast(&objc_msgSend);
+        const default_mode = nsString("kCFRunLoopDefaultMode");
+        const start = nowNs();
+        const limit = @as(u64, timeout_ms) * std.time.ns_per_ms;
+        // Real AppKit handles the launch's Apple Event (and calls the open methods)
+        // BEFORE `applicationDidFinishLaunching:`. Cocotron (Darling) reports the
+        // launch finished right away and delivers the event ~0.1 s later: there the
+        // wait goes on for a grace period after it, unless a file already arrived.
+        const cocotron = objc_getClass("O2Context_builtin_FT") != null;
+        const grace: u64 = if (cocotron) 500 * std.time.ns_per_ms else 0;
+        while (nowNs() -% start < limit) {
+            if (sink.paths.items.len > 0) break;
+            if (g_did_finish.load(.acquire) and nowNs() -% start >= grace) break;
+            const until = dateIn(class("NSDate"), sel_registerName("dateWithTimeIntervalSinceNow:"), 0.01);
+            const ev = nextEvent(app, next_sel, event_mask_any, until, default_mode, true) orelse continue;
+            send(app, sel_registerName("sendEvent:"), ev);
+        }
+        trace("launchFiles: {d} file(s) in {d} ms", .{ sink.paths.items.len, (nowNs() -% start) / std.time.ns_per_ms });
+        return sink.paths.toOwnedSlice(gpa) catch blk: {
+            for (sink.paths.items) |p| gpa.free(p);
+            sink.paths.deinit(gpa);
+            break :blk &.{};
+        };
+    }
+
     pub fn run(self: *Window) !void {
         const app = self.app orelse return;
-        trace("run: finishLaunching", .{});
-        msgVoid(app, "finishLaunching");
+        if (!g_launched) {
+            trace("run: finishLaunching", .{});
+            msgVoid(app, "finishLaunching");
+            g_launched = true;
+        }
         const distant_past = msgId(class("NSDate"), "distantPast");
         const default_mode = nsString("kCFRunLoopDefaultMode");
         const nextEvent: *const fn (id, SEL, u64, id, id, bool) callconv(.c) id = @ptrCast(&objc_msgSend);
