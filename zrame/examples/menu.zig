@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const zrame = @import("zrame");
+const zicro = @import("zicro");
 
 // A few panel sizes to spring between; Space cycles them, the File menu jumps to ends.
 const sizes = [_][2]u32{ .{ 420, 300 }, .{ 620, 420 }, .{ 900, 600 } };
@@ -46,7 +47,7 @@ fn onAbout(_: ?*anyopaque) void {
 /// Space cycles through `sizes`, springing the window to each.
 fn onKey(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     if (state != 1) return; // press only
-    if (key == zrame.wl.KEY_SPACE) {
+    if (key == zicro.wl.KEY_SPACE) {
         const cx: *Ctx = @ptrCast(@alignCast(user.?));
         cx.idx = (cx.idx + 1) % sizes.len;
         win.animateResize(sizes[cx.idx][0], sizes[cx.idx][1]);

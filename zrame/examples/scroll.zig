@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const zrame = @import("zrame");
+const zicro = @import("zicro");
 
 const row_h: f32 = 44.0;
 const rows = 60;
@@ -14,10 +15,10 @@ const content_w: f32 = 980.0;
 
 const Ctx = struct {
     scroll: *zrame.scroll.Scroll,
-    font: *zrame.Font,
+    font: *zicro.text.Font,
 };
 
-fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
+fn drawContent(canvas: *zicro.paint.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
     const s = ctx.scroll;
 
@@ -41,7 +42,7 @@ fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) vo
         if (top + row_h < cy or top > cy + vh) continue; // cull off-screen rows
 
         const shade: f32 = if (i % 2 == 0) 0.06 else 0.03;
-        canvas.fillRoundedRect(cx + 10 - ox, top + 5, content_w - 20, row_h - 10, 10, zrame.Color.rgba(255, 255, 255, shade));
+        canvas.fillRoundedRect(cx + 10 - ox, top + 5, content_w - 20, row_h - 10, 10, zicro.paint.Color.rgba(255, 255, 255, shade));
 
         var buf: [64]u8 = undefined;
         const label = std.fmt.bufPrint(&buf, "Row {d:0>2}  —  fluid scrolling, thin bars, macOS/Material chrome", .{i + 1}) catch "row";
@@ -49,7 +50,7 @@ fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) vo
         const baseline = @as(i32, @intFromFloat(top + (row_h - @as(f32, @floatFromInt(v.ascent - v.descent))) / 2)) + v.ascent;
         canvas.drawText(ctx.font, @as(i32, @intFromFloat(cx + 26 - ox)), baseline, label, .{
             .size = 16,
-            .color = zrame.Color.rgba(230, 233, 245, 0.92),
+            .color = zicro.paint.Color.rgba(230, 233, 245, 0.92),
         });
     }
 }
@@ -60,7 +61,7 @@ pub fn main() !void {
     const gpa = gpa_state.allocator();
 
     // `user` must be set before init: the first configure paints during `Window.init`.
-    var font = try zrame.Font.initDefault(gpa);
+    var font = try zicro.text.Font.initDefault(gpa);
     defer font.deinit();
     var scroll = zrame.scroll.Scroll{};
     var ctx = Ctx{ .scroll = &scroll, .font = &font };

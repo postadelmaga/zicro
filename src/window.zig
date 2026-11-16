@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 pub const paint = @import("paint.zig");
 pub const gesture = @import("gesture.zig");
+const proportion = @import("proportion.zig");
 
 pub const Rect = struct {
     x: i32,
@@ -86,6 +87,59 @@ pub const PxRect = struct { x: u32, y: u32, w: u32, h: u32 };
 /// Compositor background blur over the window geometry: a rounded rectangle, inset
 /// `inset` px from the geometry's edges (Wayland `ext-background-effect-v1`).
 pub const Blur = struct { radius: f32 = 0, inset: f32 = 0 };
+
+/// Device form factor, classified from the logical (dp) content width. Apps reflow
+/// their layout on this — collapse side panels, shrink the toolbar to essentials —
+/// instead of hardcoding pixel thresholds.
+pub const FormFactor = enum { phone, tablet, desktop };
+
+/// Responsive metrics computed by the substrate from each backend's raw signals
+/// (physical content size + display scale + touch), so every app is responsive
+/// the same way on web AND native/mobile without reinventing it.
+///
+/// - `w_dp`/`h_dp`: logical content size in **dp** (physical px ÷ `dpr`) — device
+///   independent, the space breakpoints live in.
+/// - `dpr`: display density (`devicePixelRatio` / native scale) — crispness only.
+/// - `class`: [`FormFactor`], for reflow decisions.
+/// - `touch`: touch-primary device — keep hit targets large.
+/// - `ui_scale`: a density multiplier for DRAWING (on top of `dpr`). 1.0 through
+///   normal sizes, growing toward **φ** (the golden ratio) on very large displays so
+///   the UI doesn't look lost; never below 1.0, so touch targets never shrink (small
+///   screens adapt by reflow, not by zoom).
+pub const Metrics = struct {
+    w_dp: f32,
+    h_dp: f32,
+    dpr: f32,
+    class: FormFactor,
+    touch: bool,
+    ui_scale: f32,
+};
+
+// Breakpoints scanned by the golden ratio: phone→tablet at `phone_max`, tablet→desktop
+// at `phone_max·φ`. Density (`ui_scale`) stays 1.0 up to `dense_ref = phone_max·φ²` and
+// climbs to φ beyond it. One φ (`proportion.phi`) drives the whole responsive scale.
+const phone_max: f32 = 640; // dp: below this the layout is a single column (phone)
+const tablet_max: f32 = phone_max * proportion.phi; // ≈ 1035 dp
+const dense_ref: f32 = phone_max * proportion.phi * proportion.phi; // ≈ 1675 dp: below → ui_scale 1.0
+
+/// Builds [`Metrics`] from a backend's raw signals: `w_px`/`h_px` are PHYSICAL content
+/// pixels, `dpr_in` the display scale, `touch` whether the device is touch-primary.
+pub fn computeMetrics(dpr_in: f32, w_px: u32, h_px: u32, touch: bool) Metrics {
+    const dpr = if (dpr_in > 0) dpr_in else 1.0;
+    const w_dp = @as(f32, @floatFromInt(w_px)) / dpr;
+    const h_dp = @as(f32, @floatFromInt(h_px)) / dpr;
+    const class: FormFactor = if (w_dp < phone_max) .phone else if (w_dp < tablet_max) .tablet else .desktop;
+    // Density: 1.0 until `dense_ref`, then grow to φ. Clamped both ends — never shrinks
+    // below 1.0 (touch targets stay put), never past φ (stops looking cartoonish on 8K).
+    const ui_scale = std.math.clamp(w_dp / dense_ref, 1.0, proportion.phi);
+    return .{ .w_dp = w_dp, .h_dp = h_dp, .dpr = dpr, .class = class, .touch = touch, .ui_scale = ui_scale };
+}
+
+/// Physical pixels calculated from logical DP and display density scale factor.
+pub fn physPxScale(scale: f32, logical_dp: u32) u32 {
+    const f = if (scale > 0) scale else 1.0;
+    return @intFromFloat(@round(@as(f32, @floatFromInt(logical_dp)) * f));
+}
 
 pub const Options = struct {
     title: [:0]const u8 = "zicro-shell",

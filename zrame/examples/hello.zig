@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const zrame = @import("zrame");
+const zicro = @import("zicro");
 
 /// One rounded-rect segment of a letter glyph: `{ x, y, w, h }` from the glyph origin.
 const Seg = [4]f32;
@@ -15,7 +16,7 @@ const Demo = struct {
     app_id: [:0]const u8,
     style: zrame.Style,
     /// Accent color of the second info tile.
-    tint: zrame.Color,
+    tint: zicro.paint.Color,
     glyph: []const Seg,
     /// Title-bar control layout for this window.
     tb: zrame.TitlebarStyle = .macos,
@@ -31,7 +32,7 @@ const demos = [_]Demo{
         .title = "zrame — Window A (Fluent Design)",
         .app_id = "dev.zrame.hello.a",
         .style = zrame.Style.fluent(),
-        .tint = zrame.Color.rgba(255, 255, 255, 0.15),
+        .tint = zicro.paint.Color.rgba(255, 255, 255, 0.15),
         .glyph = &glyph_a,
         .tb = .material,
     },
@@ -39,36 +40,36 @@ const demos = [_]Demo{
         .title = "zrame — Window B (Vision Pro Glass)",
         .app_id = "dev.zrame.hello.b",
         .style = zrame.Style.macos(),
-        .tint = zrame.Color.rgba(137, 180, 250, 0.45),
+        .tint = zicro.paint.Color.rgba(137, 180, 250, 0.45),
         .glyph = &glyph_b,
     },
     .{
         .title = "zrame — Window C (Aurora Glass)",
         .app_id = "dev.zrame.hello.c",
         .style = zrame.Style.aurora(),
-        .tint = zrame.Color.rgba(243, 139, 168, 0.45),
+        .tint = zicro.paint.Color.rgba(243, 139, 168, 0.45),
         .glyph = &glyph_c,
     },
     .{
         .title = "zrame — Window D (Material Design)",
         .app_id = "dev.zrame.hello.d",
         .style = zrame.Style.material(),
-        .tint = zrame.Color.rgba(166, 227, 161, 0.45),
+        .tint = zicro.paint.Color.rgba(166, 227, 161, 0.45),
         .glyph = &glyph_d,
     },
 };
 
-fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
+fn drawContent(canvas: *zicro.paint.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
     const demo: *const Demo = @ptrCast(@alignCast(user.?));
     const cx: f32 = @floatFromInt(content.x);
     const cy: f32 = @floatFromInt(content.y);
 
-    const white = zrame.Color.rgba(255, 255, 255, 0.65);
+    const white = zicro.paint.Color.rgba(255, 255, 255, 0.65);
     for (demo.glyph) |seg| {
         canvas.fillRoundedRect(cx + 32 + seg[0], cy + 32 + seg[1], seg[2], seg[3], 4, white);
     }
 
-    canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
+    canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zicro.paint.Color.rgba(255, 255, 255, 0.20));
     canvas.fillRoundedRect(cx + 88, cy + 70, 300, 22, 11, demo.tint);
 }
 

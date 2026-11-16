@@ -33,7 +33,7 @@ const presets = [_]struct { name: []const u8, style: zrame.Style }{
 var preset_idx: usize = 0;
 
 fn onKey(win: *zrame.Window, key: u32, state: u32, _: ?*anyopaque) void {
-    if (key != zrame.wl.KEY_SPACE or state != zrame.wl.KEYBOARD_KEY_STATE_PRESSED) return;
+    if (key != zicro.wl.KEY_SPACE or state != zicro.wl.KEYBOARD_KEY_STATE_PRESSED) return;
     preset_idx = (preset_idx + 1) % presets.len;
     const preset = presets[preset_idx];
     win.setStyle(preset.style.withBorderAnim(border_anim_width)) catch return;

@@ -7,13 +7,14 @@
 
 const std = @import("std");
 const zrame = @import("zrame");
+const zicro = @import("zicro");
 
-const Color = zrame.Color;
+const Color = zicro.paint.Color;
 
 const ClockPanel = struct {
     t: f32 = 0,
 
-    pub fn draw(self: *ClockPanel, canvas: *zrame.Canvas, host: zrame.Host) void {
+    pub fn draw(self: *ClockPanel, canvas: *zicro.paint.Canvas, host: zrame.Host) void {
         const info = host.info();
         const w: f32 = 104;
         const h: f32 = 30;

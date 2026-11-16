@@ -21,7 +21,9 @@ const text = zicro.text;
 
 /// An axis-aligned rectangle in canvas (buffer) pixels — the coordinate space of both
 /// the [`paint.Canvas`] and the pointer events (surface-local == buffer-local here).
-pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+/// It is zicro's own pixel rectangle (`zicro.window.PxRect`, the one zicro's window uses
+/// for damage and video placement), not a second definition.
+pub const Rect = zicro.window.PxRect;
 
 /// Bounding box of the union of two rects (for damage accumulation).
 pub fn unionOf(a: Rect, b: Rect) Rect {

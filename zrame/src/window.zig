@@ -1,22 +1,19 @@
 //! # zrame.window — the public window facade
 //!
-//! Five backends, selected at comptime by `Window` below:
+//! Two adapters over zicro's window, selected at comptime by `Window` below, one per way
+//! zicro drives a frame:
 //!
-//! | os/target       | backend                | transport                                                          |
-//! |-----------------|-------------------------|---------------------------------------------------------------------|
-//! | linux (desktop) | `window_native.zig`     | glass chrome over zicro's Wayland window (frameless, compositor blur) |
-//! | windows         | `window_native.zig`     | the same glass over zicro's Win32 window (frameless, layered GDI)  |
-//! | macos           | `window_cocoa.zig`      | thin adapter delegating to zicro's Cocoa window                   |
-//! | wasm            | `window_web.zig`        | thin adapter over zicro's web window, glass chrome in `<canvas>`  |
-//! | android         | `window_android.zig`    | thin adapter over zicro's NDK window                               |
+//! | os/target              | adapter              | how zicro drives the frame                                   |
+//! |------------------------|----------------------|---------------------------------------------------------------|
+//! | linux (desktop), windows | `window_native.zig` | composes on damage (`on_compose`): glass chrome cached, dmabuf video plane, IME, popups, tray and global menu (Linux) |
+//! | macos, wasm, android   | `window_canvas.zig`  | hands `on_draw` a canvas every frame; the targets differ by a few comptime switches (chrome, margin, text input) |
 //!
-//! Every backend exposes the SAME core surface (`init`/`run`/`presentRgba`/`waitFrame`/
-//! `toggleFullscreen`/`setStyle`/`close` + the `panel_w`/`panel_h`/`closed` fields), so
-//! callers — and zrame's own `sink.zig` — are backend-agnostic; the Linux-only extras
-//! (tray, dbusmenu) exist only on Wayland and are no-ops elsewhere.
+//! Both expose the SAME core surface (`init`/`run`/`presentRgba`/`waitFrame`/
+//! `toggleFullscreen`/`setStyle`/`close` + the `panel_w`/`panel_h`/`closed` fields; see
+//! `verifyWindowBackendContract`), so callers — and zrame's own `sink.zig` — are
+//! backend-agnostic; the Linux-only extras (tray, dbusmenu) are no-ops elsewhere.
 //! `waitFrame(timeout_ms)` blocks any thread until the compositor's next frame callback
-//! (Wayland); other backends return false at once and callers fall back to their own
-//! software pacer.
+//! (Wayland); the other backends answer at once and callers pace themselves.
 //!
 //! This file owns the platform-independent public *types* every backend shares, so the
 //! callback signatures (`fn (window: *Window, …)`) resolve to the selected backend.
@@ -41,74 +38,21 @@ pub const Rect = plugin.Rect;
 /// A single memory plane of a dmabuf GPU buffer export (fd, offset, stride, modifier).
 pub const DmabufPlane = zicro.window.DmabufPlane;
 
-/// Device form factor, classified from the logical (dp) content width. Apps reflow
-/// their layout on this — collapse side panels, shrink the toolbar to essentials —
-/// instead of hardcoding pixel thresholds.
-pub const FormFactor = enum { phone, tablet, desktop };
-
-/// Responsive metrics computed by the substrate from each backend's raw signals
-/// (physical content size + display scale + touch), so every zrame app is responsive
-/// the same way on web AND native/mobile without reinventing it.
-///
-/// - `w_dp`/`h_dp`: logical content size in **dp** (physical px ÷ `dpr`) — device
-///   independent, the space breakpoints live in.
-/// - `dpr`: display density (`devicePixelRatio` / native scale) — crispness only.
-/// - `class`: [`FormFactor`], for reflow decisions.
-/// - `touch`: touch-primary device — keep hit targets large.
-/// - `ui_scale`: a density multiplier for DRAWING (on top of `dpr`). 1.0 through
-///   normal sizes, growing toward **φ** (the golden ratio) on very large displays so
-///   the UI doesn't look lost; never below 1.0, so touch targets never shrink (small
-///   screens adapt by reflow, not by zoom).
-pub const Metrics = struct {
-    w_dp: f32,
-    h_dp: f32,
-    dpr: f32,
-    class: FormFactor,
-    touch: bool,
-    ui_scale: f32,
-};
-
-// Breakpoints scanned by the golden ratio: phone→tablet at `phone_max`, tablet→desktop
-// at `phone_max·φ`. Density (`ui_scale`) stays 1.0 up to `dense_ref = phone_max·φ²` and
-// climbs to φ beyond it. One φ (`zicro.phi`) drives the whole responsive scale.
-const phone_max: f32 = 640; // dp: below this the layout is a single column (phone)
-const tablet_max: f32 = phone_max * zicro.phi; // ≈ 1035 dp
-const dense_ref: f32 = phone_max * zicro.phi * zicro.phi; // ≈ 1675 dp: below → ui_scale 1.0
-
-/// Builds [`Metrics`] from a backend's raw signals: `w_px`/`h_px` are PHYSICAL content
-/// pixels, `dpr_in` the display scale, `touch` whether the device is touch-primary.
-pub fn computeMetrics(dpr_in: f32, w_px: u32, h_px: u32, touch: bool) Metrics {
-    const dpr = if (dpr_in > 0) dpr_in else 1.0;
-    const w_dp = @as(f32, @floatFromInt(w_px)) / dpr;
-    const h_dp = @as(f32, @floatFromInt(h_px)) / dpr;
-    const class: FormFactor = if (w_dp < phone_max) .phone else if (w_dp < tablet_max) .tablet else .desktop;
-    // Density: 1.0 until `dense_ref`, then grow to φ. Clamped both ends — never shrinks
-    // below 1.0 (touch targets stay put), never past φ (stops looking cartoonish on 8K).
-    const ui_scale = std.math.clamp(w_dp / dense_ref, 1.0, zicro.phi);
-    return .{ .w_dp = w_dp, .h_dp = h_dp, .dpr = dpr, .class = class, .touch = touch, .ui_scale = ui_scale };
-}
-
-/// Physical pixels calculated from logical DP and display density scale factor.
-pub fn physPxScale(scale: f32, logical_dp: u32) u32 {
-    const f = if (scale > 0) scale else 1.0;
-    return @intFromFloat(@round(@as(f32, @floatFromInt(logical_dp)) * f));
-}
+/// Responsive metrics (`Window.metrics`) are the substrate's: see `zicro.window.Metrics`.
+pub const Metrics = zicro.window.Metrics;
+pub const FormFactor = zicro.window.FormFactor;
 
 /// The concrete window struct for this target. Selected at comptime; the backends
 /// mutually import this file for the shared types below, so `*Window` in a callback
 /// signature is exactly the backend struct the caller receives.
-pub const Window = switch (builtin.os.tag) {
-    .windows => @import("window_native.zig").Window,
-    .macos => @import("window_cocoa.zig").Window,
-    // WebAssembly: a thin adapter over zicro's web window that paints the glass chrome
-    // into a browser <canvas>. (freestanding wasm falls here, not the Wayland else.)
-    else => if (builtin.cpu.arch.isWasm())
-        @import("window_web.zig").Window
-    else if (builtin.abi == .android or builtin.abi == .androideabi)
-        @import("window_android.zig").Window
-    else
-        @import("window_native.zig").Window,
-};
+pub const Window = if (builtin.cpu.arch.isWasm() or builtin.os.tag == .macos or
+    builtin.abi == .android or builtin.abi == .androideabi)
+    // zicro hands a canvas every frame: one adapter, a few comptime switches.
+    @import("window_canvas.zig").Window
+else
+    // Wayland and Win32: zicro composes on damage, with the video plane and the
+    // desktop integrations.
+    @import("window_native.zig").Window;
 
 comptime {
     verifyWindowBackendContract(Window);
@@ -225,42 +169,30 @@ pub const Options = struct {
     /// Close the window on ESC (handy for demo/tool windows). Apps that use ESC
     /// themselves (dialogs, editors) turn this off and decide in `on_key`.
     close_on_esc: bool = true,
-    /// Optional painter invoked after the chrome, before any staged frame:
-    /// draws app content directly on the canvas (window thread).
+    // --- callbacks -------------------------------------------------------------------
+    // The ones zicro's window has too keep zicro's meaning (`zicro.window.Options`, the
+    // reference doc) and its signature, with zrame's `*Window`; `checkCallbackParity`
+    // below fails the build if the two drift. Only what zrame changes is noted here.
+
+    /// Paints app content on the canvas, after the chrome and before any staged frame.
+    /// `content` is the content rect in canvas pixels (unsigned: zrame's `Rect`).
     on_draw: ?*const fn (canvas: *paint.Canvas, content: Rect, user: ?*anyopaque) void = null,
-    /// Optional key handler (evdev keycode, key state: 1 pressed / 0 released). Win32
-    /// translates VK codes to the same evdev codes so handlers are cross-platform.
+    /// A key the panels did not take (evdev code; state 1 pressed / 0 released).
     on_key: ?*const fn (window: *Window, key: u32, state: u32, user: ?*anyopaque) void = null,
-    /// Optional text-input handler, additive to `on_key` (which keeps firing unchanged):
-    /// on every key press that produces printable text under the ACTIVE keyboard layout
-    /// (xkbcommon on Wayland, `WM_CHAR` on Win32), `bytes[0..len]` carries one UTF-8
-    /// encoded codepoint (1..4 bytes). Control characters and DEL never fire. When layout
-    /// translation is unavailable (no keymap) it simply never fires — apps fall back to
-    /// their own `on_key` mapping.
+    /// Layout-correct text of a key press the panels did not take. On the web and
+    /// Android, which give no layout text, zrame types it through the US keymap.
     on_text: ?*const fn (window: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void = null,
-    /// Optional pre-edit composition handler for Input Method Editors (IME, `zwp_text_input_v3`).
-    /// `text` is the UTF-8 encoded in-progress composition string, `cursor_begin` and `cursor_end`
-    /// indicate the selection/cursor bounds within preedit text. Wayland-only for now; a no-op
-    /// on the other backends.
+    /// IME pre-edit (Wayland only).
     on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,
-    /// Optional mouse event handler (motion, press/release, scroll, leave). Coordinates
-    /// are in the app's PRESENTATION space, not canvas space — see [`MouseEvent`]'s doc
-    /// for the exact origin. Returns **true to consume** the event so the window skips
-    /// its default handling.
+    /// Pointer events the panels did not take, in the app's PRESENTATION space (see
+    /// [`MouseEvent`]). Return **true to consume** the event: the window then skips its
+    /// own handling (drag-to-move, resize cursor).
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) bool = null,
-    /// Optional multi-touch gesture handler (pinch, …) recognised by the substrate. Single
-    /// touch still arrives through `on_mouse`; two fingers here. See [`GestureEvent`].
-    /// Web and Android only for now — Wayland/Win32/Cocoa never invoke this.
+    /// Two-finger gestures (web and Android), center in presentation space.
     on_gesture: ?*const fn (window: *Window, gesture: GestureEvent, user: ?*anyopaque) void = null,
-    /// Optional veto on a close requested by the system (compositor close / Alt+F4 /
-    /// taskbar). Return `true` to let the window close, `false` to keep it open (e.g. to
-    /// ask "save changes?" and close later with `close()`). Not consulted for `close()`
-    /// itself. Wayland, Win32 and Cocoa (macOS re-shows the window it just ordered out). Web
-    /// and Android have no veto: the page/activity lifecycle is the browser's/OS's.
+    /// Veto on a close the system asks for (Wayland, Win32, Cocoa).
     on_close_request: ?*const fn (window: *Window, user: ?*anyopaque) bool = null,
-    /// A file the system asks the app to open (macOS Finder double-click / "Open With" /
-    /// drop on the Dock icon: no argv, an Apple Event instead). Main thread, once per
-    /// path. Cocoa only — on the other platforms files arrive through argv.
+    /// A file the system asks the app to open (macOS Finder / Dock; elsewhere argv).
     on_open_file: ?*const fn (window: *Window, path: []const u8, user: ?*anyopaque) void = null,
     /// Optional system-tray icon (StatusNotifierItem over DBus). Linux-only; a no-op
     /// elsewhere.
@@ -269,3 +201,40 @@ pub const Options = struct {
     menu: ?[]const dbusmenu.Item = null,
     user: ?*anyopaque = null,
 };
+
+comptime {
+    checkCallbackParity();
+}
+
+/// Every callback both `Options` declare must keep the same shape on both sides: the
+/// same parameters, where zicro's `*Window` reads zrame's, and the same result. The only
+/// differences allowed are the ones zrame makes on purpose: `on_draw`'s content rect is
+/// zrame's unsigned `Rect`, and `on_mouse` answers whether the app consumed the event.
+fn checkCallbackParity() void {
+    const Z = zicro.window.Options;
+    const shared = [_][]const u8{ "on_draw", "on_key", "on_text", "on_preedit", "on_mouse", "on_gesture", "on_close_request", "on_open_file" };
+    @setEvalBranchQuota(10_000);
+    for (shared) |name| {
+        if (!@hasField(Z, name)) @compileError("zicro.window.Options lost '" ++ name ++ "': update zrame.Options");
+        const zf = fnInfo(@FieldType(Z, name));
+        const rf = fnInfo(@FieldType(Options, name));
+        if (zf.param_types.len != rf.param_types.len) @compileError("zrame.Options." ++ name ++ ": parameter count differs from zicro's");
+        for (zf.param_types, rf.param_types, 0..) |zp, rp, i| {
+            const zt = zp.?;
+            const rt = rp.?;
+            if (zt == rt) continue;
+            if (zt == *zicro.window.Window and rt == *Window) continue;
+            if (std.mem.eql(u8, name, "on_draw") and i == 1 and zt == zicro.window.Rect and rt == Rect) continue;
+            @compileError("zrame.Options." ++ name ++ ": parameter type differs from zicro's");
+        }
+        const zr = zf.return_type.?;
+        const rr = rf.return_type.?;
+        if (zr != rr and !(std.mem.eql(u8, name, "on_mouse") and zr == void and rr == bool))
+            @compileError("zrame.Options." ++ name ++ ": result type differs from zicro's");
+    }
+}
+
+fn fnInfo(comptime Field: type) std.builtin.Type.Fn {
+    const ptr = @typeInfo(@typeInfo(Field).optional.child).pointer;
+    return @typeInfo(ptr.child).@"fn";
+}

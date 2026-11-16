@@ -6,15 +6,16 @@
 
 const std = @import("std");
 const zrame = @import("zrame");
+const zicro = @import("zicro");
 
-fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
-    const font: *zrame.Font = @ptrCast(@alignCast(user.?));
+fn drawContent(canvas: *zicro.paint.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
+    const font: *zicro.text.Font = @ptrCast(@alignCast(user.?));
     const cx: f32 = @floatFromInt(content.x);
     const cy: f32 = @floatFromInt(content.y);
     canvas.drawText(font, @as(i32, @intFromFloat(cx)) + 24, @as(i32, @intFromFloat(cy)) + 60, "dlopen'd plugin →", .{
         .size = 20,
         .style = .bold,
-        .color = zrame.Color.rgba(235, 238, 250, 0.85),
+        .color = zicro.paint.Color.rgba(235, 238, 250, 0.85),
     });
 }
 
@@ -24,7 +25,7 @@ pub fn main() !void {
     const gpa = gpa_state.allocator();
 
     // `user` must be set before init: the first configure paints during `Window.init`.
-    var font = try zrame.Font.initDefault(gpa);
+    var font = try zicro.text.Font.initDefault(gpa);
     defer font.deinit();
 
     const win = try zrame.Window.init(gpa, .{

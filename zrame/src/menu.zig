@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const zicro = @import("zicro");
 const paint = zicro.paint;
 const plugin = @import("plugin.zig");
-const ui = @import("ui.zig");
+const ease = @import("zicro").anim;
 const wl = zicro.wl;
 
 const Color = paint.Color;
@@ -129,7 +129,7 @@ pub const Menu = struct {
         if (self.anim <= 0.001) return;
         const info = host.info();
         const b = self.box(host, info);
-        const t = ui.cubicOut(self.anim);
+        const t = ease.cubicOut(self.anim);
         const slide = (1.0 - t) * 6.0; // small downward slide on open
         const bx = b.x;
         const by = b.y - slide;
@@ -212,7 +212,7 @@ pub const Menu = struct {
 
     pub fn tick(self: *Menu, dt: f32, host: plugin.Host) bool {
         _ = host;
-        const nf = ui.approach(self.anim, self.open, dt);
+        const nf = ease.approach(self.anim, self.open, dt);
         const moved = nf != self.anim;
         self.anim = nf;
         return moved;

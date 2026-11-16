@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 const zicro = @import("zicro");
 const paint = zicro.paint;
 const plugin = @import("plugin.zig");
-const ui = @import("ui.zig");
+const ease = @import("zicro").anim;
 const wl = zicro.wl;
 
 const Color = paint.Color;
@@ -41,7 +41,7 @@ pub const Controls = struct {
     height: u32,
     /// Borrowed window title (owned by `Window.opts`).
     title: []const u8,
-    /// Per-button hover factor 0..1 (linear; eased with `ui.cubicOut` on use).
+    /// Per-button hover factor 0..1 (linear; eased with `ease.cubicOut` on use).
     hover: [button_count]f32 = .{ 0, 0, 0 },
     /// Cluster reveal factor for the macOS glyphs (0 hidden … 1 shown).
     reveal: f32 = 0,
@@ -188,7 +188,7 @@ pub const Controls = struct {
     fn drawDisc(self: *Controls, canvas: *paint.Canvas, btn: Button, b: Bar, info: plugin.Info) void {
         const d = discDiameter(b);
         const c = discCenter(btn, b);
-        const hf = ui.cubicOut(self.hover[@backingInt(btn)]);
+        const hf = ease.cubicOut(self.hover[@backingInt(btn)]);
         var col = switch (btn) {
             .close => mac_close,
             .minimize => mac_min,
@@ -203,7 +203,7 @@ pub const Controls = struct {
         canvas.fillRoundedRect(c.x - d / 2.0, c.y - d / 2.0, d, d, d / 2.0, col);
 
         // Glyphs fade in with the cluster reveal.
-        const rv = ui.cubicOut(self.reveal);
+        const rv = ease.cubicOut(self.reveal);
         if (rv <= 0.01) return;
         const g = d * 0.22;
         const stroke = @max(1.0, d * 0.10);
@@ -228,7 +228,7 @@ pub const Controls = struct {
     }
 
     fn drawCell(self: *Controls, canvas: *paint.Canvas, btn: Button, r: Bar, info: plugin.Info) void {
-        const hf = ui.cubicOut(self.hover[@backingInt(btn)]);
+        const hf = ease.cubicOut(self.hover[@backingInt(btn)]);
         if (hf > 0.001) {
             const hl = if (btn == .close)
                 Color.rgba(232, 76, 76, 0.90 * hf)
@@ -313,11 +313,11 @@ pub const Controls = struct {
         var active = false;
         inline for (0..button_count) |i| {
             const target = if (self.hovered) |h| @backingInt(h) == i else false;
-            const nf = ui.approach(self.hover[i], target, dt);
+            const nf = ease.approach(self.hover[i], target, dt);
             if (nf != self.hover[i]) active = true;
             self.hover[i] = nf;
         }
-        const nr = ui.approach(self.reveal, self.over_cluster, dt);
+        const nr = ease.approach(self.reveal, self.over_cluster, dt);
         if (nr != self.reveal) active = true;
         self.reveal = nr;
         return active;

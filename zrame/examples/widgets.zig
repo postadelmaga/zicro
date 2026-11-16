@@ -1,14 +1,15 @@
 //! `zig build run-widgets`
 //!
 //! The widget-toolkit showcase: one glass window whose content is rebuilt every frame
-//! with `zrame.widget` — tabs, buttons, toggles, radios, slider, stepper, text field,
+//! with `zicro.widget` — tabs, buttons, toggles, radios, slider, stepper, text field,
 //! dropdown, progress bar, spinner, tooltip, a scrollable list, and a modal dialog. This is also the reference wiring for apps:
 //! window callbacks push into an [`widget.InputQueue`]; `on_draw` runs `Ui.begin` →
 //! widgets → `Ui.end`, and requests a repaint while anything animates.
 
 const std = @import("std");
 const zrame = @import("zrame");
-const widget = zrame.widget;
+const zicro = @import("zicro");
+const widget = zicro.widget;
 
 const Demo = struct {
     gpa: std.mem.Allocator,

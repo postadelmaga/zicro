@@ -33,9 +33,9 @@ zicro uses for its own `Window`:
 |-----------|------------------------|-------------------------------------------------------------|
 | Linux     | `window_native.zig`    | glass chrome, panels, sd-bus tray + KDE global menu over zicro's Wayland window (which owns the protocol: input, IME, popups, clipboard, HiDPI, `ext-background-effect-v1` blur, dmabuf zero-copy video) |
 | Windows   | `window_native.zig`    | the same file over zicro's Win32 window: frameless layered window, per-pixel alpha via `UpdateLayeredWindow` (`ZRAME_OPAQUE=1`: opaque, fast under Wine) |
-| macOS     | `window_cocoa.zig`     | thin adapter delegating to zicro's own Cocoa `Window` backend — native decorations |
-| Web       | `window_web.zig`       | thin adapter over zicro's wasm canvas backend; the glass chrome paints into the `<canvas>` |
-| Android   | `window_android.zig`   | thin adapter over zicro's NDK `Window` backend               |
+| macOS     | `window_canvas.zig`    | over zicro's Cocoa `Window` — native title bar and shadow, glass content |
+| Web       | `window_canvas.zig`    | over zicro's wasm canvas; the glass chrome paints into the `<canvas>` when the app asks for a title bar |
+| Android   | `window_canvas.zig`    | over zicro's NDK `Window` — full-screen content              |
 
 The whole compositing pipeline — chrome, panels (title bar, context menu, floating
 scrollbars), fonts, animation — is pure-CPU and platform-independent (`composeFrame` is
@@ -97,13 +97,13 @@ fractional-scale, appmenu…) is generated once, by zicro's `build.zig`. What li
 ```
 src/
   window.zig       the public facade (Options/MouseEvent/Style) + per-OS backend dispatch
-  window_native.zig / window_cocoa.zig / window_web.zig / window_android.zig
-                   adapters over zicro's window for each OS — window_native serves
-                   Wayland and Win32 (the chrome, the panels, plugins, and on Linux the
-                   tray and global menu; the protocol is zicro's)
+  window_native.zig  adapter over zicro's window where it composes on damage: Wayland
+                   and Win32 (the chrome, the panels, plugins, and on Linux the tray and
+                   global menu; the protocol is zicro's)
+  window_canvas.zig  adapter over zicro's window where it hands a canvas every frame:
+                   macOS, web, Android (one file, a few comptime switches)
   chrome.zig       shared composition: the cross-thread frame mailbox, glass panel + content blit
   plugin.zig       the extension seam: Panel / Registry / Host, and the dlopen loader
-  ui.zig           shared widget math (frame-rate-independent fades, easing)
   controls.zig     title-bar window controls panel (macOS traffic-lights / Material)
   menu.zig         glass context-menu panel
   scroll.zig       floating scrollbar panel (egui parity)

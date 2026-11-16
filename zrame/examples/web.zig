@@ -3,7 +3,7 @@
 //! The whole zrame chrome (rounded translucent panel, drop shadow, title-bar controls,
 //! floating scrollbars) is CPU + platform-independent, so this is an ordinary zrame app:
 //! open a `Window` with a title bar and an `on_draw`, and it renders its glass window
-//! inside a `<canvas>` via the web backend (`window_web.zig`), which paints the chrome and
+//! inside a `<canvas>` via the canvas adapter (`window_canvas.zig`), which paints the chrome and
 //! hands the content rect to `on_draw`. The only web-specific line is `zicroBoot` (wasm
 //! has no auto-main; JS calls it once).
 //!
@@ -11,7 +11,8 @@
 
 const std = @import("std");
 const zrame = @import("zrame");
-const paint = zrame.paint;
+const zicro = @import("zicro");
+const paint = zicro.paint;
 const Color = paint.Color;
 
 const gpa = std.heap.wasm_allocator;

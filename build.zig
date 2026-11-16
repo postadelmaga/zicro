@@ -238,7 +238,9 @@ pub fn build(b: *std.Build) void {
 ///     const zicro_dep = b.dependency("zicro", .{ .target = target, .optimize = optimize });
 ///     exe.root_module.addImport("zrame", zicro_dep.module("zrame"));
 ///
-/// and takes the web/Android roots from `zicro_dep.builder.path("zrame/src/...")`.
+/// For web and Android, zicro's own root for that target (`src/web_root.zig`,
+/// `src/android_root.zig`) goes under `zrame/src/root.zig` — zrame has one root for
+/// every target.
 fn addZrame(
     b: *std.Build,
     text_c: *TextCCache,
@@ -254,15 +256,11 @@ fn addZrame(
         .link_libc = true,
         .imports = &.{.{ .name = "zicro", .module = zicro }},
     });
-    // On Linux the Wayland transport is zicro's window (linked with `zicro`); zrame adds
-    // the desktop integrations. On Windows zrame still owns a native GDI window.
+    // The transport is zicro's window on every OS (linked with `zicro`); zrame links only
+    // what it adds itself: on desktop Linux the tray (StatusNotifierItem) and the global
+    // menu over sd-bus, FFI hand-declared, so only the library.
     if (target.result.os.tag == .linux and target.result.abi != .android) {
-        // Tray (StatusNotifierItem) over sd-bus; FFI hand-declared, so only the library.
         zrame.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
-    } else if (target.result.os.tag == .windows) {
-        zrame.linkSystemLibrary("user32", .{});
-        // GDI: the DIB section + memory DC behind the layered-window glass presentation.
-        zrame.linkSystemLibrary("gdi32", .{});
     }
 
     // Its tests run with zicro's: `zig build test` covers both modules.
@@ -305,7 +303,7 @@ fn addZrame(
                 .root_source_file = b.path("zrame/examples/plugin_clock.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "zrame", .module = zrame }},
+                .imports = &.{ .{ .name = "zrame", .module = zrame }, .{ .name = "zicro", .module = zicro } },
             }),
         });
         b.installArtifact(clock);
@@ -315,7 +313,7 @@ fn addZrame(
                 .root_source_file = b.path("zrame/examples/plugin_host.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "zrame", .module = zrame }},
+                .imports = &.{ .{ .name = "zrame", .module = zrame }, .{ .name = "zicro", .module = zicro } },
             }),
         });
         b.installArtifact(host_exe);
@@ -326,7 +324,7 @@ fn addZrame(
     }
 
     // `zig build web-zrame` — the glass window in a browser tab: zicro's web root (paint +
-    // text + the web Window backend) under zrame's web root (chrome + panels).
+    // text + the web Window backend) under zrame's one root (chrome + panels).
     {
         const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
         const zicro_web = b.createModule(.{
@@ -336,7 +334,7 @@ fn addZrame(
         });
         text_c.attach(zicro_web, wasm_target, .small, .web);
         const zrame_web = b.createModule(.{
-            .root_source_file = b.path("zrame/src/web_root.zig"),
+            .root_source_file = b.path("zrame/src/root.zig"),
             .target = wasm_target,
             .optimize = .ReleaseSmall,
             .imports = &.{.{ .name = "zicro", .module = zicro_web }},
@@ -345,7 +343,7 @@ fn addZrame(
             .root_source_file = b.path("zrame/examples/web.zig"),
             .target = wasm_target,
             .optimize = .ReleaseSmall,
-            .imports = &.{.{ .name = "zrame", .module = zrame_web }},
+            .imports = &.{ .{ .name = "zrame", .module = zrame_web }, .{ .name = "zicro", .module = zicro_web } },
         }) });
         web_exe.entry = .disabled;
         web_exe.rdynamic = true;
@@ -412,10 +410,10 @@ fn addNativeDeps(b: *std.Build, text_c: *TextCCache, mod: *std.Build.Module, tar
         //                      pulls in zwp_tablet_tool_v2_interface, so tablet-v2 must be
         //                      generated too even though only the wl_pointer path is driven
         //   appmenu          — org_kde_kwin_appmenu (KDE global menu)
-        // The last four are consumed by zrame's backend (compositor blur, dmabuf video,
-        // HiDPI viewport/fractional scale): ALL interface tables are generated here, in
-        // one repo, because zrame links this module's C objects — a table generated in
-        // both repos collides at link time.
+        // The last four serve the glass window zrame builds on this transport (compositor
+        // blur, dmabuf video, HiDPI viewport/fractional scale). Every interface table is
+        // generated here and only here: a second copy linked into the same binary would
+        // collide at link time.
         const protocols = [_][2][]const u8{
             .{ "xdg-shell.xml", "xdg-shell.c" },
             .{ "xdg-decoration-unstable-v1.xml", "xdg-decoration.c" },

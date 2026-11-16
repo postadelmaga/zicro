@@ -237,7 +237,7 @@ pub const Window = struct {
 
     pub fn metrics(self: *Window) facade.Metrics {
         const c = self.contentPx();
-        return facade.computeMetrics(self.scaleFactor(), c.w, c.h, self.inner.isTouch());
+        return zicro.window.computeMetrics(self.scaleFactor(), c.w, c.h, self.inner.isTouch());
     }
 
     /// Logical → physical pixels, rounded.
@@ -715,10 +715,6 @@ pub const Window = struct {
 
     // --- zicro callbacks: composition ----------------------------------------------------
 
-    fn toPx(r: Rect) zicro.window.PxRect {
-        return .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
-    }
-
     /// `d` (frame pixels) placed in the frame's canvas rect `r`, clamped to it.
     fn subRect(r: Rect, d: Rect) Rect {
         const x = @min(d.x, r.w);
@@ -754,14 +750,14 @@ pub const Window = struct {
         self.dirty_full = false;
         self.dirty_staged = false;
         self.dirty_rect = null;
-        if (full or partial == null) win.damageAll() else win.damage(toPx(partial.?));
-        win.setVideoArea(toPx(area));
+        if (full or partial == null) win.damageAll() else win.damage(partial.?);
+        win.setVideoArea(area);
     }
 
     /// Paint one window frame into zicro's buffer: chrome from the cache, the app's
     /// `on_draw` overlay, the staged frame, the panels. With a region only that rect is
     /// repainted (the rest of the buffer holds its last frame, by construction).
-    fn innerCompose(win: *Inner, pixels: []u32, bw: u32, bh: u32, region: ?zicro.window.PxRect, user: ?*anyopaque) void {
+    fn innerCompose(win: *Inner, pixels: []u32, bw: u32, bh: u32, region: ?Rect, user: ?*anyopaque) void {
         const self = from(win, user);
         var canvas = paint.Canvas.init(pixels, bw, bh);
         if (!self.inner.layered) {

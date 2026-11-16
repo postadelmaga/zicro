@@ -8,4 +8,8 @@ comptime {
     _ = window.Window.attach;
     _ = window.Window.presentRgba;
     _ = window.Window.textFont;
+    _ = window.Window.metrics;
+    _ = window.Window.toggleFullscreen;
+    _ = window.Window.setStyle;
+    _ = window.Window.host;
 }
