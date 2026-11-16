@@ -362,6 +362,20 @@ pub const Window = struct {
         return self.inner.presentDmabufPlanes(slot, planes, width, height, fourcc);
     }
 
+    /// The compositor takes dmabuf frames at all (zicro `dmabufAvailable`); per format,
+    /// ask `dmabufSupported`. Always false on Windows. Any thread, after init.
+    pub fn dmabufAvailable(self: *Window) bool {
+        return self.inner.dmabufAvailable();
+    }
+
+    /// `presentDmabufPlanes` into `area` (canvas px): a GPU-rendered PANE inside the
+    /// app's own layout (a web view under an address bar). The frame fills `area`, the
+    /// window keeps a hole there, and pointer coordinates stay the content's (see
+    /// `appOriginPx`). Any thread.
+    pub fn presentDmabufPlanesIn(self: *Window, slot: u8, planes: []const DmabufPlane, width: u32, height: u32, fourcc: u32, area: Rect) bool {
+        return self.inner.presentDmabufPlanesIn(slot, planes, width, height, fourcc, area);
+    }
+
     pub fn videoBusy(self: *const Window) bool {
         return self.inner.videoBusy();
     }
