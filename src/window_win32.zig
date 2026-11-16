@@ -690,6 +690,14 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         return false;
     }
 
+    pub fn dmabufAvailable(_: *Window) bool {
+        return false;
+    }
+
+    pub fn presentDmabufPlanesIn(_: *Window, _: u8, _: []const window.DmabufPlane, _: u32, _: u32, _: u32, _: window.PxRect) bool {
+        return false;
+    }
+
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }

@@ -47,6 +47,7 @@ pub const theme = @import("theme.zig");
 pub const paint_gl = @import("paint_gl.zig");
 pub const scroll = @import("scroll.zig");
 pub const widget = @import("widget.zig");
+pub const line_edit = @import("line_edit.zig"); // caret + selection model for hand-painted fields
 pub const density = @import("density.zig");
 pub const keymap = @import("keymap.zig");
 pub const window = @import("window.zig");

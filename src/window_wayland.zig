@@ -179,6 +179,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     video_area: ?PxRect = null,
     /// Where the last dmabuf frame landed (buffer px), null while no plane is up.
     video_rect: ?PxRect = null,
+    /// The live plane is an app-placed PANE (`presentDmabufPlanesIn`): part of the
+    /// app's own layout, so it does not become the app's pointer origin.
+    video_pane: bool = false,
 
     active_popups: std.ArrayList(PopupState) = .empty,
     next_popup_id: u32 = 1,
@@ -298,6 +301,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         height: u32,
         fourcc: u32,
         plane_count: u8 = 1,
+        /// `presentDmabufPlanesIn`: the plane's rect for this frame (buffer px), filled
+        /// by the frame; null = `video_area` with the window's fit options.
+        area: ?PxRect = null,
         /// The fds are OURS (dup'ed at staging): the producer may close or reuse its
         /// own the moment `presentDmabuf` returns — e.g. retiring buffers on a resize
         /// while this frame still waits for the window thread.
@@ -1197,6 +1203,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         return false;
     }
 
+    /// The compositor can take dmabuf frames at all (linux-dmabuf + subcompositor);
+    /// `dmabufSupported` then answers per format/modifier. Any thread, after init.
+    pub fn dmabufAvailable(self: *Window) bool {
+        const r = self.rt();
+        return r.dmabuf != null and r.subcompositor != null;
+    }
+
     /// Is `slot` free for the producer to render into: not attached and unreleased
     /// by the compositor, not staged for the next commit. Any thread.
     pub fn videoSlotFree(self: *Window, slot: u8) bool {
@@ -1217,6 +1230,19 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// wl_buffer is created once and reused. False when the compositor lacks
     /// linux-dmabuf or subcompositor — fall back to CPU pixels. Any thread.
     pub fn presentDmabufPlanes(self: *Window, slot: u8, planes: []const window.DmabufPlane, width: u32, height: u32, fourcc: u32) bool {
+        return self.stageDmabuf(slot, planes, width, height, fourcc, null);
+    }
+
+    /// `presentDmabufPlanes` into an app-chosen rect (buffer px) instead of the video
+    /// area: a GPU-rendered PANE inside a software-drawn UI (a web view under an address
+    /// bar). The frame is scaled to fill `area`; the window erases its hole there, so
+    /// what the app draws over that rect stays on top. Pointer coordinates are not
+    /// re-based on it (see `video_pane`). Any thread.
+    pub fn presentDmabufPlanesIn(self: *Window, slot: u8, planes: []const window.DmabufPlane, width: u32, height: u32, fourcc: u32, area: PxRect) bool {
+        return self.stageDmabuf(slot, planes, width, height, fourcc, area);
+    }
+
+    fn stageDmabuf(self: *Window, slot: u8, planes: []const window.DmabufPlane, width: u32, height: u32, fourcc: u32, area: ?PxRect) bool {
         const r = self.rt();
         if (r.dmabuf == null or r.subcompositor == null or planes.len == 0 or planes.len > 4) return false;
         if (!self.dmabufSupported(fourcc, planes[0].modifier)) return false;
@@ -1227,6 +1253,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             .height = height,
             .fourcc = fourcc,
             .plane_count = @intCast(planes.len),
+            .area = area,
         };
         for (planes, 0..) |pl, i| {
             const rc = linux.fcntl(pl.fd, linux.F.DUPFD_CLOEXEC, 0);
@@ -1286,12 +1313,19 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         // The frame FILLS the area: its pixel size is a quality knob (resolution tier,
         // dynamic-res) and wp_viewport scales it on the scanout path for free. Without a
         // viewport, or with `video_native`, it sits centered at its own size.
-        const area = self.video_area orelse self.geometryPx();
+        const area = req.area orelse self.video_area orelse self.geometryPx();
         var vw = area.w;
         var vh = area.h;
         var dx = area.x;
         var dy = area.y;
-        if (self.video_viewport == null or self.opts.video_native) {
+        self.video_pane = req.area != null;
+        if (req.area != null) {
+            // A pane fills its rect; without a viewport it can only sit at its own size.
+            if (self.video_viewport == null) {
+                vw = @min(req.width, area.w);
+                vh = @min(req.height, area.h);
+            }
+        } else if (self.video_viewport == null or self.opts.video_native) {
             vw = @min(req.width, area.w);
             vh = @min(req.height, area.h);
             dx = area.x + (area.w - vw) / 2;
@@ -1917,6 +1951,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
                 vs.attach(null, 0, 0);
                 vs.commit();
                 self.video_rect = null;
+                self.video_pane = false;
                 self.damageAll();
             }
         }
