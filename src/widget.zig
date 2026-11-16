@@ -431,6 +431,7 @@ pub const Store = struct {
     left_pressed: bool = false,
     left_released: bool = false,
     right_pressed: bool = false,
+    middle_pressed: bool = false,
     /// Wheel pixels this frame (axis units × `scroll.wheel_gain`); a hovered scroll area
     /// or open dropdown consumes it.
     wheel: f32 = 0,
@@ -617,6 +618,7 @@ pub const Ui = struct {
         store.left_pressed = false;
         store.left_released = false;
         store.right_pressed = false;
+        store.middle_pressed = false;
         store.wheel = 0;
         store.text_ops_len = 0;
         store.keys_len = 0;
@@ -648,6 +650,8 @@ pub const Ui = struct {
                     }
                 } else if (b.button == BTN_RIGHT and b.pressed) {
                     store.right_pressed = true;
+                } else if (b.button == BTN_MIDDLE and b.pressed) {
+                    store.middle_pressed = true;
                 }
             },
             .scroll => |s| {
@@ -661,8 +665,11 @@ pub const Ui = struct {
                     else => if (k.pressed) {
                         if (sym == .other) {
                             // US-layout fallback — silenced once real `.text`
-                            // events (xkb) have been seen.
-                            if (!store.saw_text_events) {
+                            // events (xkb) have been seen. Except for Ctrl chords:
+                            // xkb turns Ctrl+letter into a control character, which
+                            // the window layer never sends as text, so Ctrl+A/C/X/V
+                            // would otherwise never reach a text field.
+                            if (!store.saw_text_events or store.ctrl_down) {
                                 if (keymap.toChar(k.code, store.shift_down)) |c| {
                                     if (store.text_ops_len < store.text_ops.len) {
                                         store.text_ops[store.text_ops_len] = .{ .char = c };
@@ -983,6 +990,8 @@ pub const Ui = struct {
         pressed: bool = false,
         clicked: bool = false,
         right_clicked: bool = false,
+        /// Middle button pressed over the widget this frame (close-a-tab gestures).
+        middle_clicked: bool = false,
         held: bool = false,
         drag_dx: f32 = 0,
         drag_dy: f32 = 0,
@@ -1069,6 +1078,7 @@ pub const Ui = struct {
             if (s.left_released and sig.hovered) sig.clicked = true;
         }
         if (sig.hovered and s.right_pressed) sig.right_clicked = true;
+        if (sig.hovered and s.middle_pressed) sig.middle_clicked = true;
         return sig;
     }
 
@@ -3161,6 +3171,43 @@ test "eventi .text: UTF-8 inserito, fallback toChar disattivato" {
     _ = ui.end();
     try testing.expectEqualStrings("è", buf.items);
     try testing.expectEqual(@as(usize, 2), h.store.text_cursor);
+}
+
+test "eventi .text: Ctrl+A/C/X/V arrivano comunque al campo" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "hello");
+
+    var ui = h.frame(10, &.{ .{ .motion = .{ .x = 100, .y = 25 } }, .{ .button = .{ .button = BTN_LEFT, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    // The window layer delivers text via `.text` (xkb), so the plain-key fallback is
+    // off — yet Ctrl+A (xkb: a control char, never sent as text) must select all,
+    // and Ctrl+X must cut it.
+    ui = h.frame(20, &.{ .{ .button = .{ .button = BTN_LEFT, .pressed = false } }, .{ .text = .{ .bytes = .{ '!', 0, 0, 0 }, .len = 1 } }, .{ .key = .{ .code = 29, .pressed = true } }, .{ .key = .{ .code = 30, .pressed = true } } });
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expectEqual(@as(?usize, 0), h.store.text_anchor);
+    try testing.expectEqual(buf.items.len, h.store.text_cursor);
+    ui = h.frame(30, &.{.{ .key = .{ .code = 45, .pressed = true } }});
+    _ = ui.textField("f", &buf);
+    _ = ui.end();
+    try testing.expectEqualStrings("", buf.items);
+    try testing.expect(std.mem.indexOf(u8, h.store.clipboard.items, "hello") != null);
+}
+
+test "interact: middle click reports middle_clicked" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit(gpa);
+    var ui = h.frame(10, &.{ .{ .motion = .{ .x = 20, .y = 20 } }, .{ .button = .{ .button = BTN_MIDDLE, .pressed = true } } });
+    const sig = ui.interact(ui.makeId("tab"), .{ .x = 0, .y = 0, .w = 100, .h = 40 });
+    _ = ui.end();
+    try testing.expect(sig.middle_clicked);
+    try testing.expect(!sig.clicked);
 }
 
 test "slider: press on track sets the value" {
