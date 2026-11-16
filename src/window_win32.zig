@@ -273,8 +273,9 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     /// WM_CHAR splits astral text over two messages: the high surrogate waits here.
     high_surrogate: u16 = 0,
 
-    /// No video plane on Windows (API parity with Wayland: always null).
+    /// No video plane on Windows (API parity with Wayland: always null / false).
     video_rect: ?PxRect = null,
+    video_pane: bool = false,
 
     // Compose into `frame` (heap RAM: composing straight into DIB memory is
     // pathologically slow under Wine), then move it out in one pass.

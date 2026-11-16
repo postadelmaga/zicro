@@ -927,9 +927,13 @@ pub const Window = struct {
     }
 
     /// App origin for pointer coordinates: the live dmabuf frame's rect while the video
-    /// plane is up, else the staged frame's (or the content rect's).
+    /// plane is up, else the staged frame's (or the content rect's). A PANE the app
+    /// placed itself (`presentDmabufPlanesIn`) is part of the app's layout, not its
+    /// presentation: it does not move the origin.
     fn appOriginPx(self: *Window) struct { x: f32, y: f32 } {
-        if (self.inner.video_rect) |r| return .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y) };
+        if (self.inner.video_rect) |r| {
+            if (!self.inner.video_pane) return .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y) };
+        }
         const o = chrome.appOrigin(self.frameArea(), &self.mailbox.front);
         return .{ .x = o.x, .y = o.y };
     }
