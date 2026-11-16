@@ -683,7 +683,9 @@ fn addCheckZ(b: *std.Build, text_c: *TextCCache, target: std.Build.ResolvedTarge
         .link_libc = true,
     });
     host_mod.addImport("scenic_protocol", host_proto);
-    text_c.attach(host_mod, target, optimize, .native);
+    // The host's own window backend is in this graph too (`window.zig` resolves
+    // `Window` to it, and its tests come along): link what zicro links.
+    addNativeDeps(b, text_c, host_mod, target, null);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host_mod })).step);
 
     // 2. the real Z userspace build of the shell, minus the link (Z's crt and linker

@@ -107,10 +107,14 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: System libraries (the host tests link text_c with HarfBuzz)
+      - name: System libraries (the host tests link what zicro links)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libharfbuzz-dev
+          # The host window backend is in check-z's test graph too: the same dev
+          # packages as the linux job (Wayland, xkbcommon, ALSA, PipeWire).
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev wayland-protocols libasound2-dev \
+            libharfbuzz-dev libpipewire-0.3-dev libxkbcommon-dev
       - name: check-z (Zicro)
         working-directory: Zicro
         run: zig build check-z -Dz-src="$GITHUB_WORKSPACE/Z" --test-timeout 300s --summary all
