@@ -333,6 +333,12 @@ pub const Window = struct {
         self.inner.requestResize(width, height);
     }
 
+    /// Keep the window's proportions at `w`:`h` while it floats and the user resizes it
+    /// (0×0 = free). Backends without it ignore the call. Any thread.
+    pub fn setContentAspect(self: *Window, w: u32, h: u32) void {
+        if (@hasDecl(Inner, "setContentAspect")) self.inner.setContentAspect(w, h);
+    }
+
     pub fn requestClipboardSet(self: *Window, bytes: []const u8) void {
         self.inner.requestClipboardSet(bytes);
     }

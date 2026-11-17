@@ -377,6 +377,9 @@ pub const Window = struct {
     pub fn dmabufSupported(_: *Window, _: u32, _: u64) bool {
         return false;
     }
+    /// No aspect lock on the canvas backend: the host page owns the size.
+    pub fn setContentAspect(_: *Window, _: u32, _: u32) void {}
+
     pub fn contentCornerPx(_: *Window) f32 {
         return 0;
     }

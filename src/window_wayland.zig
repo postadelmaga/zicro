@@ -117,6 +117,16 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// Usable area suggested by `configure_bounds` (0 = unknown): resizes stay inside.
     bounds_w: u32 = 0,
     bounds_h: u32 = 0,
+    /// Aspect lock `w << 32 | h` (0 = free): a floating window keeps the content's
+    /// proportions while the user resizes it. Written from any thread.
+    content_aspect: std.atomic.Value(u64) = .init(0),
+    /// `content_aspect` changed: the loop snaps the current size to it.
+    pending_aspect: std.atomic.Value(bool) = .init(false),
+    /// Last size the compositor suggested, raw (before the aspect lock): a drag step is
+    /// measured against it, not against our adjusted size, or the following axis would
+    /// read as motion and flip the lead back and forth.
+    cfg_w: u32 = 0,
+    cfg_h: u32 = 0,
 
     // wl_shm double buffer, one pool + mapping shared by both slots, over-allocated so
     // a drag-resize re-slices the buffers instead of re-creating the memfd every frame.
@@ -179,6 +189,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     video_area: ?PxRect = null,
     /// Where the last dmabuf frame landed (buffer px), null while no plane is up.
     video_rect: ?PxRect = null,
+    /// Pixel size of the last dmabuf frame: a window resize re-places the plane with it
+    /// at once, without waiting for the producer's next frame.
+    video_src: [2]u32 = .{ 0, 0 },
     /// The live plane is an app-placed PANE (`presentDmabufPlanesIn`): part of the
     /// app's own layout, so it does not become the app's pointer origin.
     video_pane: bool = false,
@@ -830,6 +843,66 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.damageAll();
     }
 
+    /// Lock the window's proportions to `w`:`h` while it floats (0×0 = free again).
+    /// The current size snaps to it (shrinking, anchored top-left: no remap), and every
+    /// interactive resize keeps it — no letterbox bands around content of a fixed
+    /// aspect (video). Fullscreen, maximized and tiled states are left alone. Any thread.
+    pub fn setContentAspect(self: *Window, w: u32, h: u32) void {
+        const v: u64 = if (w == 0 or h == 0) 0 else @as(u64, w) << 32 | h;
+        if (self.content_aspect.swap(v, .acq_rel) == v) return;
+        if (v != 0) {
+            self.pending_aspect.store(true, .release);
+            self.wake();
+        }
+    }
+
+    /// `w`×`h` adjusted to the aspect lock (unchanged without one). `prev_w`×`prev_h`
+    /// is the size before the drag step: the axis that moved more leads, the other
+    /// follows — so dragging a single edge resizes instead of being pinned by the
+    /// still edge. Never below `min_size`, kept inside the usable area.
+    fn aspectSize(self: *const Window, w: u32, h: u32, prev_w: u32, prev_h: u32) [2]u32 {
+        const a = self.content_aspect.load(.acquire);
+        if (a == 0 or w == 0 or h == 0) return .{ w, h };
+        const aw: u64 = a >> 32;
+        const ah: u64 = a & 0xffff_ffff;
+        const dw = if (w > prev_w) w - prev_w else prev_w - w;
+        const dh = if (h > prev_h) h - prev_h else prev_h - h;
+        var tw: u64 = w;
+        var th: u64 = h;
+        // Height leads only when it moved more (in width units): a corner drag follows
+        // the dominant motion, an edge drag the moving edge.
+        if (@as(u64, dh) * aw > @as(u64, dw) * ah) {
+            tw = (th * aw + ah / 2) / ah;
+        } else {
+            th = (tw * ah + aw / 2) / aw;
+        }
+        // Below the minimum: grow back along the aspect from the smaller side.
+        const mn: u64 = self.min_size;
+        if (tw < mn or th < mn) {
+            if (tw * ah < th * aw) {
+                tw = mn;
+                th = (mn * ah + aw / 2) / aw;
+            } else {
+                th = mn;
+                tw = (mn * aw + ah / 2) / ah;
+            }
+        }
+        return self.fitBounds(@intCast(@max(tw, 1)), @intCast(@max(th, 1)));
+    }
+
+    /// The largest `w`×`h` box on the aspect lock that fits inside `w`×`h` (unchanged
+    /// without a lock).
+    fn aspectInside(self: *const Window, w: u32, h: u32) [2]u32 {
+        const a = self.content_aspect.load(.acquire);
+        if (a == 0 or w == 0 or h == 0) return .{ w, h };
+        const aw: u64 = a >> 32;
+        const ah: u64 = a & 0xffff_ffff;
+        var tw: u64 = w;
+        var th: u64 = h;
+        if (tw * ah > th * aw) tw = (th * aw + ah / 2) / ah else th = (tw * ah + aw / 2) / aw;
+        return .{ @intCast(@max(tw, 1)), @intCast(@max(th, 1)) };
+    }
+
     pub fn setMinSize(self: *Window, size: u32) void {
         self.min_size = size;
         if (self.toplevel) |t| t.setMinSize(@intCast(size), @intCast(size));
@@ -983,7 +1056,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// again. No-op in fullscreen/maximized or at the same size. Window thread.
     pub fn setContentSize(self: *Window, w: u32, h: u32) void {
         if (self.fullscreen or self.maximized) return;
-        const fitted = self.fitBounds(w, h);
+        const boxed = self.aspectInside(w, h);
+        const fitted = self.fitBounds(boxed[0], boxed[1]);
         const tw = @max(fitted[0], self.min_size);
         const th = @max(fitted[1], self.min_size);
         if (tw == self.width and th == self.height) return;
@@ -1002,6 +1076,19 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.configured = false;
         surface.commit();
         self.cancelFrameCallback();
+        self.damageAll();
+    }
+
+    /// Bring the current size onto the aspect lock, inside the current box (it only
+    /// shrinks, so it stays on screen). No remap: the window keeps its top-left corner.
+    /// Window thread.
+    fn snapToAspect(self: *Window) void {
+        if (self.fullscreen or self.maximized) return;
+        const b = self.aspectInside(self.width, self.height);
+        const s = self.aspectSize(b[0], b[1], b[0], b[1]);
+        if (s[0] == self.width and s[1] == self.height) return;
+        self.width = s[0];
+        self.height = s[1];
         self.damageAll();
     }
 
@@ -1310,44 +1397,9 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             // Mapping and position are parent state: one parent commit seals them.
             self.damageAll();
         }
-        // The frame FILLS the area: its pixel size is a quality knob (resolution tier,
-        // dynamic-res) and wp_viewport scales it on the scanout path for free. Without a
-        // viewport, or with `video_native`, it sits centered at its own size.
-        const area = req.area orelse self.video_area orelse self.geometryPx();
-        var vw = area.w;
-        var vh = area.h;
-        var dx = area.x;
-        var dy = area.y;
         self.video_pane = req.area != null;
-        if (req.area != null) {
-            // A pane fills its rect; without a viewport it can only sit at its own size.
-            if (self.video_viewport == null) {
-                vw = @min(req.width, area.w);
-                vh = @min(req.height, area.h);
-            }
-        } else if (self.video_viewport == null or self.opts.video_native) {
-            vw = @min(req.width, area.w);
-            vh = @min(req.height, area.h);
-            dx = area.x + (area.w - vw) / 2;
-            dy = area.y + (area.h - vh) / 2;
-        } else if (self.opts.video_contain and req.width > 0 and req.height > 0) {
-            // Aspect fit: the larger axis ratio decides, the other side is letterboxed.
-            if (@as(u64, area.w) * req.height > @as(u64, area.h) * req.width) {
-                vw = @max(1, @as(u32, @intCast(@as(u64, area.h) * req.width / req.height)));
-            } else {
-                vh = @max(1, @as(u32, @intCast(@as(u64, area.w) * req.height / req.width)));
-            }
-            dx = area.x + (area.w - vw) / 2;
-            dy = area.y + (area.h - vh) / 2;
-        }
-        const new_rect: PxRect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
-        // The parent's hole follows the plane: a moved/resized plane repaints it.
-        if (self.video_rect == null or !std.meta.eql(self.video_rect.?, new_rect)) self.damageAll();
-        self.video_rect = new_rect;
-        self.video_subsurface.?.setPosition(@intCast(self.logiPx(dx)), @intCast(self.logiPx(dy)));
-        if (self.video_viewport) |vp| {
-            vp.setDestination(@intCast(@max(self.logiPx(vw), 1)), @intCast(@max(self.logiPx(vh), 1)));
-        }
+        self.video_src = .{ req.width, req.height };
+        self.placeVideo(req.area);
 
         // A slot presented at a new size gets a fresh wl_buffer.
         const ino = dmabufIno(req.planes[0].fd);
@@ -1383,6 +1435,64 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         cb.setListener(&video_frame_listener, self);
         vs.commit();
         return true;
+    }
+
+    /// Position and size the video plane for a `video_src` frame: in `pane` (an app
+    /// rect) or the window's video area. Position is parent state (sealed by the next
+    /// parent commit), the viewport destination is the plane's own. Window thread.
+    fn placeVideo(self: *Window, pane: ?PxRect) void {
+        const src_w = self.video_src[0];
+        const src_h = self.video_src[1];
+        // The frame FILLS the area: its pixel size is a quality knob (resolution tier,
+        // dynamic-res) and wp_viewport scales it on the scanout path for free. Without a
+        // viewport, or with `video_native`, it sits centered at its own size.
+        const area = pane orelse self.video_area orelse self.geometryPx();
+        var vw = area.w;
+        var vh = area.h;
+        var dx = area.x;
+        var dy = area.y;
+        if (pane != null) {
+            // A pane fills its rect; without a viewport it can only sit at its own size.
+            if (self.video_viewport == null) {
+                vw = @min(src_w, area.w);
+                vh = @min(src_h, area.h);
+            }
+        } else if (self.video_viewport == null or self.opts.video_native) {
+            vw = @min(src_w, area.w);
+            vh = @min(src_h, area.h);
+            dx = area.x + (area.w - vw) / 2;
+            dy = area.y + (area.h - vh) / 2;
+        } else if (self.opts.video_contain and src_w > 0 and src_h > 0) {
+            // Aspect fit: the larger axis ratio decides, the other side is letterboxed.
+            if (@as(u64, area.w) * src_h > @as(u64, area.h) * src_w) {
+                vw = @max(1, @as(u32, @intCast(@as(u64, area.h) * src_w / src_h)));
+            } else {
+                vh = @max(1, @as(u32, @intCast(@as(u64, area.w) * src_h / src_w)));
+            }
+            dx = area.x + (area.w - vw) / 2;
+            dy = area.y + (area.h - vh) / 2;
+        }
+        const new_rect: PxRect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
+        // The parent's hole follows the plane: a moved/resized plane repaints it.
+        if (self.video_rect == null or !std.meta.eql(self.video_rect.?, new_rect)) self.damageAll();
+        self.video_rect = new_rect;
+        self.video_subsurface.?.setPosition(@intCast(self.logiPx(dx)), @intCast(self.logiPx(dy)));
+        if (self.video_viewport) |vp| {
+            vp.setDestination(@intCast(@max(self.logiPx(vw), 1)), @intCast(@max(self.logiPx(vh), 1)));
+        }
+    }
+
+    /// The window changed size under a live plane: follow it now, not at the producer's
+    /// next frame — a plane left at the old rect pokes out past the rounded corners of a
+    /// shrinking window (subsurfaces are not clipped) or leaves a gap in a growing one.
+    /// A pane is the app's layout: it re-places it itself. Window thread.
+    fn replaceVideoOnResize(self: *Window) void {
+        if (self.video_rect == null or self.video_pane) return;
+        const vs = self.video_surface orelse return;
+        if (self.video_src[0] == 0 or self.video_src[1] == 0) return;
+        self.placeVideo(null);
+        // Desynced plane: the viewport applies on its own commit (no new buffer).
+        if (self.video_viewport != null) vs.commit();
     }
 
     /// Root: has the compositor imported this kind of buffer? The first frame of a
@@ -1970,6 +2080,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.pending_clip = null;
         self.mutex.unlock();
         if (rr) |wh| self.setContentSize(wh[0], wh[1]);
+        if (self.pending_aspect.swap(false, .acq_rel)) self.snapToAspect();
         if (pclip) |clip| {
             self.clipboardSet(clip);
             self.gpa.free(clip);
@@ -1989,6 +2100,8 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (bw != self.buf_w or bh != self.buf_h) {
             try self.resizeBuffers(bw, bh);
             self.damage_full = true;
+            // Before composing: the parent's hole is cut at the new `video_rect`.
+            self.replaceVideoOnResize();
         }
         const slot = self.freeSlot() orelse return; // both busy: the release wakes us
 
@@ -2348,6 +2461,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         var is_fs = false;
         var is_max = false;
+        var is_tiled = false;
         if (states_raw) |sr| {
             const states: *const wl.Array = @ptrCast(@alignCast(sr));
             if (states.data) |raw| {
@@ -2355,9 +2469,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
                 for (p[0 .. states.size / 4]) |state| {
                     if (state == wl.STATE_FULLSCREEN) is_fs = true;
                     if (state == wl.STATE_MAXIMIZED) is_max = true;
+                    if (state >= wl.STATE_TILED_LEFT and state <= wl.STATE_TILED_BOTTOM) is_tiled = true;
                 }
             }
         }
+        const prev_w = self.cfg_w;
+        const prev_h = self.cfg_h;
+        if (w > 0) self.cfg_w = @intCast(w);
+        if (h > 0) self.cfg_h = @intCast(h);
         if (is_fs != self.fullscreen) {
             self.fullscreen = is_fs;
             if (is_fs) {
@@ -2373,6 +2492,14 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         // The suggested size is the window geometry; 0 means "you pick".
         if (w > 0) self.width = @max(@as(u32, @intCast(w)), self.min_size);
         if (h > 0) self.height = @max(@as(u32, @intCast(h)), self.min_size);
+        // Aspect lock on a floating window. During a drag the suggested size is the
+        // pointer's box; the axis that did not lead may then exceed it on that side,
+        // which compositors accept from a resizing client (mpv does the same).
+        if (!is_fs and !is_max and !is_tiled and (w > 0 or h > 0)) {
+            const s = self.aspectSize(self.width, self.height, prev_w, prev_h);
+            self.width = s[0];
+            self.height = s[1];
+        }
         if (self.opts.on_configure) |cb| cb(self, self.opts.user);
         self.damageAll();
     }
