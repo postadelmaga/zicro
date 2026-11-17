@@ -180,6 +180,8 @@ pub const Window = struct {
             .on_preedit = innerPreedit,
             .on_mouse = innerMouse,
             .on_close_request = innerCloseRequest,
+            // Files dropped on the window (drag and drop) open like "Open With" ones.
+            .on_open_file = if (opts.on_open_file != null) innerOpenFile else null,
             .on_before_compose = innerBeforeCompose,
             .on_compose = innerCompose,
             .on_wake = innerWake,
@@ -331,6 +333,17 @@ pub const Window = struct {
 
     pub fn requestResize(self: *Window, width: u32, height: u32) void {
         self.inner.requestResize(width, height);
+    }
+
+    /// Resize without re-centering (no remap, no flash): for continuous gestures like
+    /// zooming. Falls back to `requestResize` where the backend lacks it. Any thread.
+    pub fn requestResizeInPlace(self: *Window, width: u32, height: u32) void {
+        if (@hasDecl(Inner, "requestResizeInPlace")) self.inner.requestResizeInPlace(width, height) else self.inner.requestResize(width, height);
+    }
+
+    /// Usable screen area (logical px) the compositor suggested, 0×0 if unknown.
+    pub fn usableArea(self: *Window) [2]u32 {
+        return if (@hasDecl(Inner, "usableArea")) self.inner.usableArea() else .{ 0, 0 };
     }
 
     /// Keep the window's proportions at `w`:`h` while it floats and the user resizes it
@@ -905,6 +918,11 @@ pub const Window = struct {
     }
 
     // --- zicro callbacks: input -----------------------------------------------------------
+
+    fn innerOpenFile(win: *Inner, path: []const u8, user: ?*anyopaque) void {
+        const self = from(win, user);
+        if (self.opts.on_open_file) |cb| cb(self, path, self.opts.user);
+    }
 
     fn innerKey(win: *Inner, key: u32, state: u32, user: ?*anyopaque) void {
         const self = from(win, user);

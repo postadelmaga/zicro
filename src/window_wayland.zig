@@ -127,6 +127,15 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// read as motion and flip the lead back and forth.
     cfg_w: u32 = 0,
     cfg_h: u32 = 0,
+    /// Interactive resize in progress (xdg `resizing` state), the size it started from,
+    /// and whether it turned out to be a corner drag (sticky until the release).
+    drag_resizing: bool = false,
+    drag_start: [2]u32 = .{ 0, 0 },
+    drag_corner: bool = false,
+    /// `setContentSize` remapped the window at a size of its choosing: the first
+    /// configure after the remap may carry the compositor's memory of the OLD size
+    /// (sway does), which must not undo the request.
+    remap_size_pending: bool = false,
 
     // wl_shm double buffer, one pool + mapping shared by both slots, over-allocated so
     // a drag-resize re-slices the buffers instead of re-creating the memfd every frame.
@@ -146,6 +155,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     staged: Staged = .{},
     front: Staged = .{},
     pending_resize: ?[2]u32 = null,
+    /// Last title set at runtime (`setTitle`), re-sent on remap; empty = `opts.title`.
+    title_buf: [256]u8 = undefined,
+    title_len: usize = 0,
+    /// `requestResizeInPlace`: like `pending_resize`, without the remap.
+    pending_resize_in_place: ?[2]u32 = null,
     pending_clip: ?[]u8 = null,
     staged_dma: ?StagedDma = null,
     pending_hide_video: std.atomic.Value(bool) = .init(false),
@@ -260,6 +274,12 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     pending_mime: TextMime = .none,
     selection_offer: ?*wl.DataOffer = null,
     selection_mime: TextMime = .none,
+    /// `pending_offer` advertises `text/uri-list`: a drag of files.
+    pending_uris: bool = false,
+    /// The file drag over one of our surfaces, accepted (`text/uri-list`), and the
+    /// window (root or child) under it that will get the paths.
+    dnd_offer: ?*wl.DataOffer = null,
+    dnd_target: ?*Window = null,
 
     pub const OutputInfo = struct {
         name: u32,
@@ -650,6 +670,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             if (o != self.selection_offer) o.destroy();
         }
         if (self.selection_offer) |o| o.destroy();
+        self.dropDndOffer();
         if (self.data_device) |d| d.release();
         if (self.clip_text.len > 0) self.gpa.free(self.clip_text);
         if (self.xkb_state) |st| xkb.xkb_state_unref(st);
@@ -741,6 +762,22 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.pending_resize = .{ width, height };
         self.mutex.unlock();
         self.wake();
+    }
+
+    /// Resize from any thread WITHOUT re-centering: the window keeps its top-left corner
+    /// and never flashes (no unmap/remap), so it can follow a continuous gesture (zoom
+    /// with the wheel). Kept inside the usable area; no-op in fullscreen/maximized.
+    pub fn requestResizeInPlace(self: *Window, width: u32, height: u32) void {
+        self.mutex.lock();
+        self.pending_resize_in_place = .{ width, height };
+        self.mutex.unlock();
+        self.wake();
+    }
+
+    /// Usable screen area the compositor suggested for this window (`configure_bounds`,
+    /// logical px), or 0×0 while unknown. Any thread.
+    pub fn usableArea(self: *const Window) [2]u32 {
+        return .{ @atomicLoad(u32, &self.bounds_w, .monotonic), @atomicLoad(u32, &self.bounds_h, .monotonic) };
     }
 
     /// Take the clipboard from any thread: the loop runs `clipboardSet` with a copy.
@@ -890,6 +927,22 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         return self.fitBounds(@intCast(@max(tw, 1)), @intCast(@max(th, 1)));
     }
 
+    /// Corner drag: the point on the aspect line nearest to the pointer's `w`×`h` (least
+    /// squares). Continuous in both inputs — no lead axis to flip, so no jumps — and it
+    /// follows the pointer along the diagonal. Same limits as `aspectSize`.
+    fn aspectProject(self: *const Window, w: u32, h: u32) [2]u32 {
+        const a = self.content_aspect.load(.acquire);
+        if (a == 0 or w == 0 or h == 0) return .{ w, h };
+        const aw: f64 = @floatFromInt(a >> 32);
+        const ah: f64 = @floatFromInt(a & 0xffff_ffff);
+        const k = (@as(f64, @floatFromInt(w)) * aw + @as(f64, @floatFromInt(h)) * ah) / (aw * aw + ah * ah);
+        const tw: u32 = @intFromFloat(@max(1.0, @round(k * aw)));
+        const th: u32 = @intFromFloat(@max(1.0, @round(k * ah)));
+        // Width leads from here (dw ≫ dh): `aspectSize` only re-derives the height from
+        // it and applies the minimum and the usable area.
+        return self.aspectSize(tw, th, 0, th);
+    }
+
     /// The largest `w`×`h` box on the aspect lock that fits inside `w`×`h` (unchanged
     /// without a lock).
     fn aspectInside(self: *const Window, w: u32, h: u32) [2]u32 {
@@ -939,6 +992,10 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     // =====================================================================================
 
     pub fn setTitle(self: *Window, title: [*:0]const u8) void {
+        const t = std.mem.span(title);
+        self.title_len = @min(t.len, self.title_buf.len - 1);
+        @memcpy(self.title_buf[0..self.title_len], t[0..self.title_len]);
+        self.title_buf[self.title_len] = 0;
         if (self.toplevel) |toplevel| {
             toplevel.setTitle(title);
             if (self.surface) |surface| surface.commit();
@@ -1074,8 +1131,23 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         surface.commit();
         self.markUnmapped();
         self.configured = false;
+        self.remap_size_pending = true;
+        self.restageToplevelState();
         surface.commit();
         self.cancelFrameCallback();
+        self.damageAll();
+    }
+
+    /// Window-thread half of `requestResizeInPlace`.
+    fn resizeInPlace(self: *Window, w: u32, h: u32) void {
+        if (self.fullscreen or self.maximized) return;
+        const boxed = self.aspectInside(w, h);
+        const fitted = self.fitBounds(boxed[0], boxed[1]);
+        const tw = @max(fitted[0], self.min_size);
+        const th = @max(fitted[1], self.min_size);
+        if (tw == self.width and th == self.height) return;
+        self.width = tw;
+        self.height = th;
         self.damageAll();
     }
 
@@ -1084,12 +1156,40 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     /// Window thread.
     fn snapToAspect(self: *Window) void {
         if (self.fullscreen or self.maximized) return;
-        const b = self.aspectInside(self.width, self.height);
+        // Same AREA on the new proportions, not the largest box inside the old one:
+        // a 2:1 window turned 1:2 (image rotated) swaps its sides instead of
+        // collapsing to a quarter, and repeated turns never shrink it.
+        const a = self.content_aspect.load(.acquire);
+        if (a == 0) return;
+        const aw: f64 = @floatFromInt(a >> 32);
+        const ah: f64 = @floatFromInt(a & 0xffff_ffff);
+        const area = @as(f64, @floatFromInt(self.width)) * @as(f64, @floatFromInt(self.height));
+        const nw = @sqrt(area * aw / ah);
+        const b: [2]u32 = .{ @intFromFloat(@max(1.0, @round(nw))), @intFromFloat(@max(1.0, @round(nw * ah / aw))) };
         const s = self.aspectSize(b[0], b[1], b[0], b[1]);
         if (s[0] == self.width and s[1] == self.height) return;
+        // A side that GROWS, anchored top-left, can push the window past the screen
+        // edge: re-center it (remap) instead; shrinking stays in place.
+        if (s[0] > self.width or s[1] > self.height) {
+            self.setContentSize(s[0], s[1]);
+            return;
+        }
         self.width = s[0];
         self.height = s[1];
         self.damageAll();
+    }
+
+    /// Unmapping discards the toplevel's attributes (xdg-shell: "title, state, stacking,
+    /// …"): send them again before the mapping commit, or the remapped window loses its
+    /// app_id (compositor window rules, taskbar icon and grouping), title and min size.
+    fn restageToplevelState(self: *Window) void {
+        const toplevel = self.toplevel orelse return;
+        if (self.title_len > 0)
+            toplevel.setTitle(@ptrCast(self.title_buf[0..self.title_len :0].ptr))
+        else
+            toplevel.setTitle(self.opts.title.ptr);
+        if (self.opts.app_id.len > 0) toplevel.setAppId(self.opts.app_id.ptr);
+        if (self.min_size > 0) toplevel.setMinSize(@intCast(self.min_size), @intCast(self.min_size));
     }
 
     /// Hide (unmap) or show (remap) the toplevel — "minimize to tray". Window thread;
@@ -1104,6 +1204,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
                 // the mapping commit, or the remap is sized from the whole buffer and
                 // the window grows by 2·margin per hide/show.
                 if (self.buf_w != 0) self.applySurfaceMetrics();
+                self.restageToplevelState();
                 surface.commit();
             }
             self.damageAll();
@@ -1876,14 +1977,99 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         }
         self.pending_offer = offer;
         self.pending_mime = .none;
+        self.pending_uris = false;
         offer.setListener(&data_offer_listener, self);
     }
 
-    // DnD is out of scope: drags are never accepted.
-    fn onDndEnter(_: ?*anyopaque, _: *wl.DataDevice, _: u32, _: ?*wl.Surface, _: wl.Fixed, _: wl.Fixed, _: ?*wl.DataOffer) callconv(.c) void {}
-    fn onDndLeave(_: ?*anyopaque, _: *wl.DataDevice) callconv(.c) void {}
+    // --- drag and drop: files dropped on a window go to its `on_open_file` -------------
+
+    /// The window (root or child) that owns `surface`, if any.
+    fn windowOfSurface(self: *Window, surface: ?*wl.Surface) ?*Window {
+        const s = surface orelse return null;
+        if (self.surface == s) return self;
+        for (self.children.items) |c| {
+            if (c.surface == s) return c;
+        }
+        return null;
+    }
+
+    fn dropDndOffer(self: *Window) void {
+        if (self.dnd_offer) |o| o.destroy();
+        self.dnd_offer = null;
+        self.dnd_target = null;
+    }
+
+    fn onDndEnter(data: ?*anyopaque, _: *wl.DataDevice, serial: u32, surface: ?*wl.Surface, _: wl.Fixed, _: wl.Fixed, offer_opt: ?*wl.DataOffer) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.dropDndOffer();
+        const offer = offer_opt orelse return; // a drag from this very client, no data
+        const uris = offer == self.pending_offer and self.pending_uris;
+        // The offer is the drag's from here on (destroyed at leave/drop), not a
+        // selection candidate.
+        if (offer == self.pending_offer) {
+            self.pending_offer = null;
+            self.pending_mime = .none;
+        }
+        self.pending_uris = false;
+        self.dnd_offer = offer;
+        const target = self.windowOfSurface(surface);
+        if (uris and target != null and target.?.opts.on_open_file != null) {
+            self.dnd_target = target;
+            offer.accept(serial, "text/uri-list");
+            offer.setActions(wl.DND_ACTION_COPY, wl.DND_ACTION_COPY);
+        } else {
+            offer.accept(serial, null);
+        }
+    }
+
+    fn onDndLeave(data: ?*anyopaque, _: *wl.DataDevice) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.dropDndOffer();
+    }
+
     fn onDndMotion(_: ?*anyopaque, _: *wl.DataDevice, _: u32, _: wl.Fixed, _: wl.Fixed) callconv(.c) void {}
-    fn onDndDrop(_: ?*anyopaque, _: *wl.DataDevice) callconv(.c) void {}
+
+    /// Read the `text/uri-list` (the source writes it once our request is flushed; a
+    /// ~1 s budget, 1 MiB cap) and hand each local file to the target's `on_open_file`.
+    fn onDndDrop(data: ?*anyopaque, _: *wl.DataDevice) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        defer self.dropDndOffer();
+        const offer = self.dnd_offer orelse return;
+        const target = self.dnd_target orelse return;
+        const cb = target.opts.on_open_file orelse return;
+        var pipe_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
+        offer.receive("text/uri-list", pipe_fds[1]);
+        _ = linux.close(pipe_fds[1]);
+        _ = wl.wl_display_flush(self.display);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        const deadline = monotonicNs() + 1000 * 1_000_000;
+        var buf: [4096]u8 = undefined;
+        while (out.items.len < 1024 * 1024) {
+            const left_ns = deadline - monotonicNs();
+            if (left_ns <= 0) break;
+            var pfd = [_]posix.pollfd{.{ .fd = pipe_fds[0], .events = posix.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&pfd, @intCast(@divTrunc(left_ns, 1_000_000) + 1)) catch break;
+            if (ready == 0) break;
+            const n = posix.read(pipe_fds[0], &buf) catch break;
+            if (n == 0) break;
+            out.appendSlice(self.gpa, buf[0..n]) catch break;
+        }
+        _ = linux.close(pipe_fds[0]);
+        offer.finish();
+
+        var path_buf: std.ArrayList(u8) = .empty;
+        defer path_buf.deinit(self.gpa);
+        var lines = std.mem.splitScalar(u8, out.items, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            path_buf.clearRetainingCapacity();
+            if (!(fileUriPath(self.gpa, line, &path_buf) catch false)) continue;
+            cb(target, path_buf.items, target.opts.user);
+        }
+    }
 
     fn onSelection(data: ?*anyopaque, _: *wl.DataDevice, offer: ?*wl.DataOffer) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
@@ -1918,6 +2104,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         else
             .none;
         if (@backingInt(rank) > @backingInt(self.pending_mime)) self.pending_mime = rank;
+        if (std.mem.eql(u8, m, "text/uri-list")) self.pending_uris = true;
     }
 
     fn onOfferSourceActions(_: ?*anyopaque, _: *wl.DataOffer, _: u32) callconv(.c) void {}
@@ -2076,10 +2263,13 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.mutex.lock();
         const rr = self.pending_resize;
         self.pending_resize = null;
+        const rip = self.pending_resize_in_place;
+        self.pending_resize_in_place = null;
         const pclip = self.pending_clip;
         self.pending_clip = null;
         self.mutex.unlock();
         if (rr) |wh| self.setContentSize(wh[0], wh[1]);
+        if (rip) |wh| self.resizeInPlace(wh[0], wh[1]);
         if (self.pending_aspect.swap(false, .acq_rel)) self.snapToAspect();
         if (pclip) |clip| {
             self.clipboardSet(clip);
@@ -2462,6 +2652,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         var is_fs = false;
         var is_max = false;
         var is_tiled = false;
+        var is_resizing = false;
         if (states_raw) |sr| {
             const states: *const wl.Array = @ptrCast(@alignCast(sr));
             if (states.data) |raw| {
@@ -2470,11 +2661,28 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
                     if (state == wl.STATE_FULLSCREEN) is_fs = true;
                     if (state == wl.STATE_MAXIMIZED) is_max = true;
                     if (state >= wl.STATE_TILED_LEFT and state <= wl.STATE_TILED_BOTTOM) is_tiled = true;
+                    if (state == wl.STATE_RESIZING) is_resizing = true;
                 }
             }
         }
         const prev_w = self.cfg_w;
         const prev_h = self.cfg_h;
+        // Committed size before this configure: an untouched axis in an edge drag comes
+        // back either as the drag's start value or as this (compositors differ).
+        const had_w = self.width;
+        const had_h = self.height;
+        if (is_resizing and !self.drag_resizing) {
+            self.drag_start = .{ had_w, had_h };
+            self.drag_corner = false;
+        }
+        self.drag_resizing = is_resizing;
+        if (is_resizing and !self.drag_corner and w > 0 and h > 0) {
+            const uw: u32 = @intCast(w);
+            const uh: u32 = @intCast(h);
+            const moved_w = absDiff(uw, self.drag_start[0]) > 4 and uw != had_w;
+            const moved_h = absDiff(uh, self.drag_start[1]) > 4 and uh != had_h;
+            self.drag_corner = moved_w and moved_h;
+        }
         if (w > 0) self.cfg_w = @intCast(w);
         if (h > 0) self.cfg_h = @intCast(h);
         if (is_fs != self.fullscreen) {
@@ -2489,6 +2697,15 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             }
         }
         self.maximized = is_max;
+        // First configure after our own remap, floating: the size is ours (see
+        // `remap_size_pending`), the suggestion is the compositor's memory of before.
+        const keep_ours = self.remap_size_pending and !is_fs and !is_max and !is_tiled and !is_resizing;
+        self.remap_size_pending = false;
+        if (keep_ours) {
+            if (self.opts.on_configure) |cb| cb(self, self.opts.user);
+            self.damageAll();
+            return;
+        }
         // The suggested size is the window geometry; 0 means "you pick".
         if (w > 0) self.width = @max(@as(u32, @intCast(w)), self.min_size);
         if (h > 0) self.height = @max(@as(u32, @intCast(h)), self.min_size);
@@ -2496,7 +2713,16 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         // pointer's box; the axis that did not lead may then exceed it on that side,
         // which compositors accept from a resizing client (mpv does the same).
         if (!is_fs and !is_max and !is_tiled and (w > 0 or h > 0)) {
-            const s = self.aspectSize(self.width, self.height, prev_w, prev_h);
+            // Drag dall'utente: guida l'asse mosso (o la proiezione, da un angolo).
+            // Taglia decisa dal compositor (tiling di un floating, "resize set",
+            // regole): la più grande dentro il riquadro, mai oltre.
+            const s = if (!is_resizing) blk: {
+                const b = self.aspectInside(self.width, self.height);
+                break :blk self.aspectSize(b[0], b[1], b[0], b[1]);
+            } else if (self.drag_corner)
+                self.aspectProject(self.width, self.height)
+            else
+                self.aspectSize(self.width, self.height, prev_w, prev_h);
             self.width = s[0];
             self.height = s[1];
         }
@@ -2962,4 +3188,54 @@ test "dmabuf plane: announced is not enough, a refused import turns the pair off
 
     w.dmabuf = null;
     try std.testing.expect(!w.dmabufSupported(ar24, tiled)); // no linux-dmabuf at all
+}
+
+/// One `text/uri-list` line → the local path it names, percent-decoded into `out`.
+/// False for comments, blank lines and anything but a `file:` URI on this host
+/// (`file:///p`, `file://localhost/p`, `file:/p`).
+fn fileUriPath(gpa: std.mem.Allocator, line: []const u8, out: *std.ArrayList(u8)) !bool {
+    if (line.len == 0 or line[0] == '#') return false;
+    const scheme = "file:";
+    if (line.len < scheme.len or !std.ascii.eqlIgnoreCase(line[0..scheme.len], scheme)) return false;
+    var rest = line[scheme.len..];
+    if (std.mem.startsWith(u8, rest, "//")) {
+        rest = rest[2..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return false;
+        const host = rest[0..slash];
+        if (host.len != 0 and !std.ascii.eqlIgnoreCase(host, "localhost")) return false;
+        rest = rest[slash..];
+    }
+    if (rest.len == 0 or rest[0] != '/') return false;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const c = rest[i];
+        if (c == '%' and i + 2 < rest.len) {
+            const v = std.fmt.parseInt(u8, rest[i + 1 .. i + 3], 16) catch {
+                try out.append(gpa, c);
+                continue;
+            };
+            try out.append(gpa, v);
+            i += 2;
+        } else try out.append(gpa, c);
+    }
+    return true;
+}
+
+test "fileUriPath" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expect(try fileUriPath(gpa, "file:///home/a/Vacanze%202024/%C3%A8.jpg", &out));
+    try std.testing.expectEqualStrings("/home/a/Vacanze 2024/è.jpg", out.items);
+    out.clearRetainingCapacity();
+    try std.testing.expect(try fileUriPath(gpa, "file://localhost/tmp/x%", &out));
+    try std.testing.expectEqualStrings("/tmp/x%", out.items);
+    out.clearRetainingCapacity();
+    try std.testing.expect(!try fileUriPath(gpa, "# commento", &out));
+    try std.testing.expect(!try fileUriPath(gpa, "https://example.com/a.png", &out));
+    try std.testing.expect(!try fileUriPath(gpa, "file://altrohost/a.png", &out));
+}
+
+fn absDiff(a: u32, b: u32) u32 {
+    return if (a > b) a - b else b - a;
 }

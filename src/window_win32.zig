@@ -162,6 +162,9 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     extern "kernel32" fn GlobalLock(?*anyopaque) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn GlobalUnlock(?*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn GlobalFree(?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "shell32" fn DragAcceptFiles(HWND, i32) callconv(.winapi) void;
+    extern "shell32" fn DragQueryFileW(?*anyopaque, u32, ?[*]u16, u32) callconv(.winapi) u32;
+    extern "shell32" fn DragFinish(?*anyopaque) callconv(.winapi) void;
     extern fn getenv([*:0]const u8) ?[*:0]const u8;
 
     const CF_UNICODETEXT: u32 = 13;
@@ -203,6 +206,7 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
     const WM_CAPTURECHANGED: u32 = 0x0215;
     const WM_NCLBUTTONDOWN: u32 = 0x00A1;
     const WM_KEYDOWN: u32 = 0x0100;
+    const WM_DROPFILES: u32 = 0x0233;
     const WM_KEYUP: u32 = 0x0101;
     const WM_CHAR: u32 = 0x0102;
     const WM_SYSKEYDOWN: u32 = 0x0104;
@@ -375,6 +379,8 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
             self,
         ) orelse return error.WindowCreationFailed;
         self.hwnd = hwnd;
+        // Files dropped from Explorer open like "Open With" ones (`WM_DROPFILES`).
+        if (opts.on_open_file != null) DragAcceptFiles(hwnd, 1);
         // Re-run the frame calculation now that the window exists (frameless takes hold).
         _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
         self.syncClientSize();
@@ -386,6 +392,24 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
         self.ready = true;
         if (opts.on_compose == null) self.scheduleRedraw();
         return self;
+    }
+
+    /// `WM_DROPFILES`: each dropped path (UTF-16 → UTF-8) to `on_open_file`.
+    fn dropFiles(self: *Window, hdrop: ?*anyopaque) void {
+        defer DragFinish(hdrop);
+        const cb = self.opts.on_open_file orelse return;
+        const n = DragQueryFileW(hdrop, 0xFFFF_FFFF, null, 0);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const len = DragQueryFileW(hdrop, i, null, 0);
+            if (len == 0) continue;
+            const wide = self.gpa.alloc(u16, len + 1) catch continue;
+            defer self.gpa.free(wide);
+            const got = DragQueryFileW(hdrop, i, wide.ptr, len + 1);
+            const path = std.unicode.utf16LeToUtf8Alloc(self.gpa, wide[0..@min(got, len)]) catch continue;
+            defer self.gpa.free(path);
+            cb(self, path, self.opts.user);
+        }
     }
 
     pub fn deinit(self: *Window) void {
@@ -1031,6 +1055,10 @@ pub const Window = if (builtin.os.tag != .windows) struct {} else struct {
             },
             WM_APP_WAKE => {
                 self.serviceWake();
+                return 0;
+            },
+            WM_DROPFILES => {
+                self.dropFiles(@ptrFromInt(wparam));
                 return 0;
             },
             WM_TIMER => {

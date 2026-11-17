@@ -593,6 +593,9 @@ pub const DataDevice = opaque {
     }
 };
 
+/// wl_data_device_manager.dnd_action
+pub const DND_ACTION_COPY: u32 = 1;
+
 pub const DataOffer = opaque {
     pub const Listener = extern struct {
         /// offer: one mime type the source can produce (sent once per type, right after
@@ -605,6 +608,21 @@ pub const DataOffer = opaque {
 
     pub fn setListener(self: *DataOffer, listener: *const Listener, data: ?*anyopaque) void {
         addListener(self, listener, data);
+    }
+
+    /// accept (opcode 0): DnD feedback — `mime` the drop would take (null = refuse).
+    pub fn accept(self: *DataOffer, serial: u32, mime: ?[*:0]const u8) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), 0, serial, mime);
+    }
+
+    /// finish (opcode 3, v3): the drop's data was read — the source may clean up.
+    pub fn finish(self: *DataOffer) void {
+        if (version(self) >= 3) _ = wl_proxy_marshal_flags(proxy(self), 3, null, version(self), 0);
+    }
+
+    /// set_actions (opcode 4, v3): DnD actions we support and the one we prefer.
+    pub fn setActions(self: *DataOffer, actions: u32, preferred: u32) void {
+        if (version(self) >= 3) _ = wl_proxy_marshal_flags(proxy(self), 4, null, version(self), 0, actions, preferred);
     }
 
     /// receive (opcode 1): ask for the data as `mime`; the source writes into `fd`

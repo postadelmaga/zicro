@@ -299,6 +299,18 @@ fn ensureViewClass() Class {
     _ = class_addMethod(cls, sel_registerName("drawRect:"), @ptrCast(&imp_drawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     _ = class_addMethod(cls, sel_registerName("acceptsFirstResponder"), @ptrCast(&imp_yes), "c@:");
     _ = class_addMethod(cls, sel_registerName("isOpaque"), @ptrCast(&imp_no), "c@:");
+    // Keys reach the app through `dispatch`; the same event then goes on to
+    // `sendEvent:` (AppKit needs it for menus and the IME). Without its own `keyDown:`
+    // the view passes it up the responder chain to `noResponderFor:`, which plays the
+    // system alert sound: every arrow key in the viewer beeped. Swallowed here.
+    _ = class_addMethod(cls, sel_registerName("keyDown:"), @ptrCast(&imp_ignoreEvent), "v@:@");
+    _ = class_addMethod(cls, sel_registerName("keyUp:"), @ptrCast(&imp_ignoreEvent), "v@:@");
+    // File drops (NSDraggingDestination): registered per view in `init` when the app
+    // takes files (`on_open_file`).
+    _ = class_addMethod(cls, sel_registerName("draggingEntered:"), @ptrCast(&imp_dragOperation), "Q@:@");
+    _ = class_addMethod(cls, sel_registerName("draggingUpdated:"), @ptrCast(&imp_dragOperation), "Q@:@");
+    _ = class_addMethod(cls, sel_registerName("prepareForDragOperation:"), @ptrCast(&imp_yesFor), "c@:@");
+    _ = class_addMethod(cls, sel_registerName("performDragOperation:"), @ptrCast(&imp_performDrag), "c@:@");
     objc_registerClassPair(cls);
     g_view_class = cls;
     return cls;
@@ -452,6 +464,73 @@ fn imp_openFile(_: id, _: SEL, _: id, file: id) callconv(.c) bool {
     return deliverPath(pathOf(file));
 }
 
+fn imp_ignoreEvent(_: id, _: SEL, _: id) callconv(.c) void {}
+
+fn imp_yesFor(_: id, _: SEL, _: id) callconv(.c) bool {
+    return true;
+}
+
+/// NSDragOperationCopy for a drag carrying files, None otherwise.
+fn imp_dragOperation(_: id, _: SEL, info: id) callconv(.c) u64 {
+    const pb = msgId(info, "draggingPasteboard") orelse return 0;
+    const types = msgId(pb, "types") orelse return 0;
+    var i: u64 = 0;
+    while (i < arrayCount(types)) : (i += 1) {
+        const t = pathOf(arrayAt(types, i)) orelse continue;
+        const name = std.mem.span(t);
+        if (std.mem.eql(u8, name, "NSFilenamesPboardType") or std.mem.eql(u8, name, "public.file-url")) return 1;
+    }
+    return 0;
+}
+
+/// The dropped files go to the view's window `on_open_file`, one call per path.
+/// `NSFilenamesPboardType` (deprecated but still served by Finder, and the only form
+/// Cocotron knows) first, then the file URLs of the modern pasteboard.
+fn imp_performDrag(view: id, _: SEL, info: id) callconv(.c) bool {
+    if (builtin.os.tag != .macos) return false;
+    const self: *Window = @ptrCast(@alignCast(windowForView(view) orelse return false));
+    const cb = self.opts.on_open_file orelse return false;
+    const pb = msgId(info, "draggingPasteboard") orelse return false;
+    var delivered = false;
+    const plist: *const fn (id, SEL, id) callconv(.c) id = @ptrCast(&objc_msgSend);
+    const files = plist(pb, sel_registerName("propertyListForType:"), nsString("NSFilenamesPboardType"));
+    if (files != null and isKind(files, "NSArray")) {
+        var i: u64 = 0;
+        while (i < arrayCount(files)) : (i += 1) {
+            const p = pathOf(arrayAt(files, i)) orelse continue;
+            const path = std.mem.span(p);
+            if (path.len == 0) continue;
+            trace("drop: {s}", .{path});
+            cb(self, path, self.opts.user);
+            delivered = true;
+        }
+    }
+    if (delivered) return true;
+    if (!responds(pb, "readObjectsForClasses:options:")) return false;
+    const read: *const fn (id, SEL, id, id) callconv(.c) id = @ptrCast(&objc_msgSend);
+    const one: *const fn (Class, SEL, id) callconv(.c) id = @ptrCast(&objc_msgSend);
+    const classes = one(class("NSArray"), sel_registerName("arrayWithObject:"), @ptrCast(class("NSURL")));
+    const urls = read(pb, sel_registerName("readObjectsForClasses:options:"), classes, null);
+    var i: u64 = 0;
+    while (i < arrayCount(urls)) : (i += 1) {
+        const url = arrayAt(urls, i) orelse continue;
+        if (!msgBool(url, "isFileURL")) continue;
+        const p = pathOf(msgId(url, "path")) orelse continue;
+        const path = std.mem.span(p);
+        if (path.len == 0) continue;
+        trace("drop: {s}", .{path});
+        cb(self, path, self.opts.user);
+        delivered = true;
+    }
+    return delivered;
+}
+
+/// `[obj isKindOfClass:[name class]]`.
+fn isKind(obj: id, name: [*:0]const u8) bool {
+    const f: *const fn (id, SEL, Class) callconv(.c) bool = @ptrCast(&objc_msgSend);
+    return f(obj, sel_registerName("isKindOfClass:"), class(name));
+}
+
 fn imp_yes(_: id, _: SEL) callconv(.c) bool {
     return true;
 }
@@ -571,6 +650,13 @@ pub const Window = if (builtin.os.tag != .macos) struct {} else struct {
         ) orelse return error.WindowCreationFailed;
         self.view = view;
         registerView(view, self);
+        // Files dropped on the window open like "Open With" ones (see `imp_performDrag`).
+        if (opts.on_open_file != null) {
+            const types = [_]id{ nsString("NSFilenamesPboardType"), nsString("public.file-url") };
+            const mk: *const fn (Class, SEL, [*]const id, u64) callconv(.c) id = @ptrCast(&objc_msgSend);
+            const arr = mk(class("NSArray"), sel_registerName("arrayWithObjects:count:"), &types, types.len);
+            if (arr != null) msgVoidId(view, "registerForDraggedTypes:", arr);
+        }
 
         // Native glass (real AppKit only): mount a full-window NSVisualEffectView as
         // the content view with our view on top — the material blurs the desktop
