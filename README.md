@@ -108,6 +108,7 @@ zig build run-world_counter     # the App + world spine
 zig build run-shell             # the software-rendered windowing shell (Wayland/Win32)
 zig build run-hello             # zrame: styled glass windows with title-bar controls (see zrame/README.md)
 zig build bench                 # the performance contract (ReleaseFast; add `-- --quick` for a fast pass)
+zig build check-remap           # a window comes back after a remap (opens windows: needs a Wayland compositor)
 ```
 
 ## Port notes (Rust → Zig)

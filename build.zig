@@ -159,6 +159,36 @@ pub fn build(b: *std.Build) void {
         run_step.dependOn(&run_cmd.step);
     }
 
+    // `zig build check-remap` — the remap regression check (tests/window_remap.zig): it
+    // opens a real window, so it needs a running Wayland compositor and stays out of
+    // `zig build test`. One run per mode, in sequence so the verdicts read in order.
+    if (target.result.os.tag == .linux and target.result.abi != .android) {
+        const remap_exe = b.addExecutable(.{
+            .name = "check-remap",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/window_remap.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "zicro", .module = zicro },
+                },
+            }),
+        });
+        const remap_step = b.step("check-remap", "Check that a window comes back after a remap (needs a Wayland compositor)");
+        var prev: ?*std.Build.Step = null;
+        inline for (.{ "back-to-back", "hide", "spaced" }) |mode| {
+            const run = b.addRunArtifact(remap_exe);
+            // An argument, not an environment variable: a Run step with its own
+            // environment is frozen with the cached configuration, and the check would
+            // then talk to the compositor of the session that configured the build.
+            run.addArg(mode);
+            run.has_side_effects = true;
+            if (prev) |p| run.step.dependOn(p);
+            prev = &run.step;
+        }
+        remap_step.dependOn(prev.?);
+    }
+
     // `zig build web` — the WebAssembly build: the CPU canvas in a browser tab.
     // wasm32-freestanding, no libc, no C: a dedicated minimal `zicro` module that
     // exposes only `paint` (the full root's threads/Io/Wayland don't exist on wasm).
