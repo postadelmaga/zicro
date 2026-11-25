@@ -108,6 +108,17 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
     blur_shape: ?window.Blur = null,
     min_size: u32 = 0,
     configured: bool = false,
+    /// A buffer has been committed since the xdg surface was last reset: the
+    /// compositor has the window mapped. A null-buffer commit only resets the surface
+    /// (so that the next commit is answered with a configure) when it UNMAPS it; on a
+    /// surface that is configured but still has no buffer it is a no-op, no configure
+    /// follows, and a `configured = false` set to wait for one waits forever — the
+    /// window never appears. So: no unmap commit unless `mapped`.
+    mapped: bool = false,
+    /// Hidden (`setVisible(false)`) while configured but not yet mapped: nothing was
+    /// unmapped, so no configure will come on show — the one already acked still
+    /// stands and `setVisible(true)` takes it back.
+    held_configure: bool = false,
     needs_redraw: bool = false,
     closed: bool = false,
     fullscreen: bool = false,
@@ -1120,7 +1131,11 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (tw == self.width and th == self.height) return;
         self.width = tw;
         self.height = th;
-        if (!self.configured or self.toplevel == null) {
+        // Not mapped yet (first configure pending, or acked with the first buffer still
+        // to come — two resizes in a row land here): the window has no position to
+        // lose, the first buffer simply goes out at the new size. Unmapping here would
+        // be a no-op for the compositor and no configure would follow (see `mapped`).
+        if (!self.configured or !self.mapped or self.toplevel == null) {
             self.damageAll();
             return;
         }
@@ -1130,6 +1145,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         surface.attach(null, 0, 0);
         surface.commit();
         self.markUnmapped();
+        self.mapped = false;
         self.configured = false;
         self.remap_size_pending = true;
         self.restageToplevelState();
@@ -1199,7 +1215,12 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         if (show == !self.hidden.load(.acquire)) return;
         if (show) {
             self.hidden.store(false, .release);
-            if (self.surface) |surface| {
+            if (self.held_configure) {
+                // Hidden before its first buffer: never unmapped, the acked configure
+                // is still the current one. A commit here would get no answer.
+                self.held_configure = false;
+                self.configured = true;
+            } else if (self.surface) |surface| {
                 // Unmapping reset the xdg state, geometry included: re-stage it BEFORE
                 // the mapping commit, or the remap is sized from the whole buffer and
                 // the window grows by 2·margin per hide/show.
@@ -1209,10 +1230,15 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
             }
             self.damageAll();
         } else {
-            if (self.surface) |surface| {
-                surface.attach(null, 0, 0);
-                surface.commit();
-                self.markUnmapped();
+            if (self.mapped) {
+                if (self.surface) |surface| {
+                    surface.attach(null, 0, 0);
+                    surface.commit();
+                    self.markUnmapped();
+                }
+                self.mapped = false;
+            } else if (self.configured) {
+                self.held_configure = true;
             }
             self.configured = false;
             self.cancelFrameCallback();
@@ -2334,6 +2360,7 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         self.frame_cb = fcb;
         self.frame_cb_pending = true;
         surface.commit();
+        self.mapped = true;
         slot.busy = true;
     }
 
@@ -2631,6 +2658,12 @@ pub const Window = if (builtin.os.tag != .linux) struct {} else struct {
         // Sent before our unmap reached the compositor: that state is gone.
         if (self.unmap_sync != null) return;
         xdg_surface.ackConfigure(serial);
+        // Arrived while hidden (hidden before the first configure): acked, but no
+        // buffer goes out until `setVisible(true)` — it would map a hidden window.
+        if (self.hidden.load(.acquire)) {
+            self.held_configure = true;
+            return;
+        }
         self.configured = true;
         self.damageAll();
         // A compositing client (`on_compose`) is painted right away during init's
